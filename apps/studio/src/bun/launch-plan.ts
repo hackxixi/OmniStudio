@@ -25,6 +25,7 @@ import { cachedKvUnifiedSupport, defaultLlamaServerBinary } from "./runtimes/lla
 import { MIN_FIT_CTX } from "../shared/launch-planner";
 import { plannerHardwareSnapshot } from "./planner-hardware";
 import { planLlamaLaunch, type LaunchPlan } from "../shared/launch-planner";
+import type { ModelParams } from "../shared/model-params";
 
 export type { LaunchPlan };
 
@@ -265,26 +266,33 @@ function pairedMmprojBytes(modelPath: string): number | null {
  * 与「没探过就不发 --kv-unified」一致），后者按 `pairedMmprojPath` 现 stat。这样预览 RPC
  * 与运行时不用各自补参数也拿到逐字段相同的 key。运行时在 start() 里刚探测过时可以用
  * `opts.supportsKvUnified` 传当次探测值（探测成功也会写进同一份缓存，两者一致）。
+ *
+ * `opts.modelParams`（按模型参数，已经 db/model-params 校验过）逐字段盖过设置：
+ * ctxSize → ctxOverride（规划器尊重用户窗口、其余参数照样自动拟合）；parallel / KV 类型
+ * 同理 —— 它们既进 argv 也进计价，key 里必须是真正会发出去的那个值。
  */
 export function buildLaunchPlanKeyFromSettings(
   modelPath: string,
   get: (key: string) => string,
   flashAttn?: boolean | null,
-  opts?: { supportsKvUnified?: boolean | null },
+  opts?: { supportsKvUnified?: boolean | null; modelParams?: ModelParams | null },
 ): LaunchPlanKey {
   const parse = (raw: string): number | null => {
     if (!raw.trim()) return null;
     const n = Number(raw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
   };
+  const mp = opts?.modelParams ?? null;
   return {
     modelPath,
-    parallel: parse(get("SERVER_PARALLEL")) ?? 1,
+    parallel: mp?.parallel ?? parse(get("SERVER_PARALLEL")) ?? 1,
     ubatch: parse(get("SERVER_UBATCH_SIZE")),
     batch: parse(get("SERVER_BATCH_SIZE")),
-    cacheTypeK: get("SERVER_CACHE_TYPE_K") || null,
-    cacheTypeV: get("SERVER_CACHE_TYPE_V") || null,
-    ctxOverride: null,
+    cacheTypeK: mp?.cacheTypeK ?? (get("SERVER_CACHE_TYPE_K") || null),
+    cacheTypeV: mp?.cacheTypeV ?? (get("SERVER_CACHE_TYPE_V") || null),
+    // 全局 SERVER_CTX_SIZE 不进来（自动模式下不把它当「用户显式指定」，否则自动推算失去意义）；
+    // 按模型固定的窗口才是用户明确说了的。
+    ctxOverride: mp?.ctxSize ?? null,
     flashAttn: flashAttn ?? false,
     supportsKvUnified:
       opts?.supportsKvUnified ?? cachedKvUnifiedSupport(defaultLlamaServerBinary()) ?? false,

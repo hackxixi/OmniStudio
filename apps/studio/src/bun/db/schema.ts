@@ -1180,3 +1180,18 @@ export const miniappNotes = sqliteTable(
 );
 
 export type MiniappNoteRow = typeof miniappNotes.$inferSelect;
+
+/**
+ * 按模型保存的启动 / 采样参数（覆盖全局设置，形状见 shared/model-params.ts 的 ModelParams）。
+ *
+ * 主键是模型 target 字符串（本地文件 / 目录 / HF repo id，与已服务模型注册表同一口径）。
+ * 参数整体存一段 JSON 而不是逐列：字段会随引擎能力增减，逐列每加一项都要一次迁移；
+ * 读写都经 db/model-params.ts 校验收敛，JSON 里不会有白名单之外的东西。
+ */
+export const modelParams = sqliteTable("model_params", {
+  modelKey: text("model_key").primaryKey(),
+  paramsJson: text("params_json").notNull(),
+  updatedAt: int("updated_at").notNull(),
+});
+
+export type ModelParamsRow = typeof modelParams.$inferSelect;

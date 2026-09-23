@@ -6,7 +6,9 @@ import {
   cachedServerHelpSupport,
   clearServerHelpSupportCache,
   flashAttnArgs,
+  cachedReasoningSupport,
   parseServerHelpSupport,
+  reasoningArgs,
   setCachedServerHelpSupport,
 } from "./llama-flash-attn";
 
@@ -142,5 +144,48 @@ describe("kvUnified support cache", () => {
     setCachedServerHelpSupport("/bin/k2", { loadMode: "load-mode", flashAttn: "none" });
     expect(cachedKvUnifiedSupport("/bin/k2")).toBeNull();
     expect(cachedServerHelpSupport("/bin/k2")?.kvUnified).toBe(false);
+  });
+});
+
+describe("parseServerHelpSupport / reasoning", () => {
+  test("新版：-rea, --reasoning [on|off|auto] → 支持（本机 llama-server --help 原文）", () => {
+    const help =
+      "--reasoning-format FORMAT               controls whether thought tags are allowed\n" +
+      "-rea,  --reasoning [on|off|auto]        Use reasoning/thinking in the chat ('on', 'off', or 'auto', default:\n" +
+      "--reasoning-budget N                    token budget for thinking\n";
+    expect(parseServerHelpSupport(help).reasoning).toBe(true);
+  });
+
+  test("老版只有 --reasoning-format / --reasoning-budget：同名前缀不算数", () => {
+    const help =
+      "--reasoning-format FORMAT               controls whether thought tags are allowed\n" +
+      "--reasoning-budget N                    token budget for thinking\n" +
+      "--chat-template-kwargs STRING           sets additional params for the json template parser\n";
+    expect(parseServerHelpSupport(help).reasoning).toBe(false);
+  });
+
+  test("缓存：没探过 = null；注入后同步可读；清掉恢复未探测", () => {
+    clearServerHelpSupportCache();
+    expect(cachedReasoningSupport("/x/llama-server")).toBeNull();
+    setCachedServerHelpSupport("/x/llama-server", { loadMode: "load-mode", flashAttn: "tristate", reasoning: true });
+    expect(cachedReasoningSupport("/x/llama-server")).toBe(true);
+    expect(cachedServerHelpSupport("/x/llama-server")?.reasoning).toBe(true);
+    clearServerHelpSupportCache();
+    expect(cachedReasoningSupport("/x/llama-server")).toBeNull();
+  });
+});
+
+describe("reasoningArgs", () => {
+  test("支持 --reasoning：on / off 原样发，auto / 没设不发", () => {
+    expect(reasoningArgs("on", true)).toEqual(["--reasoning", "on"]);
+    expect(reasoningArgs("off", true)).toEqual(["--reasoning", "off"]);
+    expect(reasoningArgs("auto", true)).toEqual([]);
+    expect(reasoningArgs(undefined, true)).toEqual([]);
+  });
+
+  test("不支持：关思考回落 chat-template-kwargs，开不发；非法值不发", () => {
+    expect(reasoningArgs("off", false)).toEqual(["--chat-template-kwargs", '{"enable_thinking":false}']);
+    expect(reasoningArgs("on", false)).toEqual([]);
+    expect(reasoningArgs("--evil", true)).toEqual([]);
   });
 });

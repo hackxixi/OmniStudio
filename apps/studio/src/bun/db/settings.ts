@@ -51,6 +51,8 @@ export type SettingsKey =
   | "SERVER_TOP_P"
   | "SERVER_TOP_K"
   | "SERVER_REPEAT_PENALTY"
+  | "SERVER_MIN_P"
+  | "SERVER_PRESENCE_PENALTY"
   | "SERVER_IDLE_UNLOAD_MINUTES"
   | "SERVER_FALLBACK_MODELS"
   | "SERVER_GPU_LAYERS"
@@ -369,10 +371,18 @@ const DEFAULTS: Record<SettingsKey, string> = {
   SERVER_BATCH_SIZE: "256",
   SERVER_UBATCH_SIZE: "64",
   SERVER_PARALLEL: "1",
-  SERVER_TEMP: "0.2",
+  // 全局采样只是最后一级兜底（优先级见 shared/model-params.ts）：认得出的模型走
+  // 模型自带值 / 家族推荐表（bun/model-sampling.ts），这里给通用对话的中性值。
+  // 以前是 OCR 口味的 0.2 / 1.12，推理模型在它下面会复读、思考链被压短；OCR 档案的
+  // 原值已挪进 shared/sampling-presets.ts。DEFAULTS 只是读侧回落、不落库，
+  // 用户显式存过的值原样保留。
+  SERVER_TEMP: "0.7",
   SERVER_TOP_P: "0.9",
   SERVER_TOP_K: "40",
-  SERVER_REPEAT_PENALTY: "1.12",
+  SERVER_REPEAT_PENALTY: "1.0",
+  // llama.cpp 自己的 min_p 默认就是 0.05；presence penalty 默认 0 = 不惩罚。
+  SERVER_MIN_P: "0.05",
+  SERVER_PRESENCE_PENALTY: "0",
   // 0 = 关闭（默认）：空闲卸载是给「机器小、模型多」的人省显存用的，
   // 默认打开会让「昨晚还跑着的模型今天不见了」变成一个需要解释的意外。
   SERVER_IDLE_UNLOAD_MINUTES: "0",

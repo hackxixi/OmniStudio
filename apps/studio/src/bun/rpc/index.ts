@@ -213,6 +213,14 @@ import { listEvalSuites, type EvalSuiteInfo } from "../eval";
 import { downloadManager, type DownloadTask } from "../download-manager";
 import type { LaunchPlan } from "../launch-plan";
 import { launchPlanPreviewForRpc } from "./launch-plan-preview";
+import {
+  clearModelParamsForRpc,
+  getModelParamsForRpc,
+  setModelParamsForRpc,
+  type GetModelParamsResult,
+} from "./model-params-rpc";
+import { listModelParams, type ModelParamsEntry } from "../db/model-params";
+import type { ModelParams } from "../../shared/model-params";
 import * as Voice from "../voice";
 import type { VoiceRecordRow, VoiceRecordKind, VoiceClone } from "../voice";
 import * as Asr from "../asr";
@@ -1887,6 +1895,29 @@ export type AppRPC = {
       getLaunchPlanPreview: {
         params: { path: string };
         response: { ok: true; plan: LaunchPlan } | { ok: false; error: string; reason: string };
+      };
+      /**
+       * 按模型参数（覆盖全局设置，形状见 shared/model-params.ts）。`model` = 模型 target
+       * （本地文件 / 仓库目录 / HF repo id），服务端按注册表同一规则归一。
+       * 返回保存的参数 + 最终采样值（逐项来源）+ 按现在参数的启动命令 + 是否需重启生效。
+       */
+      getModelParams: {
+        params: { model: string };
+        response: GetModelParamsResult;
+      };
+      /** 整份替换（不是合并）；校验后为空 = 删除。改动不自动重启跑着的实例（看 needsRestart）。 */
+      setModelParams: {
+        params: { model: string; params: ModelParams };
+        response: { ok: boolean; params: ModelParams | null; needsRestart: boolean; error?: string };
+      };
+      clearModelParams: {
+        params: { model: string };
+        response: { ok: boolean; needsRestart: boolean };
+      };
+      /** 所有存过按模型参数的模型（最近修改在前），模型列表上标「已自定义」用。 */
+      listModelParams: {
+        params: undefined;
+        response: { entries: ModelParamsEntry[] };
       };
       toggleFavoriteModel: {
         params: { path: string };
@@ -4922,6 +4953,12 @@ const rpcRequests: NonNullable<
 
   // 实现在 ./launch-plan-preview（可测）：路径先过 llamaLoadablePath，与真正启动同源。
   getLaunchPlanPreview: async ({ path }) => launchPlanPreviewForRpc(path),
+
+  // 实现在 ./model-params-rpc（可测）：key 归一、采样解析、命令预览、重启判定都在那里。
+  getModelParams: async ({ model }) => getModelParamsForRpc(model),
+  setModelParams: async ({ model, params }) => setModelParamsForRpc(model, params),
+  clearModelParams: async ({ model }) => clearModelParamsForRpc(model),
+  listModelParams: async () => ({ entries: listModelParams() }),
 
   toggleFavoriteModel: async ({ path }) => {
     ModelStore.toggleFavorite(path);

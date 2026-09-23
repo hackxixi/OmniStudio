@@ -20,6 +20,9 @@ import {
   type LaunchPlanKey,
 } from "../launch-plan";
 import { llamaCppBinaryPath } from "../engine-paths";
+import { KV_CACHE_TYPES, getModelParams } from "../db/model-params";
+import { refreshSamplingMetadata, resolveSampling } from "../model-sampling";
+import type { ModelParams, ResolvedSampling } from "../../shared/model-params";
 import { mainGgufInDir, modelNameForPath } from "../model-scan";
 import { slugModelFileName } from "../model-store";
 import { markServerStarted } from "../stats";
@@ -28,12 +31,15 @@ import {
   COMMON_LLAMA_SERVER_PATHS,
   cachedFlashAttnSupport,
   cachedKvUnifiedSupport,
+  cachedReasoningSupport,
   cachedServerHelpSupport,
   defaultLlamaServerBinary,
   flashAttnArgs,
   probeServerHelp,
+  reasoningArgs,
   type FlashAttnSupport,
 } from "./llama-flash-attn";
+import { shellJoin, splitShellArgs } from "./shell-args";
 import { loadModeArgs, loadModeUnsupported, type LoadModeSupport } from "./llama-load-mode";
 import { MAX_LOG_CHARS, killProcessTree, pumpServerOutput, spawnServerProcess, waitExit } from "./proc";
 import type {
@@ -109,6 +115,66 @@ export function effectiveFlashAttnForPlan(
  */
 export function persistedEffectiveFlashAttn(raw: string | null | undefined): "" | "on" | "off" {
   return raw === "on" || raw === "off" ? raw : "";
+}
+
+type LlamaModel = { kind: "local"; path: string; alias: string } | { kind: "hf"; ref: string };
+
+/**
+ * 自动启动参数的缓存 key（运行时 / 预览 RPC 共用这一处，保证逐字段相同）：
+ * 设置 + 按模型参数（ctx 作 ctxOverride、parallel / KV 类型盖过设置）+ FA 折算。
+ * FA 的「设置值」同样是按模型的优先（它既决定发什么参数，也决定按开还是关计价）。
+ */
+export function launchPlanKeyForModel(
+  modelPath: string,
+  modelParams: ModelParams | null,
+  get: (key: string) => string,
+  effectiveFa: "" | "on" | "off" | null | undefined,
+  supportsKvUnified?: boolean | null,
+): LaunchPlanKey {
+  return buildLaunchPlanKeyFromSettings(
+    modelPath,
+    get,
+    effectiveFlashAttnForPlan(modelParams?.flashAttn ?? get("SERVER_FLASH_ATTN"), effectiveFa),
+    { supportsKvUnified, modelParams },
+  );
+}
+
+/**
+ * 采样参数的最终值（按模型 > 模型自带 > 家族推荐 > 全局，见 model-sampling.ts）。
+ * 解析器抛错时回落「设置优先、档案兜底」的旧规则 —— 采样值算不出来不能挡住启动。
+ */
+function samplingValuesFor(
+  target: string,
+  mp: ModelParams | null,
+  serverArgs: ServerArgs,
+): ResolvedSampling["values"] {
+  try {
+    return resolveSampling(target, { override: mp?.sampling, thinking: mp?.thinking }).values;
+  } catch (e) {
+    logEvent({
+      level: "warn",
+      source: "server",
+      event: "sampling.resolve_failed",
+      message: `采样参数解析失败（${e instanceof Error ? e.message : String(e)}），按全局设置`,
+    });
+    const num = (key: SettingsKey, fallback: number) => {
+      const n = Number(getSetting(key));
+      return getSetting(key) !== "" && Number.isFinite(n) ? n : fallback;
+    };
+    return {
+      temperature: num("SERVER_TEMP", serverArgs.temp),
+      topP: num("SERVER_TOP_P", serverArgs.topP),
+      topK: num("SERVER_TOP_K", serverArgs.topK),
+      minP: num("SERVER_MIN_P" as SettingsKey, 0),
+      presencePenalty: num("SERVER_PRESENCE_PENALTY" as SettingsKey, 0),
+      repeatPenalty: num("SERVER_REPEAT_PENALTY", serverArgs.repeatPenalty),
+    };
+  }
+}
+
+/** 数值 → argv 字符串：非有限数不发（返回 null），避免 NaN 进命令行。 */
+function numArg(v: number): string | null {
+  return Number.isFinite(v) ? String(v) : null;
 }
 
 function getSearchPath(): string {
@@ -230,6 +296,10 @@ export class LlamaRuntime implements Runtime {
    * 保证「复制的命令」与实际发出去的一致。
    */
   private launchPlanKey: LaunchPlanKey | null = null;
+  /** `--reasoning` 支持（同一次 --help 探测；null = 本实例还没探测，回落进程级缓存）。 */
+  private reasoningSupport: boolean | null = null;
+  /** 本次运行实际发出去的 argv（没在跑 / 没启动过 = null），「改了参数要不要重启」的比对基准。 */
+  private launchedArgs: string[] | null = null;
 
   clearLogs() {
     this.serverLogs = "";
@@ -288,6 +358,19 @@ export class LlamaRuntime implements Runtime {
     return { kind: "hf", ref: "" };
   }
 
+  /**
+   * 本实例的模型身份（按模型参数 / 采样解析的 key）：与 resolveModel 同一优先级，但返回
+   * **原始 target**（目录条目不换成主 GGUF，HF 引用原样）—— 与已服务模型注册表的
+   * modelRef 同一口径，界面按这个 key 存的参数才能被启动时读到。
+   */
+  private resolveTarget(): string {
+    if (this.overrides.model) return this.overrides.model;
+    const localPath = getSetting("LOCAL_MODEL_PATH");
+    if (localPath) return localPath;
+    const profile = getModelProfile(getSetting("VLLM_MODEL_PROFILE"));
+    return getSetting("CUSTOM_HF_MODEL") || profile?.hfModel || "";
+  }
+
   /** 公开（同进程内的 UI / 测试入口与 `buildCommandLine` 共用）：模型档案的 serverArgs。 */
   getProfileServerArgs(): ServerArgs {
     const profileId = getSetting("VLLM_MODEL_PROFILE");
@@ -307,18 +390,17 @@ export class LlamaRuntime implements Runtime {
    * （见 effectiveFlashAttnForPlan），unknown 时保守按关计价。
    * 非本地 GGUF（HF 引用 / 未解析到模型）没有可算的对象，返回 null。
    */
-  private buildLaunchPlanKey(
-    model: { kind: "local"; path: string; alias: string } | { kind: "hf"; ref: string },
-  ): LaunchPlanKey | null {
+  private buildLaunchPlanKey(model: LlamaModel, target: string): LaunchPlanKey | null {
     if (model.kind !== "local") return null;
-    // key 的计算收敛在 launch-plan.ts（与测试共用同一份，见 buildLaunchPlanKeyFromSettings）。
-    return buildLaunchPlanKeyFromSettings(
+    // key 的计算收敛在 launchPlanKeyForModel（与预览 RPC、测试共用同一份）。
+    return launchPlanKeyForModel(
       model.path,
+      getModelParams(target),
       (k) => getSetting(k as SettingsKey),
-      this.effectiveFlashAttnForPlan(),
+      this.planFlashAttnEffective(),
       // start() 里刚探测过就用当次结果（与实际启动的那份二进制一致）；没探过由
       // launch-plan 读进程级缓存 —— 与预览 RPC 同一条规则。
-      { supportsKvUnified: this.kvUnifiedSupport },
+      this.kvUnifiedSupport,
     );
   }
 
@@ -328,11 +410,6 @@ export class LlamaRuntime implements Runtime {
    */
   private planFlashAttnEffective(): "" | "on" | "off" {
     return this.lastEffectiveFlashAttn || persistedEffectiveFlashAttn(getSetting("SERVER_FLASH_ATTN_EFFECTIVE"));
-  }
-
-  /** 本次规划用的 FA 布尔（设置值 + 上次实测折算，见 effectiveFlashAttnForPlan）。 */
-  private effectiveFlashAttnForPlan(): boolean {
-    return effectiveFlashAttnForPlan(getSetting("SERVER_FLASH_ATTN"), this.planFlashAttnEffective());
   }
 
   /** 数值型设置收成非负整数串，非法 / 空 → fallback（argv 注入防御，见 buildArgs）。 */
@@ -373,7 +450,7 @@ export class LlamaRuntime implements Runtime {
       model: basename(this.resolvedModelPath()),
     };
 
-    const plan = this.autoPlan(this.resolveModel());
+    const plan = this.autoPlan(this.resolveModel(), this.resolveTarget());
     if (plan !== null) {
       detail.predictedCtx = plan.ctxTokens;
       detail.predictedPerSlot = plan.ctxPerSlot;
@@ -446,17 +523,17 @@ export class LlamaRuntime implements Runtime {
   /** 本次自动推算用的计划（同步读缓存）；未开自动 / 非 GGUF / 没算过 → null，调用方回落到设置值。
    *  key 由调用方传入（start 用自己缓存的这份；buildCommandLine 用模型现建），
    *  两处 key 同一模型时逐字段相同，保证「复制的命令」与实际发出去的一致。 */
-  private autoPlan(model: {
-    kind: "local";
-    path: string;
-    alias: string;
-  } | {
-    kind: "hf";
-    ref: string;
-  }): LaunchPlan | null {
+  private autoPlan(model: LlamaModel, target: string): LaunchPlan | null {
     if (!LlamaRuntime.isAutoTuneEnabled()) return null;
-    const key = this.launchPlanKey ?? this.buildLaunchPlanKey(model);
-    if (key === null) return null;
+    const fresh = this.buildLaunchPlanKey(model, target);
+    if (fresh === null) return null;
+    // key 每次现建（按模型参数改了 → key 变 → 预览 / 重启判定立刻看到新值）；唯一沿用启动那份的
+    // 是 FA 折算：启动回读会把「实测 FA」写回，只因为它就换 key 会让正在跑的实例读不到自己的计划。
+    const launched = this.launchPlanKey;
+    const key =
+      launched !== null && launched.modelPath === fresh.modelPath
+        ? { ...fresh, flashAttn: launched.flashAttn }
+        : fresh;
     const plan = cachedLaunchPlan(key);
     return plan !== null && plan.ctxTokens > 0 ? plan : null;
   }
@@ -473,7 +550,7 @@ export class LlamaRuntime implements Runtime {
   }
 
   buildCommandLine(modelOverride?: string): string {
-    let model: { kind: "local"; path: string; alias: string } | { kind: "hf"; ref: string };
+    let model: LlamaModel;
     if (modelOverride) {
       if (existsSync(modelOverride)) {
         // 与 resolveModel 同一规则：目录条目换成主 GGUF（`-m` 只收文件），
@@ -489,17 +566,31 @@ export class LlamaRuntime implements Runtime {
     } else {
       model = this.resolveModel();
     }
-    // 用户终端直接跑原生命令，不带 macOS PTY 包装。
+    // 用户终端直接跑原生命令，不带 macOS PTY 包装。按 shell 规则加引号：路径带空格 /
+    // JSON 参数原样粘进终端也能跑，且切回来与 argv 逐项相等。
     const bin = defaultLlamaServerBinary();
-    return [bin, ...this.buildArgs(model, this.getProfileServerArgs())].join(" ");
+    const target = modelOverride || this.resolveTarget();
+    return shellJoin([bin, ...this.buildArgs(model, this.getProfileServerArgs(), target)]);
+  }
+
+  /**
+   * 正在跑的实例与「按现在的设置 / 按模型参数再起一次」的 argv 是否不同（界面据此提示
+   * 「改动需重启生效」）。不自动重启 —— 重启会打断进行中的请求，由用户决定。
+   * 没在跑 / 没有启动记录 → false。
+   */
+  needsRestart(): boolean {
+    if (this.launchedArgs === null || this.serverStatus !== "running") return false;
+    const current = this.buildArgs(this.resolveModel(), this.getProfileServerArgs(), this.resolveTarget());
+    return shellJoin(current) !== shellJoin(this.launchedArgs);
   }
 
   /** 公开（`buildCommandLine` / `start` / 同进程内 UI 入口共用）：拼装 llama-server 参数。 */
-  buildArgs(model:
-    | { kind: "local"; path: string; alias: string }
-    | { kind: "hf"; ref: string },
-    serverArgs: ServerArgs): string[] {
+  buildArgs(model: LlamaModel, serverArgs: ServerArgs, target?: string): string[] {
     const cleanNum = LlamaRuntime.cleanNum;
+    // 按模型参数的 key：调用方给的原始 target；没给（测试直调）按实例 target → 模型本身兜底。
+    const modelKey = target ?? (this.overrides.model || (model.kind === "local" ? model.path : model.ref));
+    // 按模型参数（已校验收敛，见 db/model-params）：逐字段盖过自动规划与全局设置。
+    const mp = getModelParams(modelKey);
     // 数值型设置（ctx / batch / parallel / port / …）的注入防御：这些值会原样进 argv，而
     // 设置行可能被手改数据库 / 旧版本写入，所以统一收一遍 —— 解析不出有限非负整数就丢弃
     // （空串保持空，让 `|| 档案默认` 兜底；非法值同样落回默认而不是把字符串塞给引擎）。
@@ -510,10 +601,14 @@ export class LlamaRuntime implements Runtime {
     // 自动启动参数（SERVER_AUTO_TUNE，默认开）：有计划时 --ctx-size / --batch-size /
     // --ubatch-size（仅聊天实例）用计划值；--parallel 仍用设置值（并发是用户的业务选择），
     // --cache-type-k/-v 保持设置值（它们参与计划 key 的计算，改了自然重算）。
-    const autoPlan = this.autoPlan(model);
+    // 按模型固定的窗口：自动规划开着时它已作为 ctxOverride 进了计划（计划的 ctxTokens 就是它，
+    // 其余参数照样拟合）；没有计划（关了自动 / 非 GGUF / 没算过）时直接用它。
+    const autoPlan = this.autoPlan(model, modelKey);
     const ctxSize = autoPlan
       ? String(autoPlan.ctxTokens)
-      : cleanNum(getSetting("SERVER_CTX_SIZE") || "", String(serverArgs.ctxSize));
+      : mp?.ctxSize !== undefined
+        ? String(mp.ctxSize)
+        : cleanNum(getSetting("SERVER_CTX_SIZE") || "", String(serverArgs.ctxSize));
     const imageMaxTokens = cleanNum(
       getSetting("SERVER_IMAGE_MAX_TOKENS") || "",
       String(serverArgs.imageMaxTokens),
@@ -524,32 +619,30 @@ export class LlamaRuntime implements Runtime {
     const ubatchSize = autoPlan
       ? String(autoPlan.ubatch)
       : cleanNum(getSetting("SERVER_UBATCH_SIZE") || "", String(serverArgs.ubatchSize));
-    const parallel = cleanNum(getSetting("SERVER_PARALLEL") || "", String(serverArgs.parallel));
-    const temp = getSetting("SERVER_TEMP") || String(serverArgs.temp);
-    const topP = getSetting("SERVER_TOP_P") || String(serverArgs.topP);
-    // 采样参数一律「设置优先、模型档案兜底」：设置页显示的就是实际发出去的那份。
-    // 用 || 而不是 ?? 是因为空字符串表示「没设过」，要落回档案的默认值。
-    const topK = getSetting("SERVER_TOP_K") || String(serverArgs.topK);
-    const repeatPenalty = getSetting("SERVER_REPEAT_PENALTY") || String(serverArgs.repeatPenalty);
+    const parallel =
+      mp?.parallel !== undefined
+        ? String(mp.parallel)
+        : cleanNum(getSetting("SERVER_PARALLEL") || "", String(serverArgs.parallel));
     // 「自动（全卸载）」哨兵值：与 llama.cpp 引擎自身的 -1 同值（不传参数 = 引擎自己决定），
     // 这里额外接受 "" / "auto" 作为同义写法 —— 自动推算的 gpuLayers 建议只在用户没
     // 显式指定时采纳（哨兵 → 计划值；具体数字 → 听用户的）。具体数字要能被解析成
     // 有限整数才进 argv（手改设置行塞进来的垃圾值丢弃，行为等同哨兵 = 引擎自己决定）。
-    const rawGpuLayers = getSetting("SERVER_GPU_LAYERS");
+    // 按模型的层数优先：-1 = 显式「交给引擎 / 自动规划」（盖过全局的固定层数），>=0 = 固定。
+    const rawGpuLayers = mp?.gpuLayers !== undefined ? String(mp.gpuLayers) : getSetting("SERVER_GPU_LAYERS");
     const gpuAuto = rawGpuLayers === "-1" || rawGpuLayers === "" || rawGpuLayers.toLowerCase() === "auto";
     const gpuLayers =
       !gpuAuto && /^-?\d+$/.test(rawGpuLayers.trim()) && Number.isSafeInteger(Number(rawGpuLayers))
         ? rawGpuLayers
         : "";
-    // llama.cpp 的 KV 量化枚举（`--help` 取值列表，与 settings 页下拉同源）：手改设置行
-    // 塞进来的值不能进 argv，白名单之外一律不落参数（引擎用自己的默认）。
-    const KV_CACHE_TYPES = new Set(["f32", "f16", "q8_0", "q4_0", "q4_1"]);
-    const cacheTypeK = KV_CACHE_TYPES.has(getSetting("SERVER_CACHE_TYPE_K"))
-      ? getSetting("SERVER_CACHE_TYPE_K")!
-      : null;
-    const cacheTypeV = KV_CACHE_TYPES.has(getSetting("SERVER_CACHE_TYPE_V"))
-      ? getSetting("SERVER_CACHE_TYPE_V")!
-      : null;
+    // llama.cpp 的 KV 量化枚举（本机 `--help` 的 allowed values，与规划器 KV 表同源）：手改设置行
+    // 塞进来的值不能进 argv，白名单之外一律不落参数（引擎用自己的默认）。按模型的优先。
+    const kvTypes = new Set<string>(KV_CACHE_TYPES);
+    const pickKv = (perModel: string | undefined, key: SettingsKey): string | null => {
+      const v = perModel ?? getSetting(key);
+      return kvTypes.has(v) ? v : null;
+    };
+    const cacheTypeK = pickKv(mp?.cacheTypeK, "SERVER_CACHE_TYPE_K");
+    const cacheTypeV = pickKv(mp?.cacheTypeV, "SERVER_CACHE_TYPE_V");
     // 池化方式同理：设置键在 set 时有枚举校验，这里再收一遍（db 被手改 / 旧值兜底）。
     const pooling = (EMBEDDING_POOLING_VALUES as readonly string[]).includes(
       getSetting("EMBEDDING_POOLING"),
@@ -627,19 +720,24 @@ export class LlamaRuntime implements Runtime {
     if (cacheTypeK) args.push("--cache-type-k", cacheTypeK);
     if (cacheTypeV) args.push("--cache-type-v", cacheTypeV);
 
+    // 采样默认值（请求没带时引擎用它）：按模型 > 模型自带 > 家族推荐 > 全局（model-sampling.ts）。
+    // 嵌入实例不采样，整组不发。
     if (!embedding) {
-      args.push(
-        "--repeat-penalty",
-        repeatPenalty,
-        "--repeat-last-n",
-        String(serverArgs.repeatLastN),
-        "--temp",
-        temp,
-        "--top-p",
-        topP,
-        "--top-k",
-        topK,
-      );
+      const s = samplingValuesFor(modelKey, mp, serverArgs);
+      const sampling: [string, string | null][] = [
+        ["--repeat-penalty", numArg(s.repeatPenalty)],
+        ["--repeat-last-n", String(serverArgs.repeatLastN)],
+        ["--temp", numArg(s.temperature)],
+        ["--top-p", numArg(s.topP)],
+        ["--top-k", numArg(s.topK)],
+        ["--min-p", numArg(s.minP)],
+        ["--presence-penalty", numArg(s.presencePenalty)],
+      ];
+      for (const [flag, v] of sampling) if (v !== null) args.push(flag, v);
+      // 思考开关（按模型）：认 --reasoning 就直接交给引擎，老版关思考回落 chat-template-kwargs。
+      const reaSupported =
+        this.reasoningSupport ?? cachedReasoningSupport(defaultLlamaServerBinary()) ?? false;
+      args.push(...reasoningArgs(mp?.thinking, reaSupported));
     }
 
     // 嵌入实例追加嵌入开关与池化方式（llama.cpp 默认禁用嵌入端点，这就是 501 的根因）。
@@ -674,7 +772,7 @@ export class LlamaRuntime implements Runtime {
     // flash attention（T4d）：三态开关按 --help 探测结果折算 —— 新版发 [--flash-attn, 值]，
     // 老版布尔开关只有 on 才发，没探测到就一个参数都不发（与加这个开关前逐字节一致）。
     // flashAttnArgs 自己把设置值收进白名单（非法值回落 auto），这里直传原始值。
-    const rawFlash = getSetting("SERVER_FLASH_ATTN");
+    const rawFlash = mp?.flashAttn ?? getSetting("SERVER_FLASH_ATTN");
     const faSupport =
       this.flashAttnSupport ?? cachedFlashAttnSupport(defaultLlamaServerBinary()) ?? "none";
     args.push(...flashAttnArgs(rawFlash, faSupport));
@@ -684,8 +782,10 @@ export class LlamaRuntime implements Runtime {
       args.push("--no-mmproj-offload");
     }
 
-    const extra = getSetting("SERVER_EXTRA_ARGS");
-    if (extra.trim()) args.push(...extra.trim().split(/\s+/));
+    // 追加参数放最后（llama.cpp 同名参数后者生效）：全局在前、按模型在后，所以按模型的能盖过全局。
+    // 按 shell 引号规则切分（'{"enable_thinking": false}' 这类带空格的 JSON 不能被拆开）。
+    args.push(...splitShellArgs(getSetting("SERVER_EXTRA_ARGS") || ""));
+    if (mp?.extraArgs) args.push(...splitShellArgs(mp.extraArgs));
 
     return args;
   }
@@ -698,6 +798,7 @@ export class LlamaRuntime implements Runtime {
     const serverArgs = this.getProfileServerArgs();
 
     const model = this.resolveModel();
+    const target = this.resolveTarget();
     if (model.kind === "hf" && !model.ref) {
       return { ok: false, error: "No model configured" };
     }
@@ -714,6 +815,7 @@ export class LlamaRuntime implements Runtime {
     this.loadModeSupport = helpSupport.loadMode;
     this.flashAttnSupport = helpSupport.flashAttn;
     this.kvUnifiedSupport = helpSupport.kvUnified ?? false;
+    this.reasoningSupport = helpSupport.reasoning ?? false;
     const loadMode = getSetting("SERVER_LOAD_MODE");
     if (loadModeUnsupported(loadMode, this.loadModeSupport)) {
       const message = `加载模式 ${loadMode} 在这台 llama-server（${this.loadModeSupport}）上不支持，本次按默认加载模式启动`;
@@ -735,7 +837,7 @@ export class LlamaRuntime implements Runtime {
       model.kind === "local" &&
       /\.gguf$/i.test(model.path)
     ) {
-      const key = this.buildLaunchPlanKey(model);
+      const key = this.buildLaunchPlanKey(model, target);
       if (key !== null) {
         try {
           await refreshLaunchPlan(key);
@@ -758,10 +860,21 @@ export class LlamaRuntime implements Runtime {
       }
     }
 
-    const args = this.buildArgs(model, serverArgs);
+    // 模型自带的采样元数据（generation_config / GGUF general.sampling.*）先异步读进缓存，
+    // buildArgs 里同步解析才拿得到；读不到不影响启动（回落家族推荐 / 全局）。
+    if (target) {
+      try {
+        await refreshSamplingMetadata(target);
+      } catch {
+        // 元数据读取失败：按没有处理
+      }
+    }
+
+    const args = this.buildArgs(model, serverArgs, target);
+    this.launchedArgs = args;
     this.lastError = "";
     this.setStatus("starting");
-    this.appendLog(`$ llama-server ${args.join(" ")}\n`);
+    this.appendLog(`$ llama-server ${shellJoin(args)}\n`);
 
     try {
       const usePty = process.platform === "darwin";

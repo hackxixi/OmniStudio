@@ -169,8 +169,8 @@ describe("buildCommandLine / chat", () => {
     expect(cmd).toBe(
       `${bin} -m ${chatModel} --alias e2e-chat --host 127.0.0.1 --port 18400 --ctx-size 8192` +
         " --parallel 1 --batch-size 256 --ubatch-size 64" +
-        " --cache-type-k q8_0 --cache-type-v q8_0 --repeat-penalty 1.12 --repeat-last-n 256" +
-        " --temp 0.1 --top-p 0.8 --top-k 40",
+        " --cache-type-k q8_0 --cache-type-v q8_0 --repeat-penalty 1 --repeat-last-n 256" +
+        " --temp 0.1 --top-p 0.8 --top-k 40 --min-p 0.05 --presence-penalty 0",
     );
   });
 
@@ -186,23 +186,24 @@ describe("buildCommandLine / chat", () => {
     expect(new LlamaRuntime().buildCommandLine(chatModel)).not.toContain("--evil-flag");
   });
 
-  test("采样参数「设置优先、模型档案兜底」：设置页显示的就是发出去的那份（ENG-04）", () => {
+  test("采样参数：没有按模型 / 模型自带 / 家族推荐时走全局设置（ENG-04，解析见 model-sampling）", () => {
     setChatSettings();
-    // 档案默认值（模型自带的那套）
-    const fromProfile = new LlamaRuntime().buildCommandLine(chatModel);
-    expect(fromProfile).toContain("--repeat-penalty 1.12");
-    expect(fromProfile).toContain("--temp 0.1");
-    expect(fromProfile).toContain("--top-p 0.8");
-    expect(fromProfile).toContain("--top-k 40");
-    // 设置盖过档案
+    const base = new LlamaRuntime().buildCommandLine(chatModel);
+    expect(base).toContain("--temp 0.1");
+    expect(base).toContain("--top-p 0.8");
+    // 全局设置改了，发出去的跟着改
     SETTINGS.SERVER_TOP_K = "7";
     SETTINGS.SERVER_REPEAT_PENALTY = "1.3";
+    SETTINGS.SERVER_MIN_P = "0.1";
+    SETTINGS.SERVER_PRESENCE_PENALTY = "1.5";
     const cmd = new LlamaRuntime().buildCommandLine(chatModel);
     expect(cmd).toContain("--top-k 7");
     expect(cmd).toContain("--repeat-penalty 1.3");
-    // 空串 = 没设过，落回档案的默认值（而不是把参数发成空）
+    expect(cmd).toContain("--min-p 0.1");
+    expect(cmd).toContain("--presence-penalty 1.5");
+    // 空串 = 没设过，落回默认（而不是把参数发成空）
     SETTINGS.SERVER_TOP_K = "";
-    expect(new LlamaRuntime().buildCommandLine(chatModel)).toContain("--top-k 40");
+    expect(new LlamaRuntime().buildCommandLine(chatModel)).toMatch(/--top-k \d+/);
   });
 });
 
@@ -668,6 +669,201 @@ bun 的数组 toContain 是精确匹配（单元素），
   });
 });
 
+// ---------- 按模型参数（model_params 表，覆盖全局设置） ----------
+// 放在 T4e 之前：那一组会 mock.module 替换 llama-flash-attn，之后注的探测缓存 llama.ts 读不到。
+
+describe("buildArgs / 按模型参数", () => {
+  const { setModelParams, clearModelParams } =
+    require("../db/model-params") as typeof import("../db/model-params");
+  const { setCachedServerHelpSupport, clearServerHelpSupportCache } =
+    require("./llama-flash-attn") as typeof import("./llama-flash-attn");
+  const { splitShellArgs } = require("./shell-args") as typeof import("./shell-args");
+
+  const resolvedBin = () =>
+    ["/opt/homebrew/bin/llama-server", "/usr/local/bin/llama-server"].find((p) => existsSync(p)) ??
+    "llama-server";
+  const argsFor = (rt: InstanceType<typeof LlamaRuntime>) =>
+    rt.buildArgs({ kind: "local", path: chatModel, alias: "e2e-chat" }, DEFAULT_CUSTOM_SERVER_ARGS, chatModel);
+  const valueOf = (args: string[], flag: string) => {
+    const i = args.lastIndexOf(flag);
+    return i === -1 ? undefined : args[i + 1];
+  };
+
+  afterEach(() => {
+    clearModelParams(chatModel);
+    clearModelParams(embedModel);
+    clearServerHelpSupportCache();
+  });
+
+  test("启动参数：按模型 > 全局（ctx / parallel / gpuLayers / KV 类型 / FA）", () => {
+    setChatSettings();
+    SETTINGS.SERVER_GPU_LAYERS = "28";
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate" });
+    SETTINGS.SERVER_FLASH_ATTN = "auto";
+    setModelParams(chatModel, {
+      ctxSize: 32768,
+      parallel: 2,
+      gpuLayers: 10,
+      cacheTypeK: "bf16",
+      cacheTypeV: "q5_1",
+      flashAttn: "off",
+    });
+    const args = argsFor(new LlamaRuntime({ model: chatModel, port: "18430" }));
+    expect(valueOf(args, "--ctx-size")).toBe("32768");
+    expect(valueOf(args, "--parallel")).toBe("2");
+    expect(valueOf(args, "--n-gpu-layers")).toBe("10");
+    // bf16 / q5_1 是 llama-server --help 认的值（argv 白名单已与规划器 KV 表对齐）
+    expect(valueOf(args, "--cache-type-k")).toBe("bf16");
+    expect(valueOf(args, "--cache-type-v")).toBe("q5_1");
+    expect(valueOf(args, "--flash-attn")).toBe("off");
+
+    // 清掉按模型的 → 回到全局
+    clearModelParams(chatModel);
+    const g = argsFor(new LlamaRuntime({ model: chatModel, port: "18430" }));
+    expect(valueOf(g, "--ctx-size")).toBe("8192");
+    expect(valueOf(g, "--n-gpu-layers")).toBe("28");
+    expect(valueOf(g, "--cache-type-k")).toBe("q8_0");
+    expect(valueOf(g, "--flash-attn")).toBe("auto");
+  });
+
+  test("gpuLayers = -1（按模型显式交给引擎）盖过全局的固定层数，采纳计划建议", () => {
+    setChatSettings();
+    SETTINGS.SERVER_GPU_LAYERS = "28";
+    setModelParams(chatModel, { gpuLayers: -1 });
+    expect(argsFor(new LlamaRuntime({ model: chatModel, port: "18431" }))).not.toContain("--n-gpu-layers");
+    SETTINGS.SERVER_AUTO_TUNE = "1";
+    __setLaunchPlanForTest(
+      buildLaunchPlanKeyFromSettings(chatModel, (k) => SETTINGS[k] ?? "", false, {
+        modelParams: { gpuLayers: -1 },
+      }),
+      makePlan({ gpuLayers: 20 }),
+    );
+    expect(valueOf(argsFor(new LlamaRuntime({ model: chatModel, port: "18431" })), "--n-gpu-layers")).toBe("20");
+  });
+
+  test("自动规划开着时按模型的 ctx 作为 ctxOverride 进 key：命中的是尊重该窗口的那份计划", () => {
+    setChatSettings();
+    SETTINGS.SERVER_AUTO_TUNE = "1";
+    SETTINGS.SERVER_PARALLEL = "3";
+    // 全局设置的那份计划（ctxOverride = null）
+    seedPlan(chatModel, makePlan({ ctxTokens: 131072, batch: 1024 }));
+    setModelParams(chatModel, { ctxSize: 16384 });
+    const key = buildLaunchPlanKeyFromSettings(chatModel, (k) => SETTINGS[k] ?? "", false, {
+      modelParams: { ctxSize: 16384 },
+    });
+    expect(key.ctxOverride).toBe(16384);
+    const rt = new LlamaRuntime({ model: chatModel, port: "18432" });
+    // 还没算过带 ctxOverride 的计划：不能误用全局那份 131072，直接用按模型的窗口
+    expect(valueOf(argsFor(rt), "--ctx-size")).toBe("16384");
+    expect(valueOf(argsFor(rt), "--batch-size")).toBe("256");
+    // 算过之后：ctx 是计划的（规划器对用户显式窗口不缩），其余参数照样自动（batch 用计划值）
+    __setLaunchPlanForTest(key, makePlan({ ctxTokens: 16384, batch: 2048 }));
+    const planned = argsFor(rt);
+    expect(valueOf(planned, "--ctx-size")).toBe("16384");
+    expect(valueOf(planned, "--batch-size")).toBe("2048");
+  });
+
+  test("按模型的 parallel / KV 类型进计划 key（计价用的是真正发出去的值）", () => {
+    setChatSettings();
+    const key = buildLaunchPlanKeyFromSettings(chatModel, (k) => SETTINGS[k] ?? "", false, {
+      modelParams: { parallel: 4, cacheTypeK: "f16", cacheTypeV: "f16" },
+    });
+    expect(key.parallel).toBe(4);
+    expect(key.cacheTypeK).toBe("f16");
+    expect(key.cacheTypeV).toBe("f16");
+    expect(key.ctxOverride).toBeNull();
+  });
+
+  test("采样：按模型 > 全局；min-p / presence-penalty 也发；嵌入实例整组不发", () => {
+    setChatSettings();
+    setModelParams(chatModel, { sampling: { temperature: 0.6, topK: 20, minP: 0, presencePenalty: 1.5 } });
+    const args = argsFor(new LlamaRuntime({ model: chatModel, port: "18433" }));
+    expect(valueOf(args, "--temp")).toBe("0.6");
+    expect(valueOf(args, "--top-k")).toBe("20");
+    expect(valueOf(args, "--min-p")).toBe("0");
+    expect(valueOf(args, "--presence-penalty")).toBe("1.5");
+    // 没覆盖的字段仍按全局
+    expect(valueOf(args, "--top-p")).toBe("0.8");
+    expect(args).toContain("--repeat-last-n");
+
+    setModelParams(embedModel, { sampling: { temperature: 0.6 }, ctxSize: 4096 });
+    const emb = new LlamaRuntime({ model: embedModel, port: "18434", purpose: "embedding" }).buildArgs(
+      { kind: "local", path: embedModel, alias: "wemm-emb" },
+      DEFAULT_CUSTOM_SERVER_ARGS,
+      embedModel,
+    );
+    expect(emb).not.toContain("--temp");
+    expect(emb).not.toContain("--min-p");
+    // 嵌入实例的按模型启动参数照样生效（ctx 同时决定嵌入 batch）
+    expect(valueOf(emb, "--ctx-size")).toBe("4096");
+    expect(valueOf(emb, "--batch-size")).toBe("4096");
+  });
+
+  test("hf 引用模型也按 target 读按模型参数", () => {
+    setChatSettings();
+    const ref = "unsloth/Some-Model-GGUF:Q4_K_M";
+    setModelParams(ref, { ctxSize: 12288, extraArgs: "--foo bar" });
+    const args = new LlamaRuntime({ model: ref, port: "18435" }).buildArgs(
+      { kind: "hf", ref },
+      DEFAULT_CUSTOM_SERVER_ARGS,
+      ref,
+    );
+    expect(valueOf(args, "--ctx-size")).toBe("12288");
+    expect(args.slice(-2)).toEqual(["--foo", "bar"]);
+    clearModelParams(ref);
+  });
+
+  test("思考开关：认 --reasoning 发 --reasoning on|off；不认时关思考回落 chat-template-kwargs；auto 不发", () => {
+    setChatSettings();
+    const rt = () => new LlamaRuntime({ model: chatModel, port: "18436" });
+    setModelParams(chatModel, { thinking: "off" });
+    // 没探过 → 按不支持：关思考走 kwargs
+    let args = argsFor(rt());
+    expect(args).not.toContain("--reasoning");
+    expect(valueOf(args, "--chat-template-kwargs")).toBe('{"enable_thinking":false}');
+    // 探到支持 → --reasoning off
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", reasoning: true });
+    args = argsFor(rt());
+    expect(valueOf(args, "--reasoning")).toBe("off");
+    expect(args).not.toContain("--chat-template-kwargs");
+    setModelParams(chatModel, { thinking: "on" });
+    expect(valueOf(argsFor(rt()), "--reasoning")).toBe("on");
+    // 不支持时「开」不发（模板默认就是开）
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", reasoning: false });
+    args = argsFor(rt());
+    expect(args).not.toContain("--reasoning");
+    expect(args).not.toContain("--chat-template-kwargs");
+    setModelParams(chatModel, { thinking: "auto" });
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", reasoning: true });
+    expect(argsFor(rt())).not.toContain("--reasoning");
+  });
+
+  test("追加参数：按 shell 引号切分，全局在前、按模型在后；复制的命令切回来与 argv 相等", () => {
+    setChatSettings();
+    SETTINGS.SERVER_EXTRA_ARGS = `--chat-template-kwargs '{"enable_thinking": false}' --seed 1`;
+    setModelParams(chatModel, { extraArgs: `--seed 42 --system-prompt "hi \\"there\\""` });
+    const rt = new LlamaRuntime({ model: chatModel, port: "18437" });
+    const args = argsFor(rt);
+    expect(args.slice(-8)).toEqual([
+      "--chat-template-kwargs",
+      '{"enable_thinking": false}',
+      "--seed",
+      "1",
+      "--seed",
+      "42",
+      "--system-prompt",
+      'hi "there"',
+    ]);
+    const cmd = rt.buildCommandLine(chatModel);
+    expect(splitShellArgs(cmd).slice(1)).toEqual(args);
+  });
+
+  test("needsRestart：没在跑 → false", () => {
+    setChatSettings();
+    expect(new LlamaRuntime({ model: chatModel, port: "18438" }).needsRestart()).toBe(false);
+  });
+});
+
 // ---------- T4e：启动后回读实测值（预测 → 实测闭环） ----------
 
 describe("start / 回读实测值（T4e）", () => {
@@ -854,5 +1050,22 @@ describe("start / 回读实测值（T4e）", () => {
     const { result } = await startServer(18503);
     expect(result.ok).toBe(true);
     expect(realSettings.getSetting("SERVER_FLASH_ATTN_EFFECTIVE")).toBe("off");
+  });
+
+  test("needsRestart：跑着时改了按模型参数 → true（不自动重启）；改回去 → false", async () => {
+    const { setModelParams, clearModelParams } =
+      require("../db/model-params") as typeof import("../db/model-params");
+    propsBehavior = "ok";
+    faLogLine = "";
+    setChatSettings();
+    const rt = new LlamaRuntime({ model: chatModel, port: "18504" });
+    expect((await rt.start()).ok).toBe(true);
+    expect(rt.needsRestart()).toBe(false);
+    setModelParams(chatModel, { sampling: { temperature: 1.1 } });
+    expect(rt.needsRestart()).toBe(true);
+    expect(rt.getStatus()).toBe("running");
+    clearModelParams(chatModel);
+    expect(rt.needsRestart()).toBe(false);
+    // 不 stop：假子进程的 exited 永不兑现，stop 会等满 5s；也不能 kill 假 pid。与上面几条一样留着。
   });
 });

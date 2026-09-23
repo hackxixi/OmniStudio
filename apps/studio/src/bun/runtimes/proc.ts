@@ -193,3 +193,37 @@ export async function probeCommand(cmd: string[], timeoutMs = 5_000): Promise<bo
     return false;
   }
 }
+
+/**
+ * 跑一条 `--help` 类命令，拿 stdout + stderr 的全文（引擎开关探测用）。
+ * 与 probeCommand 不同，这里**不看退出码**：有的 CLI 打印帮助后退出码非 0（argparse 的
+ * 子命令组、`--help=all` 不认时的回落），只要吐出了文字就能拿来认开关。
+ * 启动失败 / 超时 / 什么都没输出 → null（调用方不落缓存，下回再试）。
+ */
+export async function readHelpText(cmd: string[], timeoutMs = 5_000): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // 已经退出了
+      }
+    }, timeoutMs);
+    try {
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text().catch(() => ""),
+        new Response(proc.stderr).text().catch(() => ""),
+      ]);
+      await proc.exited;
+      const text = `${out}\n${err}`;
+      return timedOut || !text.trim() ? null : text;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}

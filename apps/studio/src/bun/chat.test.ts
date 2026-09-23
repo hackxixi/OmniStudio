@@ -561,3 +561,31 @@ test("云端发消息：max_tokens 仍是 8k，且不去探测 /props", async ()
     resetServedContextCache();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 关思考时的逐请求采样：实例命令行上是模型默认（思考）档，关思考要换成非思考档。
+// ---------------------------------------------------------------------------
+
+test("关思考的采样字段：本地模式按非思考档给，两种重复惩罚名都带", async () => {
+  const { nonThinkingSamplingFields } = await import("./chat");
+  await withSetting("SERVER_MODE", "local", () =>
+    withSetting("LOCAL_MODEL_PATH", "unsloth/Qwen3-8B-GGUF:Q4_K_M", () => {
+      expect(nonThinkingSamplingFields()).toEqual({
+        temperature: 0.7,
+        top_p: 0.8,
+        top_k: 20,
+        min_p: 0,
+        presence_penalty: 0,
+        repeat_penalty: 1.0,
+        repetition_penalty: 1.0,
+      });
+    }),
+  );
+});
+
+test("关思考的采样字段：云端模式不带（厂商各有规矩）", async () => {
+  const { nonThinkingSamplingFields } = await import("./chat");
+  await withSetting("LOCAL_MODEL_PATH", "unsloth/Qwen3-8B-GGUF:Q4_K_M", () => {
+    expect(nonThinkingSamplingFields()).toEqual({});
+  });
+});

@@ -945,6 +945,34 @@ export function clearServedModelLogs(id: string): void {
   entries.get(id)?.runtime.clearLogs();
 }
 
+/**
+ * 按模型参数改过之后，跑着的这个模型要不要重启才生效：注册表里 modelRef 等于 `target`
+ * （已归一的模型身份）的实例，只要有一个 argv 会变就是 true。不自动重启 —— 会打断进行中的
+ * 请求，交给用户。没在跑 / 引擎没实现比对 → false。
+ */
+export function servedModelNeedsRestart(target: string): boolean {
+  for (const entry of entries.values()) {
+    if (entry.info.modelRef !== target) continue;
+    try {
+      if (entry.runtime.needsRestart?.()) return true;
+    } catch {
+      // 比对失败不是「需要重启」的证据
+    }
+  }
+  return false;
+}
+
+/**
+ * 注册表里服务这个模型（modelRef === target）的实例「按现在的参数」的启动命令；没有实例 → null。
+ * 不带参数调 buildCommandLine：走实例自己的 overrides（端口 / 服务名 / 用途），与它重启时发的一致。
+ */
+export function servedLaunchPreview(target: string): string | null {
+  for (const entry of entries.values()) {
+    if (entry.info.modelRef === target) return entry.runtime.buildCommandLine();
+  }
+  return null;
+}
+
 /** 该模型的启动命令（命令预览 / 复制用；不会起进程）。 */
 export function buildServedCommandLine(id: string): string {
   const entry = entries.get(id);

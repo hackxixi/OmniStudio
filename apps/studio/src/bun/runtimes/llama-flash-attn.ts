@@ -52,6 +52,12 @@ export type ServerHelpSupport = {
    * 可选只是为了兼容旧调用方（测试注缓存）；缺省按不支持处理（不赌开关存在）。
    */
   kvUnified?: boolean;
+  /**
+   * 是否认 `-rea, --reasoning [on|off|auto]`（按模型「思考开关」直接交给引擎）。
+   * 不认的老版回落 `--chat-template-kwargs '{"enable_thinking":false}'`（只有关能这样表达）。
+   * 可选同 kvUnified：缺省按不支持处理。
+   */
+  reasoning?: boolean;
 };
 
 /** `--load-mode` 的 `--help` 识别（照抄 llama-load-mode.ts 的正则，保持两处判定一致）。 */
@@ -82,12 +88,22 @@ function parseKvUnifiedSupportText(help: string): boolean {
   return /(^|[\s,])--kv-unified\b/m.test(help) || /(^|[\s,])-kvu\b/m.test(help);
 }
 
+/**
+ * `--reasoning` 的 `--help` 识别：`-rea, --reasoning [on|off|auto]` 那一行。
+ * 同名前缀的 `--reasoning-format` / `--reasoning-budget` / `--reasoning-effort` 是另外的开关
+ * （老版早就有 --reasoning-format），不能算数 —— 所以要求后面不再跟 `-` / 单词字符。
+ */
+function parseReasoningSupportText(help: string): boolean {
+  return /(^|[\s,])--reasoning(?![-\w])/m.test(help);
+}
+
 /** 一次 `--help` 解析出各开关的支持形态。 */
 export function parseServerHelpSupport(help: string): ServerHelpSupport {
   return {
     loadMode: parseLoadModeSupportText(help),
     flashAttn: parseFlashAttnSupportText(help),
     kvUnified: parseKvUnifiedSupportText(help),
+    reasoning: parseReasoningSupportText(help),
   };
 }
 
@@ -110,11 +126,26 @@ export function flashAttnArgs(setting: string | null | undefined, support: Flash
   return [];
 }
 
+/**
+ * 按模型的思考开关 → 启动参数（仅聊天实例）。
+ *
+ *  - auto / 没设：一个参数都不发（交给模板默认，与加这个开关前逐字节一致）；
+ *  - 认 `--reasoning`：原样发 `--reasoning on|off`；
+ *  - 不认（老版 / 没探过）：关 → `--chat-template-kwargs {"enable_thinking":false}`（Qwen3 /
+ *    GLM 等模板都认这个 kwarg，老版也有这个开关）；开 → 不发（模板默认本来就是开）。
+ */
+export function reasoningArgs(mode: string | null | undefined, supported: boolean): string[] {
+  if (mode !== "on" && mode !== "off") return [];
+  if (supported) return ["--reasoning", mode];
+  return mode === "off" ? ["--chat-template-kwargs", JSON.stringify({ enable_thinking: false })] : [];
+}
+
 // —— 进程级缓存（llama.ts 持有） ——
 
 const flashAttnSupportCache = new Map<string, FlashAttnSupport>();
 const loadModeSupportCache = new Map<string, ServerHelpSupport["loadMode"]>();
 const kvUnifiedSupportCache = new Map<string, boolean>();
+const reasoningSupportCache = new Map<string, boolean>();
 
 export function cachedFlashAttnSupport(binaryPath: string): FlashAttnSupport | null {
   return flashAttnSupportCache.get(binaryPath) ?? null;
@@ -129,24 +160,41 @@ export function cachedKvUnifiedSupport(binaryPath: string): boolean | null {
   return kvUnifiedSupportCache.get(binaryPath) ?? null;
 }
 
+/** 同步读已探测到的 `--reasoning` 支持（null = 还没探过）。 */
+export function cachedReasoningSupport(binaryPath: string): boolean | null {
+  return reasoningSupportCache.get(binaryPath) ?? null;
+}
+
 /**
  * 同步读已缓存的合并探测结果（null = 还没探过）。
  * llama.ts 的 `cachedLoadModeSupport` 委托到这里，避免两份 Map 各自演化。
  */
 export function cachedServerHelpSupport(
   binaryPath: string,
-): { loadMode: ServerHelpSupport["loadMode"]; flashAttn: FlashAttnSupport; kvUnified: boolean } | null {
+): {
+  loadMode: ServerHelpSupport["loadMode"];
+  flashAttn: FlashAttnSupport;
+  kvUnified: boolean;
+  reasoning: boolean;
+} | null {
   const load = loadModeSupportCache.get(binaryPath);
   const flash = flashAttnSupportCache.get(binaryPath);
   const kvu = kvUnifiedSupportCache.get(binaryPath);
-  if (load === undefined && flash === undefined && kvu === undefined) return null;
-  return { loadMode: load ?? "unknown", flashAttn: flash ?? "none", kvUnified: kvu ?? false };
+  const rea = reasoningSupportCache.get(binaryPath);
+  if (load === undefined && flash === undefined && kvu === undefined && rea === undefined) return null;
+  return {
+    loadMode: load ?? "unknown",
+    flashAttn: flash ?? "none",
+    kvUnified: kvu ?? false,
+    reasoning: rea ?? false,
+  };
 }
 
 export function clearServerHelpSupportCache(): void {
   flashAttnSupportCache.clear();
   loadModeSupportCache.clear();
   kvUnifiedSupportCache.clear();
+  reasoningSupportCache.clear();
 }
 
 /**
@@ -158,6 +206,7 @@ export function setCachedServerHelpSupport(binaryPath: string, support: ServerHe
   if (support.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, support.loadMode);
   flashAttnSupportCache.set(binaryPath, support.flashAttn);
   if (support.kvUnified !== undefined) kvUnifiedSupportCache.set(binaryPath, support.kvUnified);
+  if (support.reasoning !== undefined) reasoningSupportCache.set(binaryPath, support.reasoning);
 }
 
 /**
@@ -173,8 +222,9 @@ export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSup
   const cachedFlash = flashAttnSupportCache.get(binaryPath);
   const cachedLoad = loadModeSupportCache.get(binaryPath);
   const cachedKvu = kvUnifiedSupportCache.get(binaryPath);
-  if (cachedFlash && cachedLoad && cachedKvu !== undefined) {
-    return { loadMode: cachedLoad, flashAttn: cachedFlash, kvUnified: cachedKvu };
+  const cachedRea = reasoningSupportCache.get(binaryPath);
+  if (cachedFlash && cachedLoad && cachedKvu !== undefined && cachedRea !== undefined) {
+    return { loadMode: cachedLoad, flashAttn: cachedFlash, kvUnified: cachedKvu, reasoning: cachedRea };
   }
 
   let help = "";
@@ -208,6 +258,7 @@ export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSup
       loadMode: cachedLoad ?? "unknown",
       flashAttn: cachedFlash ?? "none",
       kvUnified: cachedKvu ?? false,
+      reasoning: cachedRea ?? false,
     };
   }
 
@@ -215,5 +266,6 @@ export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSup
   if (parsed.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, parsed.loadMode);
   flashAttnSupportCache.set(binaryPath, parsed.flashAttn);
   kvUnifiedSupportCache.set(binaryPath, parsed.kvUnified ?? false);
+  reasoningSupportCache.set(binaryPath, parsed.reasoning ?? false);
   return parsed;
 }

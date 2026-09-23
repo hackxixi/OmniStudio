@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ggufModelMeta, parseGguf, type GgufValue } from "./gguf";
+import { ggufModelMeta, ggufSampling, parseGguf, type GgufValue } from "./gguf";
 
 // ---------- 测试辅助：合成 GGUF 字节流 ----------
 
@@ -366,5 +366,37 @@ describe("parseGguf", () => {
     ]);
     const r = parseOrThrow(bytes);
     expect(ggufModelMeta(r.kv).vocabSize).toBe(500);
+  });
+});
+
+describe("general.sampling.*", () => {
+  test("从文件头读出作者推荐的采样值（f32 / u32 / i32 都认）", () => {
+    const bytes = buildGguf([
+      kvStr("general.architecture", "qwen3"),
+      { key: "general.sampling.temp", type: 6, value: f32(0.6) },
+      { key: "general.sampling.top_p", type: 6, value: f32(0.95) },
+      { key: "general.sampling.top_k", type: 5, value: i32(20) },
+      { key: "general.sampling.min_p", type: 6, value: f32(0) },
+      { key: "general.sampling.penalty_repeat", type: 6, value: f32(1) },
+    ]);
+    const s = ggufModelMeta(parseOrThrow(bytes).kv).sampling;
+    expect(s?.temperature).toBeCloseTo(0.6, 5);
+    expect(s?.topP).toBeCloseTo(0.95, 5);
+    expect(s?.topK).toBe(20);
+    expect(s?.minP).toBe(0);
+    expect(s?.repeatPenalty).toBe(1);
+    expect(s?.presencePenalty).toBeUndefined();
+  });
+
+  test("没有 sampling 键 → null；越界值当没写", () => {
+    expect(ggufModelMeta({ "general.architecture": "llama" }).sampling).toBeNull();
+    expect(
+      ggufSampling({
+        "general.sampling.temp": -1,
+        "general.sampling.top_p": 1.5,
+        "general.sampling.top_k": 2.5,
+        "general.sampling.min_p": 0.05,
+      }),
+    ).toEqual({ minP: 0.05 });
   });
 });

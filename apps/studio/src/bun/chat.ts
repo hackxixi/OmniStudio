@@ -24,6 +24,8 @@ import { memoryEnabled, memoryRecallSection } from "./memory";
 import type { KbCitation } from "../shared/knowledge";
 import { mainT } from "./i18n";
 import * as ModelStore from "./model-store";
+import { resolveSampling } from "./model-sampling";
+import { getModelParams } from "./db/model-params";
 
 export type ChatMessage = {
   id: number;
@@ -631,6 +633,40 @@ function fallbackLocalContext(model: string | null | undefined): number {
   return ctx;
 }
 
+/**
+ * 关思考时随请求带上的非思考档采样（仅本地模式）。
+ *
+ * 实例启动时按模型默认模式（通常是思考档）把采样写在了命令行上；这里临时关掉思考，
+ * 采样也得跟着换 —— Qwen3 非思考档是 0.7 / 0.8，拿思考档的 0.6 / 0.95 去答会变啰嗦。
+ * 云端不带：厂商各有规矩，乱给 top_k / min_p 可能直接 400。
+ *
+ * 重复惩罚两个名字都发：llama.cpp 认 `repeat_penalty`，vLLM / SGLang / mlx-lm 认
+ * `repetition_penalty`；各家对不认识的字段都是忽略（vLLM 只打一条警告），所以同发无害。
+ */
+export function nonThinkingSamplingFields(): Record<string, number> {
+  if (getSetting("SERVER_MODE") !== "local") return {};
+  const target =
+    Served.getRequestTargetServedModel()?.modelRef ?? Served.resolveConfiguredTarget()?.model ?? "";
+  if (!target) return {};
+  try {
+    // 按模型设置里用户手填的采样照样生效（思考模式这里是强制关，不看设置）
+    const override = getModelParams(target)?.sampling;
+    const { values } = resolveSampling(target, { thinking: "off", override });
+    return {
+      temperature: values.temperature,
+      top_p: values.topP,
+      top_k: values.topK,
+      min_p: values.minP,
+      presence_penalty: values.presencePenalty,
+      repeat_penalty: values.repeatPenalty,
+      repetition_penalty: values.repeatPenalty,
+    };
+  } catch {
+    // 解析失败不影响发消息：交给实例启动时的默认采样
+    return {};
+  }
+}
+
 /** 测试用：清掉兜底窗口缓存。 */
 export function resetLocalContextCacheForTest(): void {
   fallbackCtxCache = null;
@@ -731,6 +767,7 @@ async function streamAssistantReply(opts: {
     stream: true,
     // llama.cpp / Qwen3 等支持：通话等场景要求直接回答，不打思考草稿。
     ...(opts.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+    ...(opts.disableThinking ? nonThinkingSamplingFields() : {}),
   };
 
   const startedAt = performance.now();

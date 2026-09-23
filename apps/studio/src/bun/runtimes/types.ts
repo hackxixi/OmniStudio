@@ -42,6 +42,12 @@ export interface Runtime {
    */
   buildCommandLine(modelOverride?: string): string;
 
+  /**
+   * 正在跑的实例若按现在的设置 / 按模型参数重起，argv 是否会变（界面提示「需重启生效」）。
+   * 没在跑 → false。可选：没实现的引擎当作「不知道」（调用方按 false 处理）。
+   */
+  needsRestart?(): boolean;
+
   start(): Promise<StartResult>;
   stop(): Promise<void>;
   restart(): Promise<StartResult>;
