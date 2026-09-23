@@ -3,10 +3,12 @@ import { describe, expect, test } from "bun:test";
 import {
   classifyModel,
   classifyModelName,
+  engineForModelKind,
   filterModelIds,
   isChatModelCategory,
   MODEL_CATEGORY_SETS,
   modelNameFromRef,
+  resolveEngineForKind,
   type MarketModel,
   type ModelCategory,
 } from "./modelscope";
@@ -166,6 +168,53 @@ describe("modelNameFromRef", () => {
   test("空值回落到 fallback", () => {
     expect(modelNameFromRef("", "—")).toBe("—");
     expect(modelNameFromRef("   ", "—")).toBe("—");
+  });
+});
+
+/**
+ * engineForModelKind / resolveEngineForKind 的平台感知：mac 上没有可用的 vLLM / SGLang
+ * （官方只发 Linux 的 CUDA 轮子），safetensors 必须推荐 MLX；不分平台的话 mac 上
+ * 任何 safetensors 目录都会推荐 vLLM，用户点「启动」拿到「vLLM 未安装」而不是
+ * 一个能跑起来的 MLX 实例（真机现场：HF 缓存里的 laya-multilingual-mlx 目录）。
+ */
+describe("engineForModelKind（平台感知）", () => {
+  test("safetensors：mac → mlx，非 mac → vllm", () => {
+    expect(engineForModelKind("safetensors", true)).toBe("mlx");
+    expect(engineForModelKind("safetensors", false)).toBe("vllm");
+  });
+
+  test("gguf：不分平台都是 llama.cpp", () => {
+    expect(engineForModelKind("gguf", true)).toBe("llama.cpp");
+    expect(engineForModelKind("gguf", false)).toBe("llama.cpp");
+  });
+
+  test("other：不分平台都是 null", () => {
+    expect(engineForModelKind("other", true)).toBeNull();
+    expect(engineForModelKind("other", false)).toBeNull();
+  });
+});
+
+describe("resolveEngineForKind（平台感知）", () => {
+  test("mac 上 llama.cpp + safetensors → mlx（而不是 mac 上装不了的 vllm）", () => {
+    expect(resolveEngineForKind("safetensors", "llama.cpp", true)).toBe("mlx");
+  });
+
+  test("非 mac 上 llama.cpp + safetensors → vllm", () => {
+    expect(resolveEngineForKind("safetensors", "llama.cpp", false)).toBe("vllm");
+  });
+
+  test("当前引擎支持该格式时不变（任何平台）", () => {
+    expect(resolveEngineForKind("safetensors", "vllm", true)).toBe("vllm");
+    expect(resolveEngineForKind("safetensors", "mlx", false)).toBe("mlx");
+    expect(resolveEngineForKind("gguf", "llama.cpp", true)).toBe("llama.cpp");
+  });
+
+  test("缺省 isMac = 当前平台（mac 测试环境 → mlx）", () => {
+    if (process.platform === "darwin") {
+      expect(resolveEngineForKind("safetensors", "llama.cpp")).toBe("mlx");
+    } else {
+      expect(resolveEngineForKind("safetensors", "llama.cpp")).toBe("vllm");
+    }
   });
 });
 

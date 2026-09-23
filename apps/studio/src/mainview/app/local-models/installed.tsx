@@ -1,7 +1,9 @@
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2Icon, PlayIcon, TerminalIcon, CheckIcon, CheckCircle2Icon, StarIcon, Trash2Icon, HardDriveIcon, FolderOpenIcon, AlertTriangleIcon, SparklesIcon, FolderIcon } from "lucide-react";
+import { Loader2Icon, PlayIcon, TerminalIcon, CheckIcon, CheckCircle2Icon, StarIcon, Trash2Icon, HardDriveIcon, FolderOpenIcon, AlertTriangleIcon, SparklesIcon, FolderIcon, WaypointsIcon } from "lucide-react";
 import { rpcClient } from "@lib/rpc";
+import { useAppStore } from "@stores/app";
+import { useRouter } from "@stores/router";
 import { SourceBadge } from "@components/source-badge";
 import { ModelCategoryBadge, ModelFormatBadge, MODEL_TAG_CLASS } from "@components/model-category-badge";
 import { ModelCategoryChips } from "@components/model-category-chips";
@@ -57,6 +59,8 @@ function InstalledModelRow({
     kind: import("../../../shared/modelscope").ModelFileKind;
     /** 运行时实际加载的路径（分批 GGUF 指向第一个分片），与已启动实例对齐用。 */
     runtimeTarget: string;
+    /** 非聊天权重家族（laya-mlx = JEV / SystemOne 判定模型）；有值时不给启动入口。 */
+    special?: "laya-mlx";
   };
   engine: InferenceEngine;
 }) {
@@ -69,6 +73,11 @@ function InstalledModelRow({
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const isCustomized = useCustomizedModels();
+  // laya-mlx（JEV / SystemOne 判定模型）：BERT 系小模型，走 JEV 页的本地运行时
+  // （systemone-laya worker 按 repo id 懒加载），不能拿目录进推理服务器 ——
+  // 启动 / 设为当前 / 参数入口全部换成一个指向 JEV 页的按钮（三步切换，缺一步
+  // 从别的页面点过来路由不动，与 agent-diagnose-button 的跳转会同一套）。
+  const isLaya = model.special === "laya-mlx";
   // 按模型参数的 key：与启动按钮用的是同一个 target（分批 GGUF → 第一片），服务端再归一一次
   const paramsTarget = model.runtimeTarget || model.path;
 
@@ -159,13 +168,19 @@ function InstalledModelRow({
                   : t("models.format.other")
             }
           />
-          {!compatible && (
+          {isLaya && (
+            // laya-mlx 不走推理引擎，引擎切换提示不适用（它永远「不兼容」）。
+            <Badge variant="secondary" className="gap-1 text-[10px]">
+              <WaypointsIcon className="size-3" /> {t("models.specialLaya")}
+            </Badge>
+          )}
+          {!isLaya && !compatible && (
             <span className="inline-flex h-5 items-center gap-1 rounded-full bg-amber-100 px-1.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
               <AlertTriangleIcon className="size-3" />
               {t("models.autoSwitchEngine")}
             </span>
           )}
-          {isCustomized(paramsTarget, model.path) && <CustomizedParamsBadge />}
+          {!isLaya && isCustomized(paramsTarget, model.path) && <CustomizedParamsBadge />}
           <OriginBadge origin={model.origin} />
           {model.source && model.origin !== "hf-cache" && <SourceBadge source={model.source} />}
           {model.isActive && (
@@ -241,46 +256,64 @@ function InstalledModelRow({
         >
           <StarIcon className={cn("size-4", model.favorite && "fill-amber-500")} />
         </Button>
-        {kind !== "other" && <ModelParamsButton model={paramsTarget} label={model.fileName} />}
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          tooltip={t("models.copyCommand")}
-          onClick={() => void copyCommand()}
-          className="text-muted-foreground"
-        >
-          {copied ? <CheckIcon className="size-4 text-primary" /> : <TerminalIcon className="size-4" />}
-        </Button>
-        <Button
-          variant="default"
-          size="sm"
-          className="h-7 text-xs"
-          disabled={startMutation.isPending || serverBusy}
-          onClick={() => startMutation.mutate()}
-        >
-          {startMutation.isPending ? (
-            <Loader2Icon data-icon="inline-start" className="animate-spin" />
-          ) : (
-            <PlayIcon data-icon="inline-start" />
-          )}
-          {serverStatus === "running" ? t("models.restart") : t("models.run")}
-        </Button>
-        {/* 嵌入模型不能设为当前聊天模型（后端会拒），按钮藏掉别给死入口。 */}
-        {model.category !== "embedding" && (
+        {kind !== "other" && !isLaya && <ModelParamsButton model={paramsTarget} label={model.fileName} />}
+        {isLaya ? (
           <Button
-            variant={model.isActive ? "default" : "outline"}
+            variant="default"
             size="sm"
             className="h-7 text-xs"
-            disabled={model.isActive || setActiveMutation.isPending}
-            onClick={() => setActiveMutation.mutate()}
+            onClick={() => {
+              // 三步缺一不可：切 JEV、切回主路由（只切 activeApp 从别的页面点过来路由不动）。
+              useAppStore.getState().setActiveApp("jev");
+              useRouter.getState().setRoute({ path: "index" });
+            }}
           >
-            {setActiveMutation.isPending ? (
-              <Loader2Icon data-icon="inline-start" className="animate-spin" />
-            ) : (
-              <CheckCircle2Icon data-icon="inline-start" />
-            )}
-            {model.isActive ? t("models.inUse") : t("models.activate")}
+            <WaypointsIcon data-icon="inline-start" />
+            {t("models.openInJev")}
           </Button>
+        ) : (
+          <>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              tooltip={t("models.copyCommand")}
+              onClick={() => void copyCommand()}
+              className="text-muted-foreground"
+            >
+              {copied ? <CheckIcon className="size-4 text-primary" /> : <TerminalIcon className="size-4" />}
+            </Button>
+            <Button
+              variant="default"
+              size="sm"
+              className="h-7 text-xs"
+              disabled={startMutation.isPending || serverBusy}
+              onClick={() => startMutation.mutate()}
+            >
+              {startMutation.isPending ? (
+                <Loader2Icon data-icon="inline-start" className="animate-spin" />
+              ) : (
+                <PlayIcon data-icon="inline-start" />
+              )}
+              {serverStatus === "running" ? t("models.restart") : t("models.run")}
+            </Button>
+            {/* 嵌入模型不能设为当前聊天模型（后端会拒），按钮藏掉别给死入口。 */}
+            {model.category !== "embedding" && (
+              <Button
+                variant={model.isActive ? "default" : "outline"}
+                size="sm"
+                className="h-7 text-xs"
+                disabled={model.isActive || setActiveMutation.isPending}
+                onClick={() => setActiveMutation.mutate()}
+              >
+                {setActiveMutation.isPending ? (
+                  <Loader2Icon data-icon="inline-start" className="animate-spin" />
+                ) : (
+                  <CheckCircle2Icon data-icon="inline-start" />
+                )}
+                {model.isActive ? t("models.inUse") : t("models.activate")}
+              </Button>
+            )}
+          </>
         )}
         <Button
           variant="ghost"

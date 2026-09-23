@@ -101,7 +101,8 @@ export function getLaunchCommand(modelOverride?: string): { command: string; eng
         return false;
       }
     })();
-    // 目录条目按目录内容选引擎；单文件按扩展名（GGUF → llama.cpp，safetensors → vLLM）。
+    // 目录条目按目录内容选引擎；单文件按扩展名（GGUF → llama.cpp，safetensors →
+    // mac 上 MLX / 其它平台 vLLM，`engineForModelKind` 缺省 `isMac` = 当前平台）。
     const engine = isDir
       ? (() => {
           const kind = dirModelKind(target);

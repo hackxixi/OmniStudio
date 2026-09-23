@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "fs";
 import { createServer } from "node:net";
+import path from "path";
 
 import * as Settings from "./db/settings";
 import { EMBEDDING_PORT_BASE, ENGINE_PORT_KEYS, engineSupportsEmbeddings } from "../shared/engines";
@@ -7,7 +8,7 @@ import { classifyStartupError, type StartupErrorKind } from "../shared/engine-er
 import { downloadManager, type DownloadTask } from "./download-manager";
 import { hasUnfinishedDownloadAt } from "./downloader";
 import { getModelProfile } from "../shared/model-profiles";
-import { dirModelKind, modelNameForPath, resolveRuntimeTarget } from "./model-scan";
+import { dirModelKind, modelNameForPath, resolveRuntimeTarget, specialModelFormat } from "./model-scan";
 import { listInstalledModels, servedNameForModelPath, slugModelFileName } from "./model-store";
 import { createRuntime, type InferenceEngine, type Runtime, type ServerStatus } from "./runtimes";
 import { mlxRequestModelId } from "./runtimes/mlx";
@@ -357,7 +358,12 @@ function targetKind(target: string): { isDir: boolean; kind: ModelFileKind } {
 
 /**
  * 该用哪个引擎加载这个目标：显式指定 > 当前引擎能加载就用当前引擎 >
- * 按格式挑（GGUF → llama.cpp，safetensors → vLLM）。
+ * 按格式挑（GGUF → llama.cpp，safetensors → mac 上 MLX / 其它平台 vLLM）。
+ *
+ * 推荐引擎的挑选必须平台感知（`engineForModelKind` 带 `isMac`）：mac 上没有可用的
+ * vLLM / SGLang，不分平台的话 mac 上任何 safetensors 目录都会推荐 vLLM，用户点
+ * 「启动」拿到的就是「vLLM 未安装」而不是一个能跑起来的 MLX 实例（真机现场：
+ * HF 缓存里的 laya-multilingual-mlx 目录）。
  */
 function resolveTargetEngine(target: string, preferred?: InferenceEngine): InferenceEngine {
   const current = (Settings.getSetting("INFERENCE_ENGINE") as InferenceEngine) || "llama.cpp";
@@ -713,6 +719,32 @@ export async function startServedModel(params: StartParams): Promise<StartServed
 
   // 仓库目录 / 分批 GGUF 要先归一化成运行时真正加载的目标（与 setActiveModel 一致）。
   const target = isLocalTarget(raw) ? resolveRuntimeTarget(raw) : raw;
+  const { isDir } = targetKind(target);
+
+  // 非聊天权重（laya-mlx = JEV / SystemOne 判定模型）绝不能进推理服务器：
+  // 它在「已安装」列表里长得和正常 safetensors 仓库一模一样，用户会点「启动」，
+  // 而 vLLM / MLX 都会因为架构不认识而失败。在选引擎之前先拒掉，给出指向 JEV
+  // 页的明确指引（它的本地运行时走 systemone-laya worker 按 repo id 懒加载）。
+  // 目录目标只查目录本身（父目录有 mlx_config.json 不代表这个子目录是 laya）；
+  // 文件目标（平面目录里 laya 被列成文件条目，runtimeTarget 指向 model.safetensors）
+  // 查它所在的目录。
+  if (isLocalTarget(target)) {
+    const special = specialModelFormat(isDir ? target : path.dirname(target));
+    if (special === "laya-mlx") {
+      logEvent({
+        level: "warn",
+        source: "server",
+        event: "served_model.start.refused",
+        message: `拒绝启动 JEV 判定模型（laya-mlx）：${target}`,
+        detail: { target, trigger: "startServedModel" },
+      });
+      return {
+        ok: false,
+        error: "这是 JEV 判定模型（laya-mlx），不是聊天模型，不能用推理引擎启动。请到左侧「JEV」里选择本地运行时使用它。",
+      };
+    }
+  }
+
   const engine = resolveTargetEngine(target, params.engine);
   const id = servedId(engine, target);
   const existing = entries.get(id);
@@ -730,7 +762,6 @@ export async function startServedModel(params: StartParams): Promise<StartServed
     entries.delete(id);
   }
 
-  const { isDir } = targetKind(target);
   if (!isLocalTarget(target) && !target.includes("/")) {
     return { ok: false, error: `Model not found: ${target}` };
   }

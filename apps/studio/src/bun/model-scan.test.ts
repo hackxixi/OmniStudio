@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "path";
 
 /**
- * model-scan 的 mmproj 排除测试入口（真测试体见 model-scan.tests.ts）。
+ * model-scan 的 mmproj 排除与 laya-mlx 标记测试入口（真测试体见 model-scan.tests.ts）。
  *
  * 子进程隔离的理由与先例（model-store.embedding.test.ts:4-13）相同：bun 的 mock
  * 注册表在同一批次里跨文件共享，别的测试文件会桩掉 fs / db/settings
@@ -11,7 +11,7 @@ import { join } from "path";
  */
 const suite = join(import.meta.dir, "model-scan.tests.ts");
 
-describe("model-scan: mmproj 不作为已安装模型列出", () => {
+describe("model-scan: mmproj 不作为已安装模型列出 / laya-mlx 目录被标记", () => {
   test("平面目录里的 mmproj-*.gguf 不出现在扫描结果；仓库 files[] 不受损（子进程隔离跑）", () => {
     const proc = Bun.spawnSync({
       cmd: [process.execPath, "test", suite],

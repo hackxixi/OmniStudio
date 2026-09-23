@@ -221,6 +221,7 @@ export function listInstalledModels(): InstalledModel[] {
       files: m.files,
       supportFiles: m.supportFiles,
       contextLength,
+      special: m.special,
     };
   });
 }
