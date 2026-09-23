@@ -21,7 +21,7 @@
  * 都一样，属于「该换模型」而不是「该重试」。
  */
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
-import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 
 /** 只看这几个字段，便于单测喂普通对象。 */
 type RoughMessage = {
@@ -139,21 +139,29 @@ export function nudgeMessage(attempt: number): AgentMessage {
   } as AgentMessage;
 }
 
+/** 收尾回合注入的那条 harness 消息（文案见 `stepLimitWrapUpText`）。 */
+export function wrapUpMessage(maxSteps: number): AgentMessage {
+  return {
+    role: "user",
+    content: [{ type: "text" as const, text: stepLimitWrapUpText(maxSteps) }],
+    timestamp: Date.now(),
+  } as AgentMessage;
+}
+
 /**
- * 空回合自愈（对齐 OMP 的 empty-stop-retry）：
- * 助手既没给正文、也没调工具就停下来时，注入一条 harness 提醒让它重新决定，
- * 而不是直接把这轮交出去（界面上那会是一个空白气泡）。
+ * 回合层自愈（本文件）：
+ * 1. **失败重发**：整轮以可重试的错误结束时，丢掉那条空壳助手消息、
+ *    用 `agent.continue()` 拿着同一条上下文再发一次。
+ * 2. **空回合提醒**：助手既没有正文、也没调工具就停下来的回合，注入一条
+ *    harness 提示让它重新决定（提醒次数受 `AGENT_RETRY_MAX` 约束）。
+ * 3. **步数上限收尾**：步数用满时如果它还没写出结论，给一次「收尾回合」：
+ *    把下一轮的 `tools` 置空（内核循环会原样用它）并注入一条「按已有信息
+ *    写结论」的 harness 消息，而不是直接停在空壳上（用户看到"跑完了却什么都
+ *    没有"）。只给一次：它是为把话说完而设，不是为了再干活。
  *
- * 用内核的 followUp 队列实现，**没有另起一轮**：`shouldStopAfterTurn` 里返回 false
- * 并在队列里放一条消息，循环会在"本来要停"的那一刻把它取出来接着跑 ——
- * 提醒只活在这次运行里，不会在会话里多出一条用户消息，也不会再走一遍落库。
- *
- * 提醒次数受自愈预算约束（`AGENT_RETRY_MAX`）：模型要是一路空到底，提醒几次就放手，
- * 免得把窗口和推理时间浪费在"求它说话"上。
- *
- * 这条实现依赖的内核契约（`agent-retry.loop.test.ts` 用假模型流钉住了）：
- * `shouldStopAfterTurn` 返回 false 之后，内层循环结束前会 drain followUp 队列，
- * 队列非空就继续下一轮。
+ * 依赖的内核契约（`agent-retry.loop.test.ts` 用假模型流钉住了）：
+ * `shouldStopAfterTurn` 返回 false 之后，内层循环结束前会 drain steering / followUp
+ * 队列，非空就继续下一轮。
  */
 export function attachTurnRecovery(
   agent: Agent,
@@ -162,11 +170,34 @@ export function attachTurnRecovery(
     maxSteps: number;
     budget: number;
     onNudge: (attempt: number) => void;
+    /** 步数上限收尾回合注入时回调一次（轨迹里留一条"已让它停工具直接总结"）。 */
+    onWrapUp?: () => void;
   },
 ): void {
   let nudges = 0;
+  /** 收尾回合只给一次：第二次到顶就是真停。 */
+  let wrapUpGiven = false;
   agent.shouldStopAfterTurn = (context) => {
-    if (opts.steps() >= opts.maxSteps) return true;
+    if (opts.steps() >= opts.maxSteps) {
+      if (wrapUpGiven) return true;
+      // 它已经说了正文：那就算是结论了，正常停。
+      if (hasAssistantText(context.message as never)) return true;
+      // 长度钳制型空回合（`stopReason=length` 且输出 ≤ 1）：请求侧把 max_tokens
+      // 压到了下限，收尾回合重发一次算术还是同一截 —— 直接交出去，外层
+      // classifyTurnOutcome 会给出指向配置的诊断文案（与空回合分支同口径）。
+      if (isLengthClampedTurn(context.message as never)) return true;
+      wrapUpGiven = true;
+      // 把下一轮要用的工具清单清空：`lastCompletedTurn.context` 就是内核下一轮
+      // 请求的 `currentContext`（可变对象，见 pi-agent-core 的 `runLoop`），
+      // 它的 `tools` 字段直接决定发给模型的工具列表。置空后 pi-ai 在历史里
+      // 还有工具调用的情况下会自动补发 `tools: []`（保持协议合法），模型这轮
+      // 想调也调不了 —— 这正是「让它停工具直接总结」的机制，而不是靠提示词
+      // 求它别调。
+      context.context.tools = [] as unknown as AgentTool<any>[];
+      agent.steer(wrapUpMessage(opts.maxSteps));
+      opts.onWrapUp?.();
+      return false; // 给那一轮
+    }
     if (!isEmptyAssistantTurn(context.message as never)) return false;
     // 长度钳制型空回合：提醒无济于事（重发的 max_tokens 还是会被钳到 1），
     // 直接交出去，外层 classifyTurnOutcome 会给出指向配置的诊断文案。
@@ -177,6 +208,16 @@ export function attachTurnRecovery(
     agent.followUp(nudgeMessage(nudges));
     return false;
   };
+}
+
+/** 助手消息里有没有非空正文（thinking / toolCall 不算）。 */
+function hasAssistantText(message: RoughMessage | undefined): boolean {
+  if (!message || message.role !== "assistant") return false;
+  const content = Array.isArray(message.content) ? message.content : [];
+  return content.some((block) => {
+    const part = block as { type?: string; text?: string };
+    return part?.type === "text" && typeof part.text === "string" && part.text.trim().length > 0;
+  });
 }
 
 /**
@@ -202,4 +243,22 @@ export function emptyTurnNudgeText(attempt: number): string {
     );
   }
   return lines.join("\n");
+}
+
+/**
+ * 步数用尽时的收尾文案。
+ *
+ * 与 `emptyTurnNudgeText` 一样标明是 harness 消息；区别是它**禁止再调工具**
+ * （那一轮的 `tools` 已经被置空），只要求把已有发现写成结论 —— 这是「用满预算却
+ * 没有结论」和「有结论但没做完」的分界线：前者用户什么也拿不到，后者至少能接手。
+ */
+export function stepLimitWrapUpText(maxSteps: number): string {
+  return [
+    `（系统消息，不是用户发言）你已用完本回合的 ${maxSteps} 步工具预算，不能再调用任何工具。`,
+    "现在直接基于已经查到的信息给出结论，分三部分：",
+    "① 问题判断：卡在哪一步、依据是什么（引用你读到的报错 / 日志行）；",
+    "② 已经做了什么（哪些操作成功、哪些失败）；",
+    "③ 还没做完的事与建议的下一步：需要用户确认的操作要写清楚具体命令、路径与预期结果，不留待办。",
+    "不要再调工具，也不要回复“好的”这类空话。",
+  ].join("\n");
 }

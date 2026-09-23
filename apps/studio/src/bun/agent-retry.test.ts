@@ -10,6 +10,7 @@ import {
   lastAssistantMessage,
   retryBackoffMs,
   retryNoticeText,
+  stepLimitWrapUpText,
 } from "./agent-retry";
 
 const assistant = (input: {
@@ -169,5 +170,17 @@ describe("退避与文案", () => {
     expect(emptyTurnNudgeText(2)).toContain("最后一次");
     // 提醒是给模型看的，不能反过来变成"再问用户一次"。
     expect(emptyTurnNudgeText(2)).not.toContain("ask_user");
+  });
+
+  test("步数上限收尾文案：标明是 harness 消息、禁止调工具、要求给结论三段", () => {
+    const text = stepLimitWrapUpText(40);
+    expect(text).toContain("系统消息，不是用户发言");
+    expect(text).toContain("40 步");
+    expect(text).toContain("不能再调用任何工具");
+    expect(text).toContain("① 问题判断");
+    expect(text).toContain("② 已经做了什么");
+    expect(text).toContain("③ 还没做完");
+    // 与空回合提醒同一口径：不能反向变成"问用户"。
+    expect(text).not.toContain("ask_user");
   });
 });

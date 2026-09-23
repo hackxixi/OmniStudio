@@ -54,7 +54,24 @@ export function AgentDiagnoseButton({ intro, error, context, logs, label, size =
       } catch {
         // 取不到日志也照样走：报错原文与环境已经够 Agent 开始了。
       }
-      const prompt = buildDiagnosisPrompt({ intro, error, context, logs: lines });
+      // 环境行（平台 / 数据目录 / 日志路径）：Agent 的 glob/grep/read_file 被工作区权限
+      // 拒掉之后，它要花十几步才找得到日志和数据库在哪 —— 直接给路径把那步省掉。
+      // 取不到任何一项就跳过：环境行缺失只是"少带一点现场"，不该让按钮本身失败。
+      // 平台信息来自主进程（getAboutInfo 的 platform = process.platform）：webview 里
+      // navigator.platform 是空的，只有主进程知道自己是 darwin / linux / win32。
+      const ctx = [...(context ?? [])];
+      try {
+        const about = await rpcClient.getAboutInfo();
+        if (about.dataDir) {
+          ctx.push(`应用数据目录：${about.dataDir}`);
+          ctx.push(`应用日志：${about.dataDir}/logs/app.log（JSON lines，每行 level/source/event/message/detail）`);
+        }
+        const platform = [about.platform, about.arch].filter(Boolean).join(" ").trim();
+        if (platform) ctx.push(`平台：${platform}`);
+      } catch {
+        // 同上：环境行是锦上添花，取不到不影响按钮。
+      }
+      const prompt = buildDiagnosisPrompt({ intro, error, context: ctx, logs: lines });
       const { session } = await rpcClient.createAgentSession({});
       return { session, prompt };
     },

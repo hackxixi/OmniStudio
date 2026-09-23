@@ -1685,6 +1685,10 @@ async function runSubagent(opts: {
     // 按轮数封顶，而不是"只跑一轮"：子智能体通常要先调研再写结论，
     // 一轮就掐断会让它永远交不出结论 —— 主线拿到的是「（无输出）」。
     // 空回合同样要提醒：子智能体的失败在主线上只表现为「（无输出）」，最难查。
+    // 步数用尽时给一次收尾回合（tools 置空 + 让它按已有信息写结论）——
+    // 主线拿到的是子智能体的最后一段正文，没有收尾回合的话它"用满预算"
+    // 就交不出结论，主线看到的还是「（无输出）」，最难查的那一种。
+    let subagentWrapUp = false;
     attachTurnRecovery(agent, {
       steps: () => subagentSteps,
       maxSteps: maxSubagentSteps,
@@ -1698,6 +1702,17 @@ async function runSubagent(opts: {
           subagentId,
           output: `子智能体空回合，已提醒它继续（第 ${attempt} 次）。`,
         }),
+      onWrapUp: () => {
+        subagentWrapUp = true;
+        recordEvent({
+          conversationId: opts.conversationId,
+          messageId: opts.parentMessageId,
+          kind: "status",
+          toolName: "task",
+          subagentId,
+          output: `子智能体达到步数上限（${maxSubagentSteps} 步），已让它停下工具、按已查到的信息直接总结。`,
+        });
+      },
     });
     await agent.prompt(opts.prompt + reviewContext + planContext);
     recordEvent({
@@ -1708,7 +1723,9 @@ async function runSubagent(opts: {
       subagentId,
       output: text.trim()
         ? `完成：${text.trim().slice(0, 400)}`
-        : `已停止（达到子任务步数上限 ${maxSubagentSteps}，未给出结论）`,
+        : subagentWrapUp
+          ? `达到子任务步数上限 ${maxSubagentSteps}，已让它停下工具直接总结（但收尾后仍无正文，可能模型/推理服务异常）`
+          : `已停止（达到子任务步数上限 ${maxSubagentSteps}，未给出结论）`,
       isError: !text.trim(),
     });
     return text.trim();
@@ -2567,6 +2584,8 @@ export async function runAgentTurn(opts: {
   let fullText = "";
   let reasoning = "";
   let step = 0;
+  /** 步数上限后是否给过一次收尾回合（轨迹文案用，见 attachTurnRecovery）。 */
+  let stepLimitWrapUp = false;
   let aborted = false;
   /**
    * 自愈（见 `agent-retry.ts`）：`retryLimit` 是这一个回合可以花的重发 / 提醒次数；
@@ -2736,6 +2755,25 @@ export async function runAgentTurn(opts: {
           event: "agent.turn.empty_nudge",
           message: "空回合：已注入提醒让它重新决定",
           detail: { conversationId, attempt, model: modelName, mode },
+        });
+      },
+      onWrapUp: () => {
+        // 步数用满时它还在调工具：给一次收尾回合（tools 置空 + 让它写结论），
+        // 而不是停在空壳上 —— 那是"执行没完成、什么结论都没有"的现场。
+        stepLimitWrapUp = true;
+        recordEvent({
+          conversationId,
+          messageId: assistantId,
+          kind: "status",
+          toolName: "retry",
+          output: `达到步数上限（${maxSteps} 步），已让它停下工具、按已查到的信息直接总结。`,
+        });
+        logEvent({
+          level: "info",
+          source: "agent",
+          event: "agent.turn.step_limit_wrap_up",
+          message: "步数用尽：已注入收尾回合（tools 置空，要求直接给结论）",
+          detail: { conversationId, maxSteps, model: modelName, mode },
         });
       },
     });
@@ -2954,7 +2992,8 @@ export async function runAgentTurn(opts: {
       fullText = `⚠️ ${note}`;
     }
 
-    if (step >= maxSteps) {
+    // 收尾回合给过的话，onWrapUp 已经在轨迹里记过一条说明，这里不再重复。
+    if (step >= maxSteps && !stepLimitWrapUp) {
       recordEvent({
         conversationId,
         messageId: assistantId,
