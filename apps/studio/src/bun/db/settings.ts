@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import type { InferenceEngine } from "../../shared/modelscope";
 import { ENGINE_IDS, ENGINE_SPECS, EMBEDDING_PORT_BASE } from "../../shared/engines";
 import { db } from "./index";
@@ -749,12 +749,37 @@ export function invalidateSettingsCache() {
   settingsCache.clear();
 }
 
+/**
+ * 手调过这些启动参数的人，自动调参默认保持关。
+ *
+ * SERVER_AUTO_TUNE 的默认值从「关」改成了「开」，而自动模式会接管 ctx / batch / ubatch / GPU 层数。
+ * 老用户在手动模式下存过这些值（比如把上下文调到 81920），默认一翻就被规划器悄悄换成
+ * 别的数 —— 一台 16 GB 的 Mac 上 4B 模型被规划到 258K 窗口、吃掉 12.9 GB。
+ * 所以只有「自动调参没表过态、也没手存过任何启动参数」的人才默认开；表过态的以他为准。
+ */
+const MANUAL_LAUNCH_KEYS = ["SERVER_CTX_SIZE", "SERVER_BATCH_SIZE", "SERVER_UBATCH_SIZE", "SERVER_GPU_LAYERS"] as const;
+
+function defaultFor(key: SettingsKey, storedKeys: () => Set<string>): string {
+  if (key !== "SERVER_AUTO_TUNE") return DEFAULTS[key];
+  const stored = storedKeys();
+  return MANUAL_LAUNCH_KEYS.some((k) => stored.has(k)) ? "0" : DEFAULTS[key];
+}
+
+function storedManualLaunchKeys(): Set<string> {
+  const rows = db
+    .select({ key: settingsTable.key })
+    .from(settingsTable)
+    .where(inArray(settingsTable.key, [...MANUAL_LAUNCH_KEYS]))
+    .all();
+  return new Set(rows.map((r) => r.key));
+}
+
 export function getSetting(key: SettingsKey): string {
   const now = Date.now();
   const cached = settingsCache.get(key);
   if (cached && now - cached.at < SETTINGS_CACHE_TTL_MS) return cached.value;
   const row = db.select().from(settingsTable).where(eq(settingsTable.key, key)).get();
-  const value = maybeDecrypt(key, row?.value ?? DEFAULTS[key]);
+  const value = maybeDecrypt(key, row?.value ?? defaultFor(key, storedManualLaunchKeys));
   settingsCache.set(key, { value, at: now });
   return value;
 }
@@ -775,7 +800,11 @@ export function setServerFlashAttnEffective(value: EffectiveFlashAttn): void {
 
 export function getAllSettings(): Record<string, string> {
   const rows = db.select().from(settingsTable).all();
-  const result: Record<string, string> = { ...DEFAULTS };
+  const stored = new Set(rows.map((r) => r.key));
+  const result: Record<string, string> = {
+    ...DEFAULTS,
+    SERVER_AUTO_TUNE: defaultFor("SERVER_AUTO_TUNE", () => stored),
+  };
   for (const row of rows) {
     // 敏感槽位解密后再交给调用方（RPC 会下发给渲染进程，落盘是密文，内存是明文 ——
     // 与加密前行为一致，避免前端各处读 key 的逻辑崩掉）。
@@ -857,6 +886,8 @@ export function updateSettings(values: Record<string, string>) {
       .run();
     // 缓存内存的是解密后的明文（紧接的 getSetting 直接命中，行为一致）
     settingsCache.set(key, { value, at: Date.now() });
+    // 自动调参的默认值由「存没存过手动启动参数」推出来（见 defaultFor），这里存了一个就作废它
+    if ((MANUAL_LAUNCH_KEYS as readonly string[]).includes(key)) settingsCache.delete("SERVER_AUTO_TUNE");
   }
 }
 
