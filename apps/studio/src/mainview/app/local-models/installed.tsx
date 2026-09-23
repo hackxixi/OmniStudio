@@ -24,6 +24,11 @@ import { AgentDiagnoseButton } from "@/mainview/components/agent-diagnose-button
 import { StartFailureDetails } from "@components/start-failure-details";
 import { cn } from "@/mainview/lib/utils";
 import { formatBytes } from "./parts";
+import {
+  CustomizedParamsBadge,
+  ModelParamsButton,
+  useCustomizedModels,
+} from "@components/model-params-sheet";
 
 // ---------------------------------------------------------------------------
 // 已安装模型管理
@@ -63,6 +68,9 @@ function InstalledModelRow({
   const [startError, setStartError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const isCustomized = useCustomizedModels();
+  // 按模型参数的 key：与启动按钮用的是同一个 target（分批 GGUF → 第一片），服务端再归一一次
+  const paramsTarget = model.runtimeTarget || model.path;
 
   const setActiveMutation = useMutation({
     mutationFn: () => rpcClient.setActiveModel({ path: model.path }),
@@ -157,6 +165,7 @@ function InstalledModelRow({
               {t("models.autoSwitchEngine")}
             </span>
           )}
+          {isCustomized(paramsTarget, model.path) && <CustomizedParamsBadge />}
           <OriginBadge origin={model.origin} />
           {model.source && model.origin !== "hf-cache" && <SourceBadge source={model.source} />}
           {model.isActive && (
@@ -232,6 +241,7 @@ function InstalledModelRow({
         >
           <StarIcon className={cn("size-4", model.favorite && "fill-amber-500")} />
         </Button>
+        {kind !== "other" && <ModelParamsButton model={paramsTarget} label={model.fileName} />}
         <Button
           variant="ghost"
           size="icon-sm"

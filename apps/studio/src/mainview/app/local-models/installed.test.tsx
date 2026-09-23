@@ -84,6 +84,7 @@ mock.module("@lib/rpc", () => ({
     },
     getSettings: async () => ({ settings: {} }),
     showInExplorer: async () => ({ ok: true }),
+    listModelParams: async () => ({ entries: [] }),
   },
 }));
 
