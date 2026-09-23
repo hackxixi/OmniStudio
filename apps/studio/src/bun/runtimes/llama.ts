@@ -1,6 +1,6 @@
 import type { Subprocess } from "bun";
-import { existsSync, readdirSync, statSync } from "fs";
-import { basename, dirname, join } from "path";
+import { existsSync, statSync } from "fs";
+import { basename } from "path";
 import { EMBEDDING_PORT_BASE } from "../../shared/engines";
 import { getModelProfile, type ServerArgs } from "../../shared/model-profiles";
 import { parseComputeBufferBytes, parseFlashAttnState, parseKvCacheBytes } from "../../shared/llama-log";
@@ -14,18 +14,22 @@ import {
 import {
   buildLaunchPlanKeyFromSettings,
   cachedLaunchPlan,
+  pairedMmprojPath,
   refreshLaunchPlan,
   type LaunchPlan,
   type LaunchPlanKey,
 } from "../launch-plan";
 import { llamaCppBinaryPath } from "../engine-paths";
-import { isMmprojFile, mainGgufInDir, modelNameForPath } from "../model-scan";
+import { mainGgufInDir, modelNameForPath } from "../model-scan";
 import { slugModelFileName } from "../model-store";
 import { markServerStarted } from "../stats";
 import { extractStartupError } from "./errors";
 import {
+  COMMON_LLAMA_SERVER_PATHS,
   cachedFlashAttnSupport,
+  cachedKvUnifiedSupport,
   cachedServerHelpSupport,
+  defaultLlamaServerBinary,
   flashAttnArgs,
   probeServerHelp,
   type FlashAttnSupport,
@@ -44,10 +48,7 @@ import type {
 
 const DOWNLOAD_PATTERN = /download|fetch|pulling|(\d+(\.\d+)?)\s*%/i;
 
-const COMMON_BINARY_PATHS = [
-  "/opt/homebrew/bin/llama-server",
-  "/usr/local/bin/llama-server",
-];
+const COMMON_BINARY_PATHS = COMMON_LLAMA_SERVER_PATHS;
 
 /**
  * 按二进制路径进程级缓存的 `--help` 探测结果（load-mode 与 flash-attn 共用，一次子进程）。
@@ -96,6 +97,18 @@ export function effectiveFlashAttnForPlan(
   if (e === "on") return true;
   if (e === "off") return false;
   return false; // 从没启动过 → 保守按关计价
+}
+
+/**
+ * 设置表里持久化的「上次实测」FA（SERVER_FLASH_ATTN_EFFECTIVE）收成三态；
+ * 手改进来的非法值当未知（""）。
+ *
+ * 为什么运行时也要读它：每个 LlamaRuntime 实例的内存态初始都是 ""（未知），而预览 RPC
+ * 读的是这条持久化设置 —— 只看内存态的话，重启应用 / 新建实例后运行时永远按「FA 关」
+ * 计价，预览却按「FA 开」算，两边 key 不同、预览到的计划不是真正启动用的那份。
+ */
+export function persistedEffectiveFlashAttn(raw: string | null | undefined): "" | "on" | "off" {
+  return raw === "on" || raw === "off" ? raw : "";
 }
 
 function getSearchPath(): string {
@@ -205,7 +218,12 @@ export class LlamaRuntime implements Runtime {
    */
   private loadModeSupport: LoadModeSupport | null = null;
   private flashAttnSupport: FlashAttnSupport | null = null;
-  /** 上次启动 llama.cpp 实际用的 flash attention（"" = 未知），供 auto 模式规划计价。 */
+  /** `--kv-unified` 支持（同一次 --help 探测；null = 本实例还没探测，回落进程级缓存）。 */
+  private kvUnifiedSupport: boolean | null = null;
+  /**
+   * 本实例上次启动实测的 flash attention（"" = 本实例还没测到）。规划时 "" 回落到设置里
+   * 持久化的 SERVER_FLASH_ATTN_EFFECTIVE（见 planFlashAttnEffective），与预览 RPC 同源。
+   */
   private lastEffectiveFlashAttn: "" | "on" | "off" = "";
   /**
    * 自动启动参数（SERVER_AUTO_TUNE）的缓存 key：buildArgs / start 共用同一份，
@@ -297,13 +315,46 @@ export class LlamaRuntime implements Runtime {
     return buildLaunchPlanKeyFromSettings(
       model.path,
       (k) => getSetting(k as SettingsKey),
-      effectiveFlashAttnForPlan(getSetting("SERVER_FLASH_ATTN"), this.lastEffectiveFlashAttn),
+      this.effectiveFlashAttnForPlan(),
+      // start() 里刚探测过就用当次结果（与实际启动的那份二进制一致）；没探过由
+      // launch-plan 读进程级缓存 —— 与预览 RPC 同一条规则。
+      { supportsKvUnified: this.kvUnifiedSupport },
     );
+  }
+
+  /**
+   * 规划用的「上次实测」FA：本实例测到过就用本实例的（最新），否则读持久化设置。
+   * 与预览 RPC（直接读 SERVER_FLASH_ATTN_EFFECTIVE）同源 —— 回读时两者同时写，必然相等。
+   */
+  private planFlashAttnEffective(): "" | "on" | "off" {
+    return this.lastEffectiveFlashAttn || persistedEffectiveFlashAttn(getSetting("SERVER_FLASH_ATTN_EFFECTIVE"));
   }
 
   /** 本次规划用的 FA 布尔（设置值 + 上次实测折算，见 effectiveFlashAttnForPlan）。 */
   private effectiveFlashAttnForPlan(): boolean {
-    return effectiveFlashAttnForPlan(getSetting("SERVER_FLASH_ATTN"), this.lastEffectiveFlashAttn);
+    return effectiveFlashAttnForPlan(getSetting("SERVER_FLASH_ATTN"), this.planFlashAttnEffective());
+  }
+
+  /** 数值型设置收成非负整数串，非法 / 空 → fallback（argv 注入防御，见 buildArgs）。 */
+  private static cleanNum(raw: string, fallback: string): string {
+    const n = Number(raw);
+    return raw.trim() !== "" && Number.isFinite(n) && n >= 0 && Number.isSafeInteger(n)
+      ? String(n)
+      : fallback;
+  }
+
+  /**
+   * 本实例监听的端口 —— 拼参数（--port）、健康检查、启动回读（/props）**只认这一处**。
+   * 优先 overrides.port（served-model 注册表分配的）；否则嵌入实例（purpose=embedding）
+   * 回落嵌入端口段（EMBEDDING_PORT，默认 18190），不碰聊天默认端点；聊天实例用 SERVER_PORT。
+   * 以前健康检查自己按 SERVER_PORT 算，嵌入实例起在 18190 却去轮询 8080：要么一直等到超时，
+   * 要么撞上正在跑的聊天实例、把没起来的嵌入实例误报成 running。
+   */
+  private resolvePort(): string {
+    if (this.overrides.port) return this.overrides.port;
+    return this.overrides.purpose === "embedding"
+      ? LlamaRuntime.cleanNum(getSetting("EMBEDDING_PORT") || "", String(EMBEDDING_PORT_BASE))
+      : LlamaRuntime.cleanNum(getSetting("SERVER_PORT") || "", "8080");
   }
 
   /**
@@ -317,7 +368,7 @@ export class LlamaRuntime implements Runtime {
    * 回读是对已完成启动的补充记录，没有它启动依然是成功的。
    */
   private async readbackMeasured(): Promise<void> {
-    const port = this.overrides.port ?? (getSetting("SERVER_PORT") || "8080");
+    const port = this.resolvePort();
     const detail: Record<string, string | number | null> = {
       model: basename(this.resolvedModelPath()),
     };
@@ -425,9 +476,11 @@ export class LlamaRuntime implements Runtime {
     let model: { kind: "local"; path: string; alias: string } | { kind: "hf"; ref: string };
     if (modelOverride) {
       if (existsSync(modelOverride)) {
+        // 与 resolveModel 同一规则：目录条目换成主 GGUF（`-m` 只收文件），
+        // 否则复制出来的命令与 start() 实际发的不一致。
         model = {
           kind: "local",
-          path: modelOverride,
+          path: llamaLoadablePath(modelOverride),
           alias: slugModelFileName(modelNameForPath(modelOverride)),
         };
       } else {
@@ -437,8 +490,7 @@ export class LlamaRuntime implements Runtime {
       model = this.resolveModel();
     }
     // 用户终端直接跑原生命令，不带 macOS PTY 包装。
-    const bin =
-      [llamaCppBinaryPath(), ...COMMON_BINARY_PATHS].find((p) => existsSync(p)) ?? "llama-server";
+    const bin = defaultLlamaServerBinary();
     return [bin, ...this.buildArgs(model, this.getProfileServerArgs())].join(" ");
   }
 
@@ -447,24 +499,15 @@ export class LlamaRuntime implements Runtime {
     | { kind: "local"; path: string; alias: string }
     | { kind: "hf"; ref: string },
     serverArgs: ServerArgs): string[] {
-    // llama.cpp 的端口设置键就是 SERVER_PORT（见 shared/engines.ts）。
-    // 嵌入实例（purpose=embedding）回落到嵌入端口段（EMBEDDING_PORT，默认 18190），
-    // 不碰聊天默认端点；聊天实例保持 SERVER_PORT 不变。
-    const cleanNum = (raw: string, fallback: string): string => {
-      const n = Number(raw);
-      return raw.trim() !== "" && Number.isFinite(n) && n >= 0 && Number.isSafeInteger(n)
-        ? String(n)
-        : fallback;
-    };
+    const cleanNum = LlamaRuntime.cleanNum;
     // 数值型设置（ctx / batch / parallel / port / …）的注入防御：这些值会原样进 argv，而
     // 设置行可能被手改数据库 / 旧版本写入，所以统一收一遍 —— 解析不出有限非负整数就丢弃
     // （空串保持空，让 `|| 档案默认` 兜底；非法值同样落回默认而不是把字符串塞给引擎）。
     const embedding = this.overrides.purpose === "embedding";
-    const port = this.overrides.port ?? (embedding
-      ? cleanNum(getSetting("EMBEDDING_PORT") || "", String(EMBEDDING_PORT_BASE))
-      : cleanNum(getSetting("SERVER_PORT") || "", "8080"));
+    // 端口与健康检查 / 回读同源（resolvePort）：嵌入实例落嵌入端口段，聊天实例 SERVER_PORT。
+    const port = this.resolvePort();
     const host = getSetting("SERVER_HOST") || "127.0.0.1";
-    // 自动启动参数（SERVER_AUTO_TUNE，默认关）：有计划时 --ctx-size / --batch-size /
+    // 自动启动参数（SERVER_AUTO_TUNE，默认开）：有计划时 --ctx-size / --batch-size /
     // --ubatch-size（仅聊天实例）用计划值；--parallel 仍用设置值（并发是用户的业务选择），
     // --cache-type-k/-v 保持设置值（它们参与计划 key 的计算，改了自然重算）。
     const autoPlan = this.autoPlan(model);
@@ -524,22 +567,22 @@ export class LlamaRuntime implements Runtime {
 
     const args: string[] = [];
 
+    // 这条命令里有没有视觉投影：本地模型看同目录有没有配对到 mmproj；hf ref 由 llama-server
+    // 自己按仓库拉（-hf 会顺带下载 mmproj），沿用旧行为按「有」处理。
+    // 没有投影时 --image-max-tokens / --no-mmproj-offload 都是空转参数，不发。
+    let hasVision = model.kind === "hf";
+
     if (model.kind === "local") {
       args.push("-m", model.path, "--alias", model.alias);
-      // 多模态嵌入（mmproj）：嵌入实例 + 本地模型时，按模型同目录自动配对投影文件。
-      // spike（llama-server b9410）实证 `--embeddings --pooling last --mmproj` 共存可用；
-      // 聊天实例永不注入；hf ref 走 -hf 自管缓存拿不到本地路径，不注入（Non-Goal）。
-      if (embedding) {
-        const dir = dirname(model.path);
-        try {
-          const candidates = readdirSync(dir).filter(isMmprojFile).sort();
-          // 多文件优先 f16：bf16 的名字里也含 "f16" 子串，直接 includes 会选错
-          const f16 = candidates.find((n) => /(?:^|[^a-z])f16/i.test(n));
-          const picked = f16 ?? candidates[0];
-          if (picked) args.push("--mmproj", join(dir, picked));
-        } catch {
-          // 目录读不到（模型文件被移走等）就不注入，行为与「无投影文件」一致
-        }
+      // 多模态（mmproj）：本地模型按同目录自动配对投影文件（规则见 pairedMmprojPath，
+      // 与规划器扣的那份字节数同源）。聊天实例也要注入 —— 以前「聊天实例永不注入」，
+      // 本地视觉模型收到图片也看不见。嵌入实例 spike（llama-server b9410）实证
+      // `--embeddings --pooling last --mmproj` 共存可用。
+      // hf ref 走 -hf 自管缓存拿不到本地路径，不注入（Non-Goal）。
+      const mmproj = pairedMmprojPath(model.path);
+      if (mmproj !== null) {
+        args.push("--mmproj", mmproj);
+        hasVision = true;
       }
     } else if (model.ref) {
       args.push("-hf", model.ref);
@@ -555,7 +598,8 @@ export class LlamaRuntime implements Runtime {
     );
 
     // 嵌入模式裁剪的聊天参数：--temp/--top-p/--top-k/--repeat-penalty/--repeat-last-n/--image-max-tokens。
-    if (!embedding) {
+    // --image-max-tokens 只在真有投影文件时发（纯文本模型发它没有意义）。
+    if (!embedding && hasVision) {
       args.push(
         "--image-max-tokens",
         imageMaxTokens,
@@ -572,6 +616,14 @@ export class LlamaRuntime implements Runtime {
       "--ubatch-size",
       embedding ? embedBatch : ubatchSize,
     );
+    // --kv-unified：多个 slot 共用一整块 KV，每个请求都能用满 --ctx-size；不加的话
+    // llama.cpp 把总窗口按 slot 均分（parallel=4 时每个请求只剩 1/4）。
+    // 有计划时听计划（规划器已按「引擎支持与否」定了口径），没计划时 parallel > 1 就要；
+    // 两种情况都只在这台 llama-server 的 --help 里确实有这个开关时才发（没探过不赌）。
+    const kvuSupported =
+      this.kvUnifiedSupport ?? cachedKvUnifiedSupport(defaultLlamaServerBinary()) ?? false;
+    const wantKvUnified = autoPlan ? autoPlan.kvUnified : Number(parallel) > 1;
+    if (wantKvUnified && kvuSupported) args.push("--kv-unified");
     if (cacheTypeK) args.push("--cache-type-k", cacheTypeK);
     if (cacheTypeV) args.push("--cache-type-v", cacheTypeV);
 
@@ -616,11 +668,7 @@ export class LlamaRuntime implements Runtime {
     // 的 --mlock / --no-mmap（见 llama-load-mode.ts 的等价表）；界面复制的命令读同一份
     // 缓存，所以只要启动过一次，显示与实际发出去的就是同一串。
     const loadModeSupport =
-      this.loadModeSupport ??
-      cachedLoadModeSupport(
-        [llamaCppBinaryPath(), ...COMMON_BINARY_PATHS].find((p) => existsSync(p)) ?? "llama-server",
-      ) ??
-      "unknown";
+      this.loadModeSupport ?? cachedLoadModeSupport(defaultLlamaServerBinary()) ?? "unknown";
     args.push(...loadModeArgs(getSetting("SERVER_LOAD_MODE"), loadModeSupport));
 
     // flash attention（T4d）：三态开关按 --help 探测结果折算 —— 新版发 [--flash-attn, 值]，
@@ -628,14 +676,11 @@ export class LlamaRuntime implements Runtime {
     // flashAttnArgs 自己把设置值收进白名单（非法值回落 auto），这里直传原始值。
     const rawFlash = getSetting("SERVER_FLASH_ATTN");
     const faSupport =
-      this.flashAttnSupport ??
-      cachedFlashAttnSupport(
-        [llamaCppBinaryPath(), ...COMMON_BINARY_PATHS].find((p) => existsSync(p)) ?? "llama-server",
-      ) ??
-      "none";
+      this.flashAttnSupport ?? cachedFlashAttnSupport(defaultLlamaServerBinary()) ?? "none";
     args.push(...flashAttnArgs(rawFlash, faSupport));
 
-    if (serverArgs.noMmprojOffload) {
+    // 投影留在 CPU：只有真带了投影时才有意义（见上面 hasVision）。
+    if (serverArgs.noMmprojOffload && hasVision) {
       args.push("--no-mmproj-offload");
     }
 
@@ -668,6 +713,7 @@ export class LlamaRuntime implements Runtime {
     const helpSupport = await probeServerHelp(llamaPath);
     this.loadModeSupport = helpSupport.loadMode;
     this.flashAttnSupport = helpSupport.flashAttn;
+    this.kvUnifiedSupport = helpSupport.kvUnified ?? false;
     const loadMode = getSetting("SERVER_LOAD_MODE");
     if (loadModeUnsupported(loadMode, this.loadModeSupport)) {
       const message = `加载模式 ${loadMode} 在这台 llama-server（${this.loadModeSupport}）上不支持，本次按默认加载模式启动`;
@@ -747,7 +793,8 @@ export class LlamaRuntime implements Runtime {
           self.setStatus("error");
         });
 
-      const port = this.overrides.port ?? (getSetting("SERVER_PORT") || "8080");
+      // 与 --port 同源（嵌入实例在嵌入端口段，不能去轮询聊天端口）
+      const port = this.resolvePort();
       const healthUrl = `http://localhost:${port}/health`;
       const maxIdleAttempts = 120;
       let idleCount = 0;

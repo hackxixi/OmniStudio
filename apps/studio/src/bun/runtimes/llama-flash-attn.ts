@@ -1,7 +1,7 @@
 /**
- * llama.cpp 的 flash attention 开关（`--flash-attn`）与模型加载模式（`--load-mode`）的
- * 版本探测：两者都只能从 `--help` 的输出里认出来，所以**合并成一次子进程调用**
- * （`probeServerHelp`），而不是为了两个开关各跑一遍。
+ * llama.cpp 的 flash attention 开关（`--flash-attn`）、模型加载模式（`--load-mode`）与
+ * `--kv-unified` 的版本探测：它们都只能从 `--help` 的输出里认出来，所以**合并成一次
+ * 子进程调用**（`probeServerHelp`），而不是为了每个开关各跑一遍。
  *
  * 为什么要探测而不是赌版本：
  *  - 新版（本机 llama.cpp 实测）是**三态**：`-fa, --flash-attn [on|off|auto]`
@@ -18,6 +18,25 @@
  * （哪怕是 "none"）落缓存 —— "none" 是真实答案，重试没有意义。
  */
 
+import { existsSync } from "fs";
+
+import { llamaCppBinaryPath } from "../engine-paths";
+
+/** 托管安装之外、按固定路径查找的 llama-server（Homebrew 两种前缀）。 */
+export const COMMON_LLAMA_SERVER_PATHS = [
+  "/opt/homebrew/bin/llama-server",
+  "/usr/local/bin/llama-server",
+];
+
+/**
+ * 同步路径（`buildCommandLine` / 计划 key / 预览 RPC）读探测缓存时用的二进制路径：
+ * 托管安装 → Homebrew → 裸名。缓存按路径分，所以**所有同步读者必须用同一条规则**，
+ * 否则「复制的命令」与预览、实际启动各读各的缓存条目、互相对不上。
+ */
+export function defaultLlamaServerBinary(): string {
+  return [llamaCppBinaryPath(), ...COMMON_LLAMA_SERVER_PATHS].find((p) => existsSync(p)) ?? "llama-server";
+}
+
 /** 真值表（llama-server --help 实测行）：
  *   `-fa, --flash-attn [on|off|auto]    set Flash Attention use ('on', 'off', or 'auto', default: 'auto')`
  */
@@ -27,6 +46,12 @@ export type FlashAttnSupport = "tristate" | "boolean" | "none";
 export type ServerHelpSupport = {
   loadMode: "load-mode" | "legacy" | "unknown";
   flashAttn: FlashAttnSupport;
+  /**
+   * 是否认 `--kv-unified`（`-kvu`）。不认的老版在 `--parallel N` 下会把 `--ctx-size`
+   * 按 slot 均分，每个请求只剩 1/N 的窗口 —— 规划器据此决定按哪种口径计价。
+   * 可选只是为了兼容旧调用方（测试注缓存）；缺省按不支持处理（不赌开关存在）。
+   */
+  kvUnified?: boolean;
 };
 
 /** `--load-mode` 的 `--help` 识别（照抄 llama-load-mode.ts 的正则，保持两处判定一致）。 */
@@ -48,11 +73,21 @@ function parseFlashAttnSupportText(help: string): FlashAttnSupport {
   return "none";
 }
 
-/** 一次 `--help` 解析出两个开关的支持形态。 */
+/**
+ * `--kv-unified` 的 `--help` 识别：`-kvu, --kv-unified` 那一行。
+ * 注意 `--no-kv-unified`（反向开关）不能算数 —— 它前面是 `no-` 而不是空白 / 逗号，
+ * 所以锚在「行首 / 空白 / 逗号」之后。
+ */
+function parseKvUnifiedSupportText(help: string): boolean {
+  return /(^|[\s,])--kv-unified\b/m.test(help) || /(^|[\s,])-kvu\b/m.test(help);
+}
+
+/** 一次 `--help` 解析出各开关的支持形态。 */
 export function parseServerHelpSupport(help: string): ServerHelpSupport {
   return {
     loadMode: parseLoadModeSupportText(help),
     flashAttn: parseFlashAttnSupportText(help),
+    kvUnified: parseKvUnifiedSupportText(help),
   };
 }
 
@@ -79,6 +114,7 @@ export function flashAttnArgs(setting: string | null | undefined, support: Flash
 
 const flashAttnSupportCache = new Map<string, FlashAttnSupport>();
 const loadModeSupportCache = new Map<string, ServerHelpSupport["loadMode"]>();
+const kvUnifiedSupportCache = new Map<string, boolean>();
 
 export function cachedFlashAttnSupport(binaryPath: string): FlashAttnSupport | null {
   return flashAttnSupportCache.get(binaryPath) ?? null;
@@ -88,31 +124,40 @@ export function cachedLoadModeSupport(binaryPath: string): ServerHelpSupport["lo
   return loadModeSupportCache.get(binaryPath) ?? null;
 }
 
+/** 同步读已探测到的 `--kv-unified` 支持（null = 还没探过）。 */
+export function cachedKvUnifiedSupport(binaryPath: string): boolean | null {
+  return kvUnifiedSupportCache.get(binaryPath) ?? null;
+}
+
 /**
  * 同步读已缓存的合并探测结果（null = 还没探过）。
  * llama.ts 的 `cachedLoadModeSupport` 委托到这里，避免两份 Map 各自演化。
  */
 export function cachedServerHelpSupport(
   binaryPath: string,
-): { loadMode: ServerHelpSupport["loadMode"]; flashAttn: FlashAttnSupport } | null {
+): { loadMode: ServerHelpSupport["loadMode"]; flashAttn: FlashAttnSupport; kvUnified: boolean } | null {
   const load = loadModeSupportCache.get(binaryPath);
   const flash = flashAttnSupportCache.get(binaryPath);
-  if (load === undefined && flash === undefined) return null;
-  return { loadMode: load ?? "unknown", flashAttn: flash ?? "none" };
+  const kvu = kvUnifiedSupportCache.get(binaryPath);
+  if (load === undefined && flash === undefined && kvu === undefined) return null;
+  return { loadMode: load ?? "unknown", flashAttn: flash ?? "none", kvUnified: kvu ?? false };
 }
 
 export function clearServerHelpSupportCache(): void {
   flashAttnSupportCache.clear();
   loadModeSupportCache.clear();
+  kvUnifiedSupportCache.clear();
 }
 
 /**
  * 同步把一份探测结果写进缓存（仅供测试注用；生产路径永远走 probeServerHelp）。
- * loadMode === "unknown" 不落缓存（与 probeServerHelp 同一规则），flashAttn 三种都落。
+ * loadMode === "unknown" 不落缓存（与 probeServerHelp 同一规则），flashAttn 三种都落；
+ * kvUnified 缺省不落（等价于「没探过」→ 不支持）。
  */
 export function setCachedServerHelpSupport(binaryPath: string, support: ServerHelpSupport): void {
   if (support.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, support.loadMode);
   flashAttnSupportCache.set(binaryPath, support.flashAttn);
+  if (support.kvUnified !== undefined) kvUnifiedSupportCache.set(binaryPath, support.kvUnified);
 }
 
 /**
@@ -127,8 +172,9 @@ export function setCachedServerHelpSupport(binaryPath: string, support: ServerHe
 export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSupport> {
   const cachedFlash = flashAttnSupportCache.get(binaryPath);
   const cachedLoad = loadModeSupportCache.get(binaryPath);
-  if (cachedFlash && cachedLoad) {
-    return { loadMode: cachedLoad, flashAttn: cachedFlash };
+  const cachedKvu = kvUnifiedSupportCache.get(binaryPath);
+  if (cachedFlash && cachedLoad && cachedKvu !== undefined) {
+    return { loadMode: cachedLoad, flashAttn: cachedFlash, kvUnified: cachedKvu };
   }
 
   let help = "";
@@ -161,11 +207,13 @@ export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSup
     return {
       loadMode: cachedLoad ?? "unknown",
       flashAttn: cachedFlash ?? "none",
+      kvUnified: cachedKvu ?? false,
     };
   }
 
   const parsed = parseServerHelpSupport(help);
   if (parsed.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, parsed.loadMode);
   flashAttnSupportCache.set(binaryPath, parsed.flashAttn);
+  kvUnifiedSupportCache.set(binaryPath, parsed.kvUnified ?? false);
   return parsed;
 }

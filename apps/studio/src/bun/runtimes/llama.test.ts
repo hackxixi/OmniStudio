@@ -162,15 +162,15 @@ beforeEach(() => {
 });
 
 describe("buildCommandLine / chat", () => {
-  test("chat 命令行快照：与旧版逐字节一致（聊天路径零变化，③-A2）", () => {
+  test("chat 命令行快照（纯文本模型：没有投影文件就不发 --image-max-tokens / --no-mmproj-offload）", () => {
     setChatSettings();
     const rt = new LlamaRuntime();
     const cmd = rt.buildCommandLine(chatModel);
     expect(cmd).toBe(
       `${bin} -m ${chatModel} --alias e2e-chat --host 127.0.0.1 --port 18400 --ctx-size 8192` +
-        " --image-max-tokens 2048 --parallel 1 --batch-size 256 --ubatch-size 64" +
+        " --parallel 1 --batch-size 256 --ubatch-size 64" +
         " --cache-type-k q8_0 --cache-type-v q8_0 --repeat-penalty 1.12 --repeat-last-n 256" +
-        " --temp 0.1 --top-p 0.8 --top-k 40 --no-mmproj-offload",
+        " --temp 0.1 --top-p 0.8 --top-k 40",
     );
   });
 
@@ -219,7 +219,7 @@ describe("buildCommandLine / embedding", () => {
     expect(cmd).toBe(
       `${bin} -m ${embedModel} --alias wemm --host 127.0.0.1 --port 18500 --ctx-size 8192` +
         " --parallel 1 --batch-size 8192 --ubatch-size 8192 --cache-type-k q8_0 --cache-type-v q8_0" +
-        " --embeddings --pooling last --no-mmproj-offload",
+        " --embeddings --pooling last",
     );
   });
 
@@ -309,11 +309,46 @@ describe("buildArgs / mmproj 注入", () => {
     expect(cmd).not.toContain("--mmproj");
   });
 
-  test("聊天实例永不注入：同目录有投影文件也不传 --mmproj", () => {
+  test("聊天实例也按同目录配对 --mmproj（本地视觉模型要能看图），并带上视觉参数", () => {
     setChatSettings();
     const rt = new LlamaRuntime({ model: join(mmprojBothDir, "model.gguf"), port: "18406" });
     const cmd = rt.buildCommandLine();
+    expect(cmd).toContain(`--mmproj ${join(mmprojBothDir, "mmproj-f16.gguf")}`);
+    expect(cmd.split("--mmproj ").length).toBe(2);
+    expect(cmd).toContain("--image-max-tokens 2048");
+    expect(cmd).toContain("--no-mmproj-offload");
+  });
+
+  test("聊天实例同目录无投影 → 不发 --mmproj / --image-max-tokens / --no-mmproj-offload", () => {
+    setChatSettings();
+    const cmd = new LlamaRuntime({ model: join(mmprojNoneDir, "model.gguf"), port: "18407" }).buildCommandLine();
     expect(cmd).not.toContain("--mmproj");
+    expect(cmd).not.toContain("--image-max-tokens");
+    expect(cmd).not.toContain("--no-mmproj-offload");
+  });
+
+  test("模型路径是目录（扫描器聚合的 GGUF 仓库）→ -m 换成主文件，投影从同目录配对", () => {
+    setChatSettings();
+    const cmd = new LlamaRuntime({ model: mmprojBothDir, port: "18408" }).buildCommandLine();
+    expect(cmd).toContain(`-m ${join(mmprojBothDir, "model.gguf")} `);
+    expect(cmd).toContain(`--mmproj ${join(mmprojBothDir, "mmproj-f16.gguf")}`);
+    // buildCommandLine(modelOverride) 与 resolveModel 同一规则
+    expect(new LlamaRuntime().buildCommandLine(mmprojBothDir)).toContain(`-m ${join(mmprojBothDir, "model.gguf")} `);
+  });
+
+  test("hf ref 聊天实例保持旧行为：照发 --image-max-tokens / --no-mmproj-offload", () => {
+    setChatSettings();
+    const cmd = new LlamaRuntime({ model: "unsloth/Qwen2.5-VL-7B-GGUF", port: "18409" }).buildCommandLine();
+    expect(cmd).toContain("--image-max-tokens 2048");
+    expect(cmd).toContain("--no-mmproj-offload");
+    expect(cmd).not.toContain("--mmproj ");
+  });
+
+  test("mmproj 字节数进规划 key（预算要扣掉投影文件），无投影时为 null", () => {
+    const withMm = buildLaunchPlanKeyFromSettings(join(mmprojBothDir, "model.gguf"), () => "", false);
+    expect(withMm.mmprojBytes).toBe(4); // 场景文件内容是 "gguf"
+    const without = buildLaunchPlanKeyFromSettings(join(mmprojNoneDir, "model.gguf"), () => "", false);
+    expect(without.mmprojBytes).toBeNull();
   });
 
   test("hf ref 嵌入模型（-hf 自管缓存）不注入 mmproj（Non-Goal）", () => {
@@ -425,6 +460,29 @@ describe("buildArgs / 自动启动参数（SERVER_AUTO_TUNE）", () => {
     rt = new LlamaRuntime({ model: chatModel, port: "18412" });
     expect(rt.buildCommandLine(chatModel)).toContain("--n-gpu-layers 28");
     expect(rt.buildCommandLine(chatModel)).not.toContain("--n-gpu-layers 20");
+  });
+
+  test("FA 实测值：新实例（内存态未知）回落持久化的 SERVER_FLASH_ATTN_EFFECTIVE，与预览同一 key", () => {
+    setChatSettings();
+    SETTINGS.SERVER_AUTO_TUNE = "1";
+    SETTINGS.SERVER_FLASH_ATTN = "auto";
+    SETTINGS.SERVER_FLASH_ATTN_EFFECTIVE = "on";
+    // 预览 RPC 的 key 构造：设置 + 持久化实测
+    const previewKey = buildLaunchPlanKeyFromSettings(
+      chatModel,
+      (k) => SETTINGS[k] ?? "",
+      effectiveFlashAttnForPlan(SETTINGS.SERVER_FLASH_ATTN, SETTINGS.SERVER_FLASH_ATTN_EFFECTIVE as "on"),
+    );
+    expect(previewKey.flashAttn).toBe(true);
+    __setLaunchPlanForTest(previewKey, makePlan({ ctxTokens: 65536 }));
+    // 全新实例（从没启动过）也要命中预览那份计划，而不是按「FA 关」另算一份
+    const cmd = new LlamaRuntime({ model: chatModel, port: "18415" }).buildCommandLine(chatModel);
+    expect(cmd).toContain("--ctx-size 65536");
+    // 持久化值是垃圾 → 当未知（按关），不命中 FA=on 那份
+    SETTINGS.SERVER_FLASH_ATTN_EFFECTIVE = "garbage";
+    expect(new LlamaRuntime({ model: chatModel, port: "18415" }).buildCommandLine(chatModel)).not.toContain(
+      "--ctx-size 65536",
+    );
   });
 
   test("buildCommandLine 与 buildArgs 在同一缓存状态下产生相同的参数序列", () => {
@@ -554,6 +612,42 @@ bun 的数组 toContain 是精确匹配（单元素），
     expect(cmd.replace(/^\S+\s+/, "")).toBe(args.join(" "));
   });
 
+  test("--kv-unified：parallel > 1 且 --help 认这个开关才发；没探过 / 不认 / parallel=1 都不发", () => {
+    setChatSettings();
+    SETTINGS.SERVER_PARALLEL = "4";
+    const rt = new LlamaRuntime({ model: chatModel, port: "18426" });
+    // 没探过：不赌开关存在
+    expectNoFlag(chatArgs(rt), "--kv-unified");
+    // 探到不支持
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", kvUnified: false });
+    expectNoFlag(chatArgs(rt), "--kv-unified");
+    // 探到支持
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", kvUnified: true });
+    expect(chatArgs(rt)).toContain("--kv-unified");
+    // 复制的命令与实际参数一致
+    expect(rt.buildCommandLine(chatModel)).toContain("--kv-unified");
+    // parallel = 1 时没有可共享的 slot，不发
+    SETTINGS.SERVER_PARALLEL = "1";
+    expectNoFlag(chatArgs(rt), "--kv-unified");
+  });
+
+  test("--kv-unified 与自动计划：听计划的 kvUnified；计划 key 带上探测到的支持情况", () => {
+    setChatSettings();
+    SETTINGS.SERVER_AUTO_TUNE = "1";
+    SETTINGS.SERVER_PARALLEL = "3";
+    setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate", kvUnified: true });
+    const key = buildLaunchPlanKeyFromSettings(chatModel, (k) => SETTINGS[k] ?? "", false);
+    expect(key.supportsKvUnified).toBe(true);
+    seedPlan(chatModel, makePlan({ kvUnified: false }));
+    const rt = new LlamaRuntime({ model: chatModel, port: "18427" });
+    expectNoFlag(chatArgs(rt), "--kv-unified");
+    seedPlan(chatModel, makePlan({ kvUnified: true }));
+    expect(chatArgs(rt)).toContain("--kv-unified");
+    // 不支持时 key 的 supportsKvUnified=false（规划器按每 slot 均分计价）
+    clearServerHelpSupportCache();
+    expect(buildLaunchPlanKeyFromSettings(chatModel, (k) => SETTINGS[k] ?? "", false).supportsKvUnified).toBe(false);
+  });
+
   test("SERVER_FLASH_ATTN=off（tristate）→ argv 含 --flash-attn off（#5）", () => {
     setChatSettings();
     setCachedServerHelpSupport(resolvedBin(), { loadMode: "load-mode", flashAttn: "tristate" });
@@ -582,6 +676,7 @@ describe("start / 回读实测值（T4e）", () => {
   type LogEventInput = Parameters<typeof realAppLog.logEvent>[0];
   let logEvents: LogEventInput[];
   let propsBehavior: "ok" | "fail";
+  let fetchedUrls: string[] = [];
   let faLogLine: string;
   let realSpawn: typeof realProc.spawnServerProcess;
   let realProbe: typeof realFlashAttn.probeServerHelp;
@@ -611,6 +706,7 @@ describe("start / 回读实测值（T4e）", () => {
     // 假 fetch：/health 永远 OK；/props 按用例行为（JSON / 抛错）。
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetchedUrls.push(url);
       if (url.endsWith("/health")) return new Response(null, { status: 200 });
       if (url.endsWith("/props")) {
         if (propsBehavior === "fail") throw new Error("connection refused (fake)");
@@ -662,6 +758,7 @@ describe("start / 回读实测值（T4e）", () => {
     logEvents = [];
     propsBehavior = "ok";
     faLogLine = "";
+    fetchedUrls = [];
   });
 
   afterAll(() => {
@@ -735,6 +832,19 @@ describe("start / 回读实测值（T4e）", () => {
     const { result } = await startServer(18502);
     expect(result.ok).toBe(true);
     expect(realSettings.getSetting("SERVER_FLASH_ATTN_EFFECTIVE")).toBe("on");
+  });
+
+  test("嵌入实例（无 overrides.port）：健康检查与回读轮询的是 --port 那个嵌入端口", async () => {
+    propsBehavior = "ok";
+    SETTINGS.SERVER_PORT = "18600";
+    SETTINGS.EMBEDDING_PORT = "18655";
+    const rt = new LlamaRuntime({ model: embedModel, purpose: "embedding" });
+    expect(rt.buildCommandLine()).toContain("--port 18655");
+    const result = await rt.start();
+    expect(result.ok).toBe(true);
+    expect(fetchedUrls).toContain("http://localhost:18655/health");
+    expect(fetchedUrls).toContain("http://localhost:18655/props");
+    expect(fetchedUrls.some((u) => u.includes(":18600/"))).toBe(false);
   });
 
   test("日志判断不出 FA → 设置保持原值不变", async () => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import {
   cachedFlashAttnSupport,
+  cachedKvUnifiedSupport,
   cachedServerHelpSupport,
   clearServerHelpSupportCache,
   flashAttnArgs,
@@ -104,5 +105,42 @@ describe("support cache", () => {
     const support = cachedServerHelpSupport("/bin/y");
     expect(support?.loadMode).toBe("load-mode");
     expect(support?.flashAttn).toBe("boolean");
+  });
+});
+
+describe("parseServerHelpSupport / kvUnified", () => {
+  test("新版：-kvu, --kv-unified 那一行 → true", () => {
+    const help =
+      "-kvu,  --kv-unified                     use single unified KV buffer shared across all sequences\n" +
+      "                                        (env: LLAMA_ARG_KV_UNIFIED)\n";
+    expect(parseServerHelpSupport(help).kvUnified).toBe(true);
+  });
+
+  test("只有反向开关 --no-kv-unified 不算（不能据此发 --kv-unified）", () => {
+    expect(parseServerHelpSupport("  --no-kv-unified    disable unified KV\n").kvUnified).toBe(false);
+  });
+
+  test("没有这个开关 → false", () => {
+    expect(parseServerHelpSupport("").kvUnified).toBe(false);
+    expect(parseServerHelpSupport("-fa, --flash-attn [on|off|auto]\n").kvUnified).toBe(false);
+  });
+});
+
+describe("kvUnified support cache", () => {
+  afterEach(() => clearServerHelpSupportCache());
+
+  test("未探测 → null；写入后可读；clear 后回到 null", () => {
+    expect(cachedKvUnifiedSupport("/bin/k")).toBeNull();
+    setCachedServerHelpSupport("/bin/k", { loadMode: "load-mode", flashAttn: "tristate", kvUnified: true });
+    expect(cachedKvUnifiedSupport("/bin/k")).toBe(true);
+    expect(cachedServerHelpSupport("/bin/k")?.kvUnified).toBe(true);
+    clearServerHelpSupportCache();
+    expect(cachedKvUnifiedSupport("/bin/k")).toBeNull();
+  });
+
+  test("旧调用方不带 kvUnified → 不落缓存，合并读按不支持", () => {
+    setCachedServerHelpSupport("/bin/k2", { loadMode: "load-mode", flashAttn: "none" });
+    expect(cachedKvUnifiedSupport("/bin/k2")).toBeNull();
+    expect(cachedServerHelpSupport("/bin/k2")?.kvUnified).toBe(false);
   });
 });

@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
   cachedLaunchPlan,
   clearLaunchPlanCache,
+  pairedMmprojPath,
   refreshLaunchPlan,
   type LaunchPlanKey,
 } from "./launch-plan";
@@ -84,6 +85,8 @@ function baseKey(modelPath: string): LaunchPlanKey {
     cacheTypeV: null,
     ctxOverride: null,
     flashAttn: null,
+    supportsKvUnified: true,
+    mmprojBytes: null,
   };
 }
 
@@ -142,6 +145,59 @@ describe("launch-plan", () => {
     expect(cachedLaunchPlan(k3)).not.toBeNull();
     expect(cachedLaunchPlan(k4)).not.toBeNull();
     expect(cachedLaunchPlan(k5)).not.toBeNull();
+  });
+
+  test("supportsKvUnified=false + parallel>1 → 计划按 slot 均分窗口，且与支持时是两条缓存", async () => {
+    const p = await writeGguf("kvu.gguf");
+    const unified = await refreshLaunchPlan({ ...baseKey(p), parallel: 2, supportsKvUnified: true });
+    const split = await refreshLaunchPlan({ ...baseKey(p), parallel: 2, supportsKvUnified: false });
+    expect(unified?.kvUnified).toBe(true);
+    expect(unified?.ctxPerSlot).toBe(unified?.ctxTokens);
+    expect(split?.kvUnified).toBe(false);
+    expect(split?.ctxPerSlot).toBe(Math.floor((split?.ctxTokens ?? 0) / 2));
+    expect(split?.reasons.map((r) => r.code)).toContain("kv.split-per-slot");
+    expect(cachedLaunchPlan({ ...baseKey(p), parallel: 2, supportsKvUnified: true })?.kvUnified).toBe(true);
+  });
+
+  test("mmprojBytes 计入预算（totalBytes 变大），且进缓存 key", async () => {
+    const p = await writeGguf("mm.gguf");
+    const plain = await refreshLaunchPlan(baseKey(p));
+    const withMm = await refreshLaunchPlan({ ...baseKey(p), mmprojBytes: 512 * 1024 * 1024 });
+    expect(plain).not.toBeNull();
+    expect(withMm).not.toBeNull();
+    expect(withMm!.estimates.totalBytes).toBeGreaterThan(plain!.estimates.totalBytes);
+    expect(cachedLaunchPlan(baseKey(p))?.estimates.totalBytes).toBe(plain!.estimates.totalBytes);
+  });
+
+  test("pairedMmprojPath：优先 f16（bf16 不误中）、无 f16 取字典序首个、无投影 null、目录入参也行", async () => {
+    const d = join(dir, "pair");
+    await mkdir(d, { recursive: true });
+    await writeFile(join(d, "model.gguf"), "gguf");
+    expect(pairedMmprojPath(join(d, "model.gguf"))).toBeNull();
+    await writeFile(join(d, "mmproj-bf16.gguf"), "gguf");
+    expect(pairedMmprojPath(join(d, "model.gguf"))).toBe(join(d, "mmproj-bf16.gguf"));
+    await writeFile(join(d, "mmproj-F16.gguf"), "gguf");
+    expect(pairedMmprojPath(join(d, "model.gguf"))).toBe(join(d, "mmproj-F16.gguf"));
+    expect(pairedMmprojPath(d)).toBe(join(d, "mmproj-F16.gguf"));
+    expect(pairedMmprojPath(join(dir, "no-such-dir", "x.gguf"))).toBeNull();
+  });
+
+  test("pairedMmprojPath：平铺目录里有不相干的模型时不配对，同一模型的多个量化照配", async () => {
+    const flat = join(dir, "flat");
+    await mkdir(flat, { recursive: true });
+    await writeFile(join(flat, "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"), "gguf");
+    await writeFile(join(flat, "mmproj-F16.gguf"), "gguf");
+    await writeFile(join(flat, "Llama-3.2-3B-Instruct-Q8_0.gguf"), "gguf");
+    expect(pairedMmprojPath(join(flat, "Llama-3.2-3B-Instruct-Q8_0.gguf"))).toBeNull();
+
+    const repo = join(dir, "repo");
+    await mkdir(repo, { recursive: true });
+    await writeFile(join(repo, "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf"), "gguf");
+    await writeFile(join(repo, "Qwen3-VL-8B-Instruct-Q8_0.gguf"), "gguf");
+    await writeFile(join(repo, "Qwen3-VL-8B-Instruct-BF16-00001-of-00002.gguf"), "gguf");
+    await writeFile(join(repo, "Qwen3-VL-8B-Instruct-BF16-00002-of-00002.gguf"), "gguf");
+    await writeFile(join(repo, "mmproj-F16.gguf"), "gguf");
+    expect(pairedMmprojPath(join(repo, "Qwen3-VL-8B-Instruct-Q8_0.gguf"))).toBe(join(repo, "mmproj-F16.gguf"));
   });
 
   test("clearLaunchPlanCache 清空缓存", async () => {
