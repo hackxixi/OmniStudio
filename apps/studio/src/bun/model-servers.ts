@@ -651,6 +651,10 @@ function attachListeners(entry: Entry) {
       if (status === "running") {
         entry.info.startedAt = Date.now();
         clearServedError(entry.info);
+        // 降级重试起来的要让界面知道「这次临时调小了什么」（runtime 在进入 running 前就记好了）
+        entry.info.degraded = runtime.getDegradedLaunch?.() ?? undefined;
+      } else if (status !== "starting" && status !== "downloading") {
+        entry.info.degraded = undefined;
       }
       if (status === "error") {
         const message = runtime.getLastError() || "Server failed to start";

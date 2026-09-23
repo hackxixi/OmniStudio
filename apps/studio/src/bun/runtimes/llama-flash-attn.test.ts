@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   cachedFlashAttnSupport,
   cachedKvUnifiedSupport,
+  cachedMemoryFlagSupport,
   cachedServerHelpSupport,
   clearServerHelpSupportCache,
   flashAttnArgs,
@@ -187,5 +188,55 @@ describe("reasoningArgs", () => {
     expect(reasoningArgs("off", false)).toEqual(["--chat-template-kwargs", '{"enable_thinking":false}']);
     expect(reasoningArgs("on", false)).toEqual([]);
     expect(reasoningArgs("--evil", true)).toEqual([]);
+  });
+});
+
+describe("parseServerHelpSupport / 显存开关（--fit / --n-cpu-moe / -ot / --no-context-shift）", () => {
+  // 本机 llama-server（build 11005）--help 的原文行
+  const HELP = [
+    "-ot,   --override-tensor <tensor name pattern>=<buffer type>,...",
+    "-cmoe, --cpu-moe                        keep all Mixture of Experts (MoE) weights in the CPU",
+    "-ncmoe, --n-cpu-moe N                   keep the Mixture of Experts (MoE) weights of the first N layers in the",
+    "-fit,  --fit [on|off]                   whether to adjust unset arguments to fit in device memory ('on' or",
+    "-fitt, --fit-target MiB0,MiB1,MiB2,...",
+    "-fitc, --fit-ctx N                      minimum ctx size that can be set by --fit option, default: 4096",
+    "--context-shift, --no-context-shift     whether to use context shift on infinite text generation (default:",
+  ].join("\n");
+
+  test("新版：四个都认", () => {
+    const s = parseServerHelpSupport(HELP);
+    expect(s.fit).toBe(true);
+    expect(s.nCpuMoe).toBe(true);
+    expect(s.overrideTensor).toBe(true);
+    expect(s.noContextShift).toBe(true);
+  });
+
+  test("同名前缀的兄弟开关不算（--fit-target / --n-cpu-moe-draft / --override-tensor-draft）", () => {
+    const s = parseServerHelpSupport(
+      "-fitt, --fit-target MiB\n--spec-draft-n-cpu-moe, -ncmoed, --n-cpu-moe-draft N\n" +
+        "--spec-draft-override-tensor, -otd, --override-tensor-draft <p>=<b>\n--context-shift  enable\n",
+    );
+    expect(s.fit).toBe(false);
+    expect(s.nCpuMoe).toBe(false);
+    expect(s.overrideTensor).toBe(false);
+    expect(s.noContextShift).toBe(false);
+  });
+
+  test("缓存：没探过 = 全不支持；注入后同步读得到", () => {
+    clearServerHelpSupportCache();
+    expect(cachedMemoryFlagSupport("/x/llama-server")).toEqual({
+      fit: false,
+      nCpuMoe: false,
+      overrideTensor: false,
+      noContextShift: false,
+    });
+    setCachedServerHelpSupport("/x/llama-server", { loadMode: "load-mode", flashAttn: "tristate", fit: true, noContextShift: true });
+    expect(cachedMemoryFlagSupport("/x/llama-server")).toEqual({
+      fit: true,
+      nCpuMoe: false,
+      overrideTensor: false,
+      noContextShift: true,
+    });
+    clearServerHelpSupportCache();
   });
 });

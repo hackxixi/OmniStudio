@@ -16,6 +16,8 @@ import {
   modelFootprintBytes,
   padKvCells,
   planLlamaLaunch,
+  planMoeCpuOffload,
+  MOE_EXPERT_WEIGHT_SHARE,
   CTX_COMPUTE_NO_FA_MULT,
   CTX_COMPUTE_FA_MASK_MULT,
   resolveBudgetBytes,
@@ -1362,5 +1364,114 @@ describe("planLlamaLaunch", () => {
     console.log(`[T4e] FA off ctxTokens=${off.ctxTokens} · FA on ctxTokens=${on.ctxTokens} · ratio=${(on.ctxTokens / off.ctxTokens).toFixed(2)}`);
     expect(off.ctxTokens).toBeGreaterThan(0);
     expect(on.ctxTokens).toBeGreaterThanOrEqual(off.ctxTokens * 2);
+  });
+});
+
+// ---------- MoE 专家下放（gpu.moe-cpu-offload） ----------
+
+describe("planLlamaLaunch / MoE 专家下放 CPU", () => {
+  const GiB = 1024 ** 3;
+  // Qwen3-30B-A3B 形状：48 层、128 专家选 8，Q4 约 17 GiB
+  const moe = baseMeta({
+    blockCount: 48,
+    embeddingLength: 2048,
+    headCount: 32,
+    headCountKv: 4,
+    keyLength: 128,
+    valueLength: 128,
+    headDim: 128,
+    contextLength: 32768,
+    vocabSize: 151936,
+    expertCount: 128,
+    expertUsedCount: 8,
+  });
+  const moeWeights = 17 * GiB;
+  const gpu = (freeGiB: number, sysFreeGiB = 48) => ({
+    hasGpu: true,
+    vramFreeBytes: freeGiB * GiB,
+    vramTotalBytes: freeGiB * GiB,
+    systemFreeBytes: sysFreeGiB * GiB,
+    systemTotalBytes: 64 * GiB,
+    unifiedMemory: false,
+    cpuThreads: 16,
+  });
+  const codes = (plan: ReturnType<typeof planLlamaLaunch>) => plan.reasons.map((r) => r.code);
+
+  test("12 GiB 独显装不下 17 GiB 的 MoE：层全留 GPU，前 N 层专家放 CPU，而不是砍层数", () => {
+    const plan = planLlamaLaunch({ meta: moe, weightsBytes: moeWeights, hardware: gpu(12) });
+    expect(codes(plan)).toContain("gpu.moe-cpu-offload");
+    expect(codes(plan)).not.toContain("gpu.partial-offload");
+    expect(plan.gpuLayers).toBeNull();
+    const m = plan.moeOffload!;
+    expect(m).not.toBeNull();
+    expect(m.cpuMoeLayers).toBeGreaterThan(0);
+    expect(m.cpuMoeLayers).toBeLessThanOrEqual(48);
+    expect(m.moeLayers).toBe(48);
+    // 回落值就是原来按层卸载会给的那个数（引擎不认专家下放时用）
+    expect(m.fallbackGpuLayers).toBeGreaterThan(0);
+    expect(m.fallbackGpuLayers).toBeLessThan(48);
+    // 下放的专家字节足以把 GPU 侧压回预算以内
+    expect(plan.estimates.cpuExpertBytes).toBe(m.cpuExpertBytes);
+    expect(plan.estimates.totalBytes - m.cpuExpertBytes).toBeLessThanOrEqual(plan.estimates.budgetBytes);
+    // N 是「刚好够」：少下放一层就超预算
+    const perLayer = (moeWeights * MOE_EXPERT_WEIGHT_SHARE) / 48;
+    expect(plan.estimates.totalBytes - (m.cpuMoeLayers - 1) * perLayer).toBeGreaterThan(plan.estimates.budgetBytes);
+  });
+
+  test("显存够 → 不下放（没有 moeOffload / 两个 gpu.* 原因都没有）", () => {
+    const plan = planLlamaLaunch({ meta: moe, weightsBytes: moeWeights, hardware: gpu(32) });
+    expect(plan.moeOffload ?? null).toBeNull();
+    expect(plan.gpuLayers).toBeNull();
+    expect(codes(plan)).not.toContain("gpu.moe-cpu-offload");
+    expect(codes(plan)).not.toContain("gpu.partial-offload");
+    expect(plan.estimates.cpuExpertBytes).toBe(0);
+  });
+
+  test("稠密模型同样大小 → 仍走按层卸载（专家下放只对 MoE）", () => {
+    const dense = { ...moe, expertCount: null, expertUsedCount: null };
+    const plan = planLlamaLaunch({ meta: dense, weightsBytes: moeWeights, hardware: gpu(12) });
+    expect(codes(plan)).toContain("gpu.partial-offload");
+    expect(plan.moeOffload ?? null).toBeNull();
+    expect(typeof plan.gpuLayers).toBe("number");
+  });
+
+  test("统一内存（Apple Silicon）没有第二块内存可放 → 不走专家下放", () => {
+    const plan = planLlamaLaunch({
+      meta: moe,
+      weightsBytes: 40 * GiB,
+      hardware: { ...gpu(0), vramFreeBytes: null, vramTotalBytes: null, unifiedMemory: true, systemTotalBytes: 32 * GiB },
+    });
+    expect(codes(plan)).not.toContain("gpu.moe-cpu-offload");
+  });
+
+  test("专家全放下去 KV 也装不下 → 回落按层卸载", () => {
+    // 3 GiB 显存 + 用户固定 32K × 8 并发（KV 本身就超显存）
+    const plan = planLlamaLaunch({
+      meta: moe,
+      weightsBytes: moeWeights,
+      hardware: gpu(3),
+      overrides: { ctxTokens: 32768, parallel: 8, cacheTypeK: "f16", cacheTypeV: "f16" },
+    });
+    expect(codes(plan)).not.toContain("gpu.moe-cpu-offload");
+    expect(codes(plan)).toContain("gpu.partial-offload");
+  });
+
+  test("planMoeCpuOffload：前导稠密层要加回 --n-cpu-moe 的计数（它按「前 N 层」数）", () => {
+    const deepseekish = { ...moe, blockCount: 30, leadingDenseBlockCount: 3 };
+    const perLayer = (10 * GiB * MOE_EXPERT_WEIGHT_SHARE) / 27;
+    const r = planMoeCpuOffload({
+      meta: deepseekish,
+      weightsBytes: 10 * GiB,
+      totalBytes: 8 * GiB + 2.5 * perLayer,
+      budgetBytes: 8 * GiB,
+      fallbackGpuLayers: 20,
+    });
+    expect(r).not.toBeNull();
+    expect(r!.moeLayers).toBe(27);
+    expect(r!.cpuMoeLayers).toBe(3 + 3); // ceil(2.5) = 3 层专家 + 3 层前导稠密
+    expect(r!.fallbackGpuLayers).toBe(20);
+    // 装得下 / 不是 MoE → null
+    expect(planMoeCpuOffload({ meta: deepseekish, weightsBytes: 10 * GiB, totalBytes: 7 * GiB, budgetBytes: 8 * GiB, fallbackGpuLayers: 20 })).toBeNull();
+    expect(planMoeCpuOffload({ meta: { ...deepseekish, expertCount: 1 }, weightsBytes: 10 * GiB, totalBytes: 9 * GiB, budgetBytes: 8 * GiB, fallbackGpuLayers: 20 })).toBeNull();
   });
 });

@@ -1069,3 +1069,350 @@ describe("start / 回读实测值（T4e）", () => {
     // 不 stop：假子进程的 exited 永不兑现，stop 会等满 5s；也不能 kill 假 pid。与上面几条一样留着。
   });
 });
+
+describe("buildArgs / --fit、MoE 专家下放、--no-context-shift（按 --help 探测）", () => {
+  const { setCachedServerHelpSupport, clearServerHelpSupportCache, defaultLlamaServerBinary } =
+    require("./llama-flash-attn") as typeof import("./llama-flash-attn");
+  const { cpuMoeOverrideTensor } = require("./llama") as typeof import("./llama");
+
+  /** 与 buildArgs 同一条同步路径规则（托管安装可能已被上面的 start 用例造出来）。 */
+  const probe = (over: Partial<import("./llama-flash-attn").ServerHelpSupport> = {}) =>
+    setCachedServerHelpSupport(defaultLlamaServerBinary(), {
+      loadMode: "load-mode",
+      flashAttn: "tristate",
+      kvUnified: true,
+      ...over,
+    });
+
+  const chatArgs = (rt: InstanceType<typeof LlamaRuntime>) =>
+    rt.buildArgs({ kind: "local", path: chatModel, alias: "e2e-chat" }, DEFAULT_CUSTOM_SERVER_ARGS);
+
+  const valueOf = (args: string[], flag: string): string | undefined => {
+    const i = args.indexOf(flag);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+
+  const moePlan = (fits: boolean) =>
+    makePlan({
+      gpuLayers: null,
+      fits,
+      moeOffload: { cpuMoeLayers: 3, moeLayers: 48, blockCount: 48, cpuExpertBytes: 1024 ** 3, fallbackGpuLayers: 30 },
+      reasons: [{ code: "budget.vram" }, { code: "gpu.moe-cpu-offload" }],
+    });
+
+  beforeEach(() => {
+    setChatSettings();
+    SETTINGS.SERVER_AUTO_TUNE = "1";
+  });
+  afterEach(() => clearServerHelpSupportCache());
+
+  test("没探过：计划装得下也不发 --fit / --n-gpu-layers（与加这些开关之前逐字节一致）", () => {
+    clearServerHelpSupportCache();
+    seedPlan(chatModel, makePlan({ gpuLayers: null, fits: true }));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18700" }));
+    expect(args).not.toContain("--fit");
+    expect(args).not.toContain("--n-gpu-layers");
+    expect(args).not.toContain("--no-context-shift");
+  });
+
+  test("认 --fit + 计划证明装得下 → -ngl 999 --fit off（别让 llama.cpp 为留余量再挪层）；复制的命令一致", () => {
+    probe({ fit: true });
+    seedPlan(chatModel, makePlan({ gpuLayers: null, fits: true }));
+    const rt = new LlamaRuntime({ model: chatModel, port: "18701" });
+    const args = chatArgs(rt);
+    expect(valueOf(args, "--fit")).toBe("off");
+    expect(valueOf(args, "--n-gpu-layers")).toBe("999");
+    expect(rt.buildCommandLine(chatModel)).toContain("--n-gpu-layers 999 --fit off");
+  });
+
+  test("认 --fit + 证明不了（按层卸载）→ 只发 --fit on，不发层数（交给 llama.cpp 按真实显存放）", () => {
+    probe({ fit: true });
+    seedPlan(chatModel, makePlan({ gpuLayers: 20, fits: true }));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18702" }));
+    expect(valueOf(args, "--fit")).toBe("on");
+    expect(args).not.toContain("--n-gpu-layers");
+  });
+
+  test("不认 --fit → 按层卸载回落计划层数（老行为）", () => {
+    probe({ fit: false });
+    seedPlan(chatModel, makePlan({ gpuLayers: 20, fits: true }));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18703" }));
+    expect(valueOf(args, "--n-gpu-layers")).toBe("20");
+    expect(args).not.toContain("--fit");
+  });
+
+  test("MoE 专家下放：认 --n-cpu-moe → 层全留 GPU + --n-cpu-moe N（+ --fit off）", () => {
+    probe({ fit: true, nCpuMoe: true, overrideTensor: true });
+    seedPlan(chatModel, moePlan(true));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18704" }));
+    expect(valueOf(args, "--n-gpu-layers")).toBe("999");
+    expect(valueOf(args, "--n-cpu-moe")).toBe("3");
+    expect(valueOf(args, "--fit")).toBe("off");
+    expect(args).not.toContain("--override-tensor");
+  });
+
+  test("MoE 专家下放：只认 -ot → 用正则把前 N 层专家张量放 CPU", () => {
+    probe({ nCpuMoe: false, overrideTensor: true });
+    seedPlan(chatModel, moePlan(true));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18705" }));
+    expect(valueOf(args, "--override-tensor")).toBe("blk\\.(0|1|2)\\.ffn_.*_exps\\.=CPU");
+    expect(valueOf(args, "--override-tensor")).toBe(cpuMoeOverrideTensor(3));
+    expect(args).not.toContain("--n-cpu-moe");
+    expect(args).not.toContain("--fit");
+  });
+
+  test("MoE：两种下放开关都不认 → 回落按层卸载的层数", () => {
+    probe({});
+    seedPlan(chatModel, moePlan(true));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18706" }));
+    expect(valueOf(args, "--n-gpu-layers")).toBe("30");
+    expect(args).not.toContain("--n-cpu-moe");
+  });
+
+  test("MoE 计划也装不下 + 认 --fit → 整组交给 --fit on", () => {
+    probe({ fit: true, nCpuMoe: true });
+    seedPlan(chatModel, moePlan(false));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18707" }));
+    expect(valueOf(args, "--fit")).toBe("on");
+    expect(args).not.toContain("--n-cpu-moe");
+    expect(args).not.toContain("--n-gpu-layers");
+  });
+
+  test("用户固定了层数 → 只听用户的：不下放专家、不发 --fit", () => {
+    probe({ fit: true, nCpuMoe: true });
+    SETTINGS.SERVER_GPU_LAYERS = "28";
+    seedPlan(chatModel, moePlan(true));
+    const args = chatArgs(new LlamaRuntime({ model: chatModel, port: "18708" }));
+    expect(valueOf(args, "--n-gpu-layers")).toBe("28");
+    expect(args).not.toContain("--n-cpu-moe");
+    expect(args).not.toContain("--fit");
+  });
+
+  test("--no-context-shift：认才发，只给聊天实例（嵌入实例没有「对话」可丢）", () => {
+    SETTINGS.SERVER_AUTO_TUNE = "0";
+    probe({ noContextShift: false });
+    expect(chatArgs(new LlamaRuntime({ model: chatModel, port: "18709" }))).not.toContain("--no-context-shift");
+    probe({ noContextShift: true });
+    expect(chatArgs(new LlamaRuntime({ model: chatModel, port: "18709" }))).toContain("--no-context-shift");
+    const emb = new LlamaRuntime({ model: embedModel, port: "18710", purpose: "embedding" });
+    expect(emb.buildCommandLine()).not.toContain("--no-context-shift");
+  });
+});
+
+describe("start / 显存不足降级重试", () => {
+  const originalFetch = globalThis.fetch;
+  type LogEventInput = Parameters<typeof realAppLog.logEvent>[0];
+  let logEvents: LogEventInput[] = [];
+  /** 每次 spawn 依次取一条剧本：exit = null 表示活着（健康检查通过），数字表示打完日志就以此退出。 */
+  let script: { log: string; exit: number | null }[] = [];
+  let spawned: string[][] = [];
+  let alive = false;
+  let realSpawn: typeof realProc.spawnServerProcess;
+  let realProbe: typeof realFlashAttn.probeServerHelp;
+
+  const OOM_LOG =
+    "llama_model_load: loading model\n" +
+    "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 9216.00 MiB on device 0: cudaMalloc failed: out of memory\n" +
+    "llama_init_from_model: failed to initialize the context\n" +
+    "srv    load_model: failed to load model\n";
+
+  beforeAll(async () => {
+    const binPath = llamaCppBinaryPath();
+    mkdirSync(dirname(binPath), { recursive: true });
+    if (!existsSync(binPath)) writeFileSync(binPath, "#!/bin/sh\n");
+
+    await mockModulePartial<typeof import("../app-log")>("./app-log", {
+      logEvent: (input: LogEventInput) => {
+        logEvents.push(input);
+        return { ...input, level: input.level ?? "info", seq: logEvents.length, ts: Date.now(), pid: 1 };
+      },
+    });
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith("/health")) {
+        if (!alive) throw new Error("connection refused (fake)");
+        return new Response(null, { status: 200 });
+      }
+      if (url.endsWith("/props")) return new Response(JSON.stringify({}), { status: 200 });
+      throw new Error(`unexpected fetch in test: ${url}`);
+    }) as typeof fetch;
+
+    realSpawn = realProc.spawnServerProcess;
+    mock.module("./proc", () => ({
+      ...realProc,
+      spawnServerProcess: (cmd: string[]) => {
+        spawned.push(cmd);
+        const step = script.shift() ?? { log: "", exit: null };
+        alive = step.exit === null;
+        const stream = (text: string) =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (text) controller.enqueue(new TextEncoder().encode(text));
+              controller.close();
+            },
+          });
+        return {
+          // pid 0：killProcessTree 不会去碰真实进程组
+          pid: 0,
+          exited:
+            step.exit === null
+              ? new Promise<number>(() => {})
+              : new Promise<number>((resolve) => setTimeout(() => resolve(step.exit as number), 5)),
+          stdout: stream(step.log),
+          stderr: stream(""),
+          kill: () => {},
+        } as never;
+      },
+    }));
+
+    realProbe = realFlashAttn.probeServerHelp;
+    mock.module("./llama-flash-attn", () => ({
+      ...realFlashAttn,
+      probeServerHelp: async () => ({
+        loadMode: "unknown",
+        flashAttn: "none" as const,
+        fit: true,
+        nCpuMoe: true,
+        overrideTensor: true,
+        noContextShift: true,
+      }),
+    }));
+  });
+
+  beforeEach(() => {
+    logEvents = [];
+    script = [];
+    spawned = [];
+    alive = false;
+    setChatSettings();
+    SETTINGS.SERVER_AUTO_TUNE = "0";
+    SETTINGS.SERVER_CTX_SIZE = "32768";
+  });
+
+  afterAll(() => {
+    globalThis.fetch = originalFetch;
+    mock.module("./proc", () => ({ ...realProc, spawnServerProcess: realSpawn }));
+    mock.module("./llama-flash-attn", () => ({ ...realFlashAttn, probeServerHelp: realProbe }));
+    mock.module("../app-log", () => ({ ...realAppLog }));
+    realFlashAttn.clearServerHelpSupportCache();
+  });
+
+  /** 测试用的快节奏实例（轮询 / 退出等待 / 重试间隔都调小）。 */
+  function fastRuntime(port: string, retryDelayMs = 0) {
+    const rt = new LlamaRuntime({ model: chatModel, port });
+    Object.assign(rt as unknown as Record<string, number>, { healthPollMs: 10, exitGraceMs: 20, retryDelayMs });
+    return rt;
+  }
+
+  /** spawn 的 argv 里 llama-server 之后那一段（darwin 下前面有 script -q /dev/null 包装）。 */
+  const argsOf = (cmd: string[]) => cmd.slice(cmd.indexOf(llamaCppBinaryPath()) + 1);
+  const valueOf = (args: string[], flag: string) => args[args.indexOf(flag) + 1];
+  const events = (name: string) => logEvents.filter((e) => e.event === name);
+
+  test("OOM 两次后起来：上下文减半 → KV 降档，每次都进日志；复制的命令 = 最后一次实际 argv", async () => {
+    script = [
+      { log: OOM_LOG, exit: 1 },
+      { log: OOM_LOG, exit: 1 },
+      { log: "main: server is listening\n", exit: null },
+    ];
+    const statuses: string[] = [];
+    const rt = fastRuntime("18720");
+    rt.onStatusChange((s) => statuses.push(s));
+    const result = await rt.start();
+    expect(result.ok).toBe(true);
+    expect(rt.getStatus()).toBe("running");
+    expect(spawned.length).toBe(3);
+
+    const [a1, a2, a3] = spawned.map(argsOf);
+    expect(valueOf(a1!, "--ctx-size")).toBe("32768");
+    expect(valueOf(a2!, "--ctx-size")).toBe("16384");
+    expect(valueOf(a3!, "--ctx-size")).toBe("16384");
+    expect(valueOf(a2!, "--cache-type-k")).toBe("q8_0");
+    expect(valueOf(a3!, "--cache-type-k")).toBe("q4_0");
+    expect(valueOf(a3!, "--cache-type-v")).toBe("q4_0");
+    // 聊天实例 + 认 --no-context-shift → 发
+    expect(a1).toContain("--no-context-shift");
+
+    const logs = rt.getLogs();
+    expect(logs).toContain("[omni] 显存不足，第 1 次降级重试：上下文 32768 → 16384");
+    expect(logs).toContain("[omni] 显存不足，第 2 次降级重试：KV 缓存 q8_0/q8_0 → q4_0/q4_0");
+    expect(events("launch.degrade.retry").length).toBe(2);
+    expect(events("launch.degrade.succeeded").length).toBe(1);
+    // 重试之间不闪「错误」
+    expect(statuses).not.toContain("error");
+
+    const degraded = rt.getDegradedLaunch();
+    expect(degraded?.attempts).toBe(2);
+    expect(degraded?.adjust).toEqual({ ctxCap: 16384, cacheTypeK: "q4_0", cacheTypeV: "q4_0" });
+    // 「复制的命令」与实际发出去的 argv 是同一份（降级调整也叠进去了）；也不需要重启
+    expect(rt.buildArgs({ kind: "local", path: chatModel, alias: "e2e-chat" }, DEFAULT_CUSTOM_SERVER_ARGS, chatModel)).toEqual(a3!);
+    expect(rt.needsRestart()).toBe(false);
+    // 设置没被改
+    expect(SETTINGS.SERVER_CTX_SIZE).toBe("32768");
+    expect(SETTINGS.SERVER_CACHE_TYPE_K).toBe("q8_0");
+  });
+
+  test("一直 OOM：最多重试 3 次（第 3 次交给 --fit on），然后按原错误报失败", async () => {
+    script = [0, 1, 2, 3, 4].map(() => ({ log: OOM_LOG, exit: 1 }));
+    const rt = fastRuntime("18721");
+    const result = await rt.start();
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("out of memory");
+    expect(spawned.length).toBe(4);
+    expect(argsOf(spawned[3]!)).toContain("--fit");
+    expect(valueOf(argsOf(spawned[3]!), "--fit")).toBe("on");
+    expect(rt.getStatus()).toBe("error");
+    expect(rt.getLastError()).toContain("out of memory");
+    expect(events("launch.degrade.exhausted").length).toBe(1);
+    expect(rt.getDegradedLaunch()).toBeNull();
+  });
+
+  test("不是显存问题（架构不认识）→ 不重试", async () => {
+    script = [{ log: "llama_model_load: error loading model: unknown model architecture: 'foo'\n", exit: 1 }];
+    const rt = fastRuntime("18722");
+    const result = await rt.start();
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("unknown model architecture");
+    expect(spawned.length).toBe(1);
+    expect(events("launch.degrade.retry").length).toBe(0);
+    expect(rt.getStatus()).toBe("error");
+  });
+
+  test("按模型固定了上下文：照样临时调小，日志说清楚不改设置", async () => {
+    const { setModelParams, clearModelParams } =
+      require("../db/model-params") as typeof import("../db/model-params");
+    setModelParams(chatModel, { ctxSize: 16384 });
+    try {
+      script = [
+        { log: OOM_LOG, exit: 1 },
+        { log: "", exit: null },
+      ];
+      const rt = fastRuntime("18723");
+      expect((await rt.start()).ok).toBe(true);
+      expect(valueOf(argsOf(spawned[1]!), "--ctx-size")).toBe("8192");
+      expect(rt.getLogs()).toContain("固定了上下文长度");
+    } finally {
+      clearModelParams(chatModel);
+    }
+  });
+
+  test("重试等待中用户点了停止 → 不再起下一次，状态是已停止而不是错误", async () => {
+    script = [
+      { log: OOM_LOG, exit: 1 },
+      { log: "", exit: null },
+    ];
+    const rt = fastRuntime("18724", 300);
+    const pending = rt.start();
+    // 等到第一次失败、进入重试等待
+    for (let i = 0; i < 100 && !rt.getLogs().includes("第 1 次降级重试"); i++) await Bun.sleep(10);
+    expect(rt.getLogs()).toContain("第 1 次降级重试");
+    await rt.stop();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(spawned.length).toBe(1);
+    expect(rt.getStatus()).toBe("stopped");
+    expect(rt.getLogs()).toContain("放弃降级重试");
+    expect(rt.getDegradedLaunch()).toBeNull();
+  });
+});

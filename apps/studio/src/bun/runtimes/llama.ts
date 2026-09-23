@@ -12,6 +12,7 @@ import {
   type SettingsKey,
 } from "../db/settings";
 import {
+  autoTuneMinCtx,
   buildLaunchPlanKeyFromSettings,
   cachedLaunchPlan,
   pairedMmprojPath,
@@ -26,11 +27,21 @@ import type { ModelParams, ResolvedSampling } from "../../shared/model-params";
 import { mainGgufInDir, modelNameForPath } from "../model-scan";
 import { slugModelFileName } from "../model-store";
 import { markServerStarted } from "../stats";
-import { extractStartupError } from "./errors";
+import { readGgufMeta } from "../gguf-meta";
+import { extractStartupError, isOutOfMemoryLog } from "./errors";
+import {
+  MAX_DEGRADE_RETRIES,
+  nextDegradeStep,
+  type DegradeStepKind,
+  type DegradedLaunch,
+  type LaunchAdjust,
+  type MemoryKnobs,
+} from "./llama-degrade";
 import {
   COMMON_LLAMA_SERVER_PATHS,
   cachedFlashAttnSupport,
   cachedKvUnifiedSupport,
+  cachedMemoryFlagSupport,
   cachedReasoningSupport,
   cachedServerHelpSupport,
   defaultLlamaServerBinary,
@@ -38,6 +49,7 @@ import {
   probeServerHelp,
   reasoningArgs,
   type FlashAttnSupport,
+  type MemoryFlagSupport,
 } from "./llama-flash-attn";
 import { shellJoin, splitShellArgs } from "./shell-args";
 import { loadModeArgs, loadModeUnsupported, type LoadModeSupport } from "./llama-load-mode";
@@ -118,6 +130,31 @@ export function persistedEffectiveFlashAttn(raw: string | null | undefined): "" 
 }
 
 type LlamaModel = { kind: "local"; path: string; alias: string } | { kind: "hf"; ref: string };
+
+/**
+ * 「全部层放 GPU」的 --n-gpu-layers 值。用 999 而不是 `all` / `-1`：数字在所有版本里都认
+ * （超过层数会被钳到全部），`all` 是新版才有的写法，`-1` 在带 --fit 的版本里表示「auto」。
+ */
+const ALL_GPU_LAYERS = "999";
+
+/**
+ * MoE 专家下放的 `-ot` 回落写法（没有 --n-cpu-moe 的版本）：前 n 层的专家张量
+ * （blk.<i>.ffn_{gate,up,down,gate_up}_exps.weight）放 CPU。与 --n-cpu-moe N 同义。
+ */
+export function cpuMoeOverrideTensor(n: number): string {
+  const layers = Array.from({ length: Math.max(0, Math.floor(n)) }, (_, i) => String(i));
+  return `blk\\.(${layers.join("|")})\\.ffn_.*_exps\\.=CPU`;
+}
+
+/** buildArgs 里显存相关那几个参数的最终取值（已叠过 launchAdjust），拼 argv 与选降级步骤共用。 */
+type ResolvedMemory = {
+  ctxSize: string;
+  cacheTypeK: string | null;
+  cacheTypeV: string | null;
+  /** --n-gpu-layers / --n-cpu-moe / -ot / --fit 这一组，按顺序原样进 argv */
+  gpuArgs: string[];
+  knobs: MemoryKnobs;
+};
 
 /**
  * 自动启动参数的缓存 key（运行时 / 预览 RPC 共用这一处，保证逐字段相同）：
@@ -241,6 +278,10 @@ export class LlamaRuntime implements Runtime {
 
   private appendLog(text: string) {
     this.serverLogs += text;
+    this.attemptLog += text;
+    if (this.attemptLog.length > MAX_LOG_CHARS) {
+      this.attemptLog = this.attemptLog.slice(-MAX_LOG_CHARS);
+    }
     if (this.serverLogs.length > MAX_LOG_CHARS) {
       this.serverLogs = this.serverLogs.slice(-MAX_LOG_CHARS);
     }
@@ -277,6 +318,11 @@ export class LlamaRuntime implements Runtime {
     return this.lastError;
   }
 
+  /** 本次运行是不是降级起来的、用了什么（没降级 / 没在跑 = null）。界面据此提示「本次临时调小了…」。 */
+  getDegradedLaunch(): DegradedLaunch | null {
+    return this.degraded;
+  }
+
   /**
    * `--load-mode` / `--flash-attn` 的支持形态（null = 还没探测过）。探测在 start() 里、
    * buildArgs 之前做（一次 --help 出两个），结果按二进制路径缓存在进程级（同一份
@@ -300,6 +346,27 @@ export class LlamaRuntime implements Runtime {
   private reasoningSupport: boolean | null = null;
   /** 本次运行实际发出去的 argv（没在跑 / 没启动过 = null），「改了参数要不要重启」的比对基准。 */
   private launchedArgs: string[] | null = null;
+  /** 显存相关开关（--fit / --n-cpu-moe / -ot / --no-context-shift）的探测结果；null = 本实例没探过。 */
+  private memoryFlags: MemoryFlagSupport | null = null;
+  /**
+   * 显存不足降级重试的临时调整（见 llama-degrade.ts）：buildArgs 最后一层叠上它。
+   * 只活在本次运行里 —— 每次 start() 清空，不写设置、不改按模型参数。
+   */
+  private launchAdjust: LaunchAdjust = {};
+  /** 本次运行是降级起来的：用了什么（界面 / 日志展示）；正常启动 = null。 */
+  private degraded: DegradedLaunch | null = null;
+  /** 用户在启动过程中点了停止：降级重试到此为止。 */
+  private stopRequested = false;
+  /** 正在「启动阶段」的那个子进程：它退出时由 start() 的循环决定是重试还是报错。 */
+  private startupProc: Subprocess | null = null;
+  /** 本次尝试（一次 spawn）的日志：判断是不是 OOM、挑错误行都只看这一次的。 */
+  private attemptLog = "";
+  /** 模型层数（GGUF 头；读不到 = null），GPU 层数降级时没有计划也能算 75%。 */
+  private modelBlockCount: number | null = null;
+  /** 健康检查轮询间隔 / 进程退出后等日志落地 / 两次尝试之间的间隔（测试调小）。 */
+  protected healthPollMs = 1000;
+  protected exitGraceMs = 250;
+  protected retryDelayMs = 1000;
 
   clearLogs() {
     this.serverLogs = "";
@@ -457,6 +524,9 @@ export class LlamaRuntime implements Runtime {
       detail.predictedKv = plan.estimates.kvBytes;
     }
 
+    // 降级起来的：预测与实测对不上是预期的，记下用了什么，校准时别把它当成公式误差
+    if (this.degraded !== null) detail.degraded = this.degraded.summary;
+
     const log = this.getLogs();
     const flash = parseFlashAttnState(log);
     detail.flashAttn = flash;
@@ -584,6 +654,137 @@ export class LlamaRuntime implements Runtime {
     return shellJoin(current) !== shellJoin(this.launchedArgs);
   }
 
+  /** 显存相关开关的支持：本实例探过用本实例的，否则读进程级缓存（没探过 = 全不支持）。 */
+  private memoryFlagSupport(): MemoryFlagSupport {
+    return this.memoryFlags ?? cachedMemoryFlagSupport(defaultLlamaServerBinary());
+  }
+
+  /**
+   * 显存相关参数的最终取值：上下文、KV 类型、GPU 层数 / MoE 专家下放 / --fit。
+   *
+   * 优先级（低 → 高）：档案默认 < 全局设置 < 自动计划 < 按模型参数 < **launchAdjust**（降级重试的
+   * 临时调整，永远最后叠，所以复制的命令就是降级后实际发出去的那条）。
+   *
+   * GPU 这一组的决策（只在用户没固定层数、且有自动计划时才自动决定）：
+   *  - 计划说没有 GPU（gpuLayers === 0）：一个参数都不发（引擎自己决定）；
+   *  - MoE 专家下放（计划给了 moeOffload，且引擎认 --n-cpu-moe 或 -ot）：
+   *    计划装得下 → 层全留 GPU + 前 N 层专家放 CPU（认 --fit 的再加 --fit off，别让它再挪）；
+   *    装不下 → 认 --fit 就整组交给 `--fit on`，不认照样按 N 下放；
+   *  - 其它：计划「证明装得下」（fits 且不用按层卸载）→ 认 --fit 就 `-ngl 999 --fit off`
+   *    （新版 --fit 默认 on，装得下时它仍会为留余量把约 1 GiB 挪出 GPU —— Unsloth 实测）；
+   *    证明不了（按层卸载 / 装不下）→ 认 --fit 就只发 `--fit on`、不发层数（llama.cpp 按真实空闲
+   *    显存放，比我们估得准，给了层数它反而不动）；不认 --fit 回落计划的层数（老行为）。
+   * 没有计划（关了自动 / 非 GGUF）时与加这些开关之前逐字节一致：只有用户固定的层数。
+   */
+  private resolveMemory(mp: ModelParams | null, autoPlan: LaunchPlan | null, serverArgs: ServerArgs): ResolvedMemory {
+    const cleanNum = LlamaRuntime.cleanNum;
+    const adj = this.launchAdjust;
+    const mem = this.memoryFlagSupport();
+
+    // 自动启动参数（SERVER_AUTO_TUNE，默认开）：有计划时 --ctx-size 用计划值。
+    // 按模型固定的窗口：自动规划开着时它已作为 ctxOverride 进了计划（计划的 ctxTokens 就是它，
+    // 其余参数照样拟合）；没有计划（关了自动 / 非 GGUF / 没算过）时直接用它。
+    let ctxSize = autoPlan
+      ? String(autoPlan.ctxTokens)
+      : mp?.ctxSize !== undefined
+        ? String(mp.ctxSize)
+        : cleanNum(getSetting("SERVER_CTX_SIZE") || "", String(serverArgs.ctxSize));
+    if (adj.ctxCap !== undefined && Number(ctxSize) > adj.ctxCap) ctxSize = String(adj.ctxCap);
+
+    // llama.cpp 的 KV 量化枚举（本机 `--help` 的 allowed values，与规划器 KV 表同源）：手改设置行
+    // 塞进来的值不能进 argv，白名单之外一律不落参数（引擎用自己的默认）。按模型的优先，降级调整再盖过它。
+    const kvTypes = new Set<string>(KV_CACHE_TYPES);
+    const pickKv = (adjusted: string | undefined, perModel: string | undefined, key: SettingsKey): string | null => {
+      const v = adjusted ?? perModel ?? getSetting(key);
+      return kvTypes.has(v) ? v : null;
+    };
+    const cacheTypeK = pickKv(adj.cacheTypeK, mp?.cacheTypeK, "SERVER_CACHE_TYPE_K");
+    const cacheTypeV = pickKv(adj.cacheTypeV, mp?.cacheTypeV, "SERVER_CACHE_TYPE_V");
+
+    // 「自动（全卸载）」哨兵值：与 llama.cpp 引擎自身的 -1 同值（不传参数 = 引擎自己决定），
+    // 这里额外接受 "" / "auto" 作为同义写法 —— 自动推算的 gpuLayers 建议只在用户没
+    // 显式指定时采纳（哨兵 → 计划值；具体数字 → 听用户的）。具体数字要能被解析成
+    // 有限整数才进 argv（手改设置行塞进来的垃圾值丢弃，行为等同哨兵 = 引擎自己决定）。
+    // 按模型的层数优先：-1 = 显式「交给引擎 / 自动规划」（盖过全局的固定层数），>=0 = 固定。
+    const rawGpuLayers = mp?.gpuLayers !== undefined ? String(mp.gpuLayers) : getSetting("SERVER_GPU_LAYERS");
+    const gpuAuto = rawGpuLayers === "-1" || rawGpuLayers === "" || rawGpuLayers.toLowerCase() === "auto";
+    const pinnedLayers =
+      !gpuAuto && /^-?\d+$/.test(rawGpuLayers.trim()) && Number.isSafeInteger(Number(rawGpuLayers))
+        ? rawGpuLayers
+        : "";
+
+    let ngl: string | null = null;
+    let nCpuMoe: number | null = null;
+    let fit: "on" | "off" | null = null;
+    if (pinnedLayers) {
+      ngl = pinnedLayers;
+    } else if (gpuAuto && autoPlan !== null && autoPlan.gpuLayers !== 0) {
+      const moe = autoPlan.moeOffload ?? null;
+      if (moe !== null && (mem.nCpuMoe || mem.overrideTensor)) {
+        if (mem.fit && !autoPlan.fits) {
+          fit = "on";
+        } else {
+          ngl = ALL_GPU_LAYERS;
+          nCpuMoe = moe.cpuMoeLayers;
+          if (mem.fit) fit = "off";
+        }
+      } else {
+        // 引擎不认专家下放时回落按层卸载的建议值
+        const layers = moe !== null ? moe.fallbackGpuLayers : autoPlan.gpuLayers;
+        const proven = autoPlan.fits && layers === null;
+        if (mem.fit) {
+          if (proven) {
+            ngl = ALL_GPU_LAYERS;
+            fit = "off";
+          } else {
+            fit = "on";
+          }
+        } else if (layers !== null && layers !== 0) {
+          ngl = String(layers);
+        }
+      }
+    }
+
+    // 降级重试的临时调整（最后叠）
+    if (adj.fit === "on" && mem.fit) {
+      fit = "on";
+      ngl = null;
+      nCpuMoe = null;
+    }
+    if (adj.nCpuMoe !== undefined && nCpuMoe !== null) nCpuMoe = adj.nCpuMoe;
+    if (adj.gpuLayers !== undefined) ngl = String(adj.gpuLayers);
+
+    const gpuArgs: string[] = [];
+    if (ngl !== null) gpuArgs.push("--n-gpu-layers", ngl);
+    if (nCpuMoe !== null && nCpuMoe > 0) {
+      if (mem.nCpuMoe) gpuArgs.push("--n-cpu-moe", String(nCpuMoe));
+      else gpuArgs.push("--override-tensor", cpuMoeOverrideTensor(nCpuMoe));
+    }
+    if (fit !== null) gpuArgs.push("--fit", fit);
+
+    const partialDetail = autoPlan?.reasons.find((r) => r.code === "gpu.partial-offload")?.detail?.blockCount;
+    const blockCount =
+      autoPlan?.moeOffload?.blockCount ??
+      (typeof partialDetail === "number" ? partialDetail : null) ??
+      this.modelBlockCount;
+    const rawFlash = mp?.flashAttn ?? getSetting("SERVER_FLASH_ATTN");
+    const knobs: MemoryKnobs = {
+      ctx: Number(ctxSize),
+      ctxPinned: mp?.ctxSize !== undefined,
+      cacheTypeK,
+      cacheTypeV,
+      gpuLayers: ngl !== null ? Number(ngl) : null,
+      gpuLayersPinned: pinnedLayers !== "",
+      nCpuMoe: nCpuMoe !== null && nCpuMoe > 0 ? nCpuMoe : null,
+      fit,
+      blockCount,
+      fitSupported: mem.fit,
+      flashAttnOff: rawFlash === "off" || this.planFlashAttnEffective() === "off",
+      minCtx: autoTuneMinCtx(),
+    };
+    return { ctxSize, cacheTypeK, cacheTypeV, gpuArgs, knobs };
+  }
+
   /** 公开（`buildCommandLine` / `start` / 同进程内 UI 入口共用）：拼装 llama-server 参数。 */
   buildArgs(model: LlamaModel, serverArgs: ServerArgs, target?: string): string[] {
     const cleanNum = LlamaRuntime.cleanNum;
@@ -604,11 +805,9 @@ export class LlamaRuntime implements Runtime {
     // 按模型固定的窗口：自动规划开着时它已作为 ctxOverride 进了计划（计划的 ctxTokens 就是它，
     // 其余参数照样拟合）；没有计划（关了自动 / 非 GGUF / 没算过）时直接用它。
     const autoPlan = this.autoPlan(model, modelKey);
-    const ctxSize = autoPlan
-      ? String(autoPlan.ctxTokens)
-      : mp?.ctxSize !== undefined
-        ? String(mp.ctxSize)
-        : cleanNum(getSetting("SERVER_CTX_SIZE") || "", String(serverArgs.ctxSize));
+    // 上下文 / KV 类型 / GPU 层数这一组收在 resolveMemory（同一份取值也给降级重试挑下一步用）。
+    const memory = this.resolveMemory(mp, autoPlan, serverArgs);
+    const ctxSize = memory.ctxSize;
     const imageMaxTokens = cleanNum(
       getSetting("SERVER_IMAGE_MAX_TOKENS") || "",
       String(serverArgs.imageMaxTokens),
@@ -623,26 +822,7 @@ export class LlamaRuntime implements Runtime {
       mp?.parallel !== undefined
         ? String(mp.parallel)
         : cleanNum(getSetting("SERVER_PARALLEL") || "", String(serverArgs.parallel));
-    // 「自动（全卸载）」哨兵值：与 llama.cpp 引擎自身的 -1 同值（不传参数 = 引擎自己决定），
-    // 这里额外接受 "" / "auto" 作为同义写法 —— 自动推算的 gpuLayers 建议只在用户没
-    // 显式指定时采纳（哨兵 → 计划值；具体数字 → 听用户的）。具体数字要能被解析成
-    // 有限整数才进 argv（手改设置行塞进来的垃圾值丢弃，行为等同哨兵 = 引擎自己决定）。
-    // 按模型的层数优先：-1 = 显式「交给引擎 / 自动规划」（盖过全局的固定层数），>=0 = 固定。
-    const rawGpuLayers = mp?.gpuLayers !== undefined ? String(mp.gpuLayers) : getSetting("SERVER_GPU_LAYERS");
-    const gpuAuto = rawGpuLayers === "-1" || rawGpuLayers === "" || rawGpuLayers.toLowerCase() === "auto";
-    const gpuLayers =
-      !gpuAuto && /^-?\d+$/.test(rawGpuLayers.trim()) && Number.isSafeInteger(Number(rawGpuLayers))
-        ? rawGpuLayers
-        : "";
-    // llama.cpp 的 KV 量化枚举（本机 `--help` 的 allowed values，与规划器 KV 表同源）：手改设置行
-    // 塞进来的值不能进 argv，白名单之外一律不落参数（引擎用自己的默认）。按模型的优先。
-    const kvTypes = new Set<string>(KV_CACHE_TYPES);
-    const pickKv = (perModel: string | undefined, key: SettingsKey): string | null => {
-      const v = perModel ?? getSetting(key);
-      return kvTypes.has(v) ? v : null;
-    };
-    const cacheTypeK = pickKv(mp?.cacheTypeK, "SERVER_CACHE_TYPE_K");
-    const cacheTypeV = pickKv(mp?.cacheTypeV, "SERVER_CACHE_TYPE_V");
+    const { cacheTypeK, cacheTypeV } = memory;
     // 池化方式同理：设置键在 set 时有枚举校验，这里再收一遍（db 被手改 / 旧值兜底）。
     const pooling = (EMBEDDING_POOLING_VALUES as readonly string[]).includes(
       getSetting("EMBEDDING_POOLING"),
@@ -738,6 +918,9 @@ export class LlamaRuntime implements Runtime {
       const reaSupported =
         this.reasoningSupport ?? cachedReasoningSupport(defaultLlamaServerBinary()) ?? false;
       args.push(...reasoningArgs(mp?.thinking, reaSupported));
+      // 超窗报错而不是悄悄丢前文（context shift 会把最早的对话挤掉，模型「忘了」开头却没人知道）。
+      // 新版默认已经是关，老版默认开 —— 显式发出去两边行为一致；只在 --help 认这个开关时发。
+      if (this.memoryFlagSupport().noContextShift) args.push("--no-context-shift");
     }
 
     // 嵌入实例追加嵌入开关与池化方式（llama.cpp 默认禁用嵌入端点，这就是 501 的根因）。
@@ -749,17 +932,8 @@ export class LlamaRuntime implements Runtime {
       );
     }
 
-    if (gpuLayers && !gpuAuto) {
-      args.push("--n-gpu-layers", gpuLayers);
-    } else if (
-      gpuAuto &&
-      autoPlan !== null &&
-      typeof autoPlan.gpuLayers === "number"
-    ) {
-      // 用户没显式指定层数（-1/空/auto = 交给引擎）时才采纳计划的建议值；
-      // 填了具体数字就听用户的。gpuLayers === 0（没有 GPU）时引擎自己决定，不发参数。
-      if (autoPlan.gpuLayers !== 0) args.push("--n-gpu-layers", String(autoPlan.gpuLayers));
-    }
+    // GPU 层数 / MoE 专家下放 / --fit（决策见 resolveMemory）
+    args.push(...memory.gpuArgs);
 
     // 加载模式（PERF-02）：权重 mmap / 锁内存的取舍 —— 系统内存紧张时是「换出去一点」
     // 还是「整机卡住」，由它决定。按 --help 探测结果决定发新版 --load-mode 还是旧版
@@ -816,6 +990,12 @@ export class LlamaRuntime implements Runtime {
     this.flashAttnSupport = helpSupport.flashAttn;
     this.kvUnifiedSupport = helpSupport.kvUnified ?? false;
     this.reasoningSupport = helpSupport.reasoning ?? false;
+    this.memoryFlags = {
+      fit: helpSupport.fit ?? false,
+      nCpuMoe: helpSupport.nCpuMoe ?? false,
+      overrideTensor: helpSupport.overrideTensor ?? false,
+      noContextShift: helpSupport.noContextShift ?? false,
+    };
     const loadMode = getSetting("SERVER_LOAD_MODE");
     if (loadModeUnsupported(loadMode, this.loadModeSupport)) {
       const message = `加载模式 ${loadMode} 在这台 llama-server（${this.loadModeSupport}）上不支持，本次按默认加载模式启动`;
@@ -870,11 +1050,144 @@ export class LlamaRuntime implements Runtime {
       }
     }
 
+    // 模型层数：GPU 层数降级在没有计划时也要能算「75%」。读不到（不是 GGUF / HF 引用）按未知。
+    this.modelBlockCount = null;
+    if (model.kind === "local") {
+      try {
+        const read = await readGgufMeta(model.path);
+        if (read.ok) this.modelBlockCount = read.data.meta.blockCount;
+      } catch {
+        // 元数据读取失败：按未知
+      }
+    }
+
+    // —— 启动 + 显存不足时的降级重试（见 llama-degrade.ts）——
+    // 每次 start() 都从计划重新开始：上次降级时被占的显存现在可能已经空出来了。
+    this.launchAdjust = {};
+    this.degraded = null;
+    this.stopRequested = false;
+    const used = new Set<DegradeStepKind>();
+    const steps: string[] = [];
+    let retries = 0;
+    while (true) {
+      const attempt = await this.launchOnce(llamaPath, model, serverArgs, target);
+      if (attempt.ok) {
+        if (retries > 0) {
+          logEvent({
+            level: "warn",
+            source: "server",
+            event: "launch.degrade.succeeded",
+            message: `显存不足，降级 ${retries} 次后启动成功（${basename(this.resolvedModelPath())}）：${steps.join("；")}`,
+            detail: { model: basename(this.resolvedModelPath()), attempts: retries, ...this.launchAdjust },
+          });
+        }
+        return { ok: true };
+      }
+      if (attempt.aborted || this.stopRequested) {
+        // 用户停了：不再重试，也不把「停止」记成错误
+        this.degraded = null;
+        if (retries > 0) this.appendLog("\n[omni] 已停止，放弃降级重试\n");
+        return { ok: false, error: attempt.error };
+      }
+
+      const oom = isOutOfMemoryLog(this.attemptLog);
+      const step =
+        oom && retries < MAX_DEGRADE_RETRIES
+          ? nextDegradeStep(
+              // start() 总是把 target 传给 buildArgs，这里用同一个 key 读按模型参数与计划
+              this.resolveMemory(getModelParams(target), this.autoPlan(model, target), serverArgs).knobs,
+              this.launchAdjust,
+              used,
+            )
+          : null;
+      if (step === null) {
+        if (oom && retries > 0) {
+          logEvent({
+            level: "error",
+            source: "server",
+            event: "launch.degrade.exhausted",
+            message: `显存不足，降级 ${retries} 次后仍起不来（${basename(this.resolvedModelPath())}）：${attempt.error}`,
+            detail: { model: basename(this.resolvedModelPath()), attempts: retries, steps, ...this.launchAdjust },
+          });
+        }
+        this.degraded = null;
+        this.lastError = attempt.error;
+        // 与加重试之前同一口径：启动阶段正常退出（code 0）记「已停止」，其余记错误
+        this.setStatus(attempt.exitCode === 0 ? "stopped" : "error");
+        return { ok: false, error: attempt.error };
+      }
+
+      // 超时那条路径进程可能还活着（卡在分配上）：先收掉，显存才会还回来
+      await this.killStartupLeftover();
+      retries += 1;
+      used.add(step.kind);
+      steps.push(step.summary);
+      this.launchAdjust = step.adjust;
+      // 在下一次尝试进入 running 之前就记好：注册表在状态变成 running 的回调里读它
+      this.degraded = { attempts: retries, adjust: { ...step.adjust }, summary: steps.join("；") };
+      const line = `显存不足，第 ${retries} 次降级重试：${step.summary}`;
+      this.appendLog(`\n[omni] ${line}\n`);
+      logEvent({
+        level: "warn",
+        source: "server",
+        event: "launch.degrade.retry",
+        message: `${line}（${basename(this.resolvedModelPath())}）`,
+        detail: {
+          model: basename(this.resolvedModelPath()),
+          attempt: retries,
+          step: step.kind,
+          reason: attempt.error,
+          ...step.adjust,
+        },
+      });
+      if (this.retryDelayMs > 0) await Bun.sleep(this.retryDelayMs);
+      if (this.stopRequested) {
+        this.degraded = null;
+        this.appendLog("\n[omni] 已停止，放弃降级重试\n");
+        return { ok: false, error: "Server stopped before becoming ready" };
+      }
+    }
+  }
+
+
+  /** 启动阶段超时后进程还活着：杀掉整组并等它退出（重试前必须把显存还回来）。 */
+  private async killStartupLeftover(): Promise<void> {
+    const proc = this.serverProcess;
+    if (!proc) return;
+    killProcessTree(proc, "SIGTERM");
+    if (!(await waitExit(proc, 5000))) {
+      killProcessTree(proc, "SIGKILL");
+      await proc.exited.catch(() => {});
+    }
+    if (this.serverProcess === proc) this.serverProcess = null;
+  }
+
+  /**
+   * 一次启动尝试：拼 argv → spawn → 等健康检查通过 / 进程退出 / 超时 / 用户停止。
+   *
+   * 失败时**不改状态**（保持 starting）：是报错还是降级重试由 start() 决定 —— 否则每次重试
+   * 之间界面会闪一下「错误」，注册表还会各记一条 crashed。进入 running 之后才挂掉的照旧由
+   * exited 回调记错误。
+   */
+  private async launchOnce(
+    llamaPath: string,
+    model: LlamaModel,
+    serverArgs: ServerArgs,
+    target: string,
+  ): Promise<{ ok: boolean; error: string; exitCode?: number | null; aborted?: boolean }> {
     const args = this.buildArgs(model, serverArgs, target);
     this.launchedArgs = args;
     this.lastError = "";
+    this.attemptLog = "";
     this.setStatus("starting");
     this.appendLog(`$ llama-server ${shellJoin(args)}\n`);
+
+    let exited = false;
+    let exitCode: number | null = null;
+    let signalExit: () => void = () => {};
+    const exitSignal = new Promise<void>((resolve) => {
+      signalExit = resolve;
+    });
 
     try {
       const usePty = process.platform === "darwin";
@@ -882,13 +1195,23 @@ export class LlamaRuntime implements Runtime {
         ? ["script", "-q", "/dev/null", llamaPath, ...args]
         : [llamaPath, ...args];
 
-      this.serverProcess = spawnServerProcess(cmd);
-      pumpServerOutput(this.serverProcess, this.appendLog.bind(this));
+      const proc = spawnServerProcess(cmd);
+      this.serverProcess = proc;
+      this.startupProc = proc;
+      pumpServerOutput(proc, this.appendLog.bind(this));
 
       const self = this;
-      this.serverProcess.exited
+      proc.exited
         .then((code) => {
-          self.serverProcess = null;
+          if (self.serverProcess === proc) self.serverProcess = null;
+          exited = true;
+          exitCode = code;
+          signalExit();
+          if (self.startupProc === proc && self.getStatus() !== "stopped") {
+            // 启动阶段退出：由 start() 的循环决定重试还是报错
+            self.appendLog(`\n[server exited with code ${code}]\n`);
+            return;
+          }
           if (code === 0 || self.getStatus() === "stopped") {
             self.appendLog(`\n[server exited with code ${code}]\n`);
             self.setStatus("stopped");
@@ -902,8 +1225,10 @@ export class LlamaRuntime implements Runtime {
           }
         })
         .catch(() => {
-          self.serverProcess = null;
-          self.setStatus("error");
+          if (self.serverProcess === proc) self.serverProcess = null;
+          exited = true;
+          signalExit();
+          if (self.startupProc !== proc) self.setStatus("error");
         });
 
       // 与 --port 同源（嵌入实例在嵌入端口段，不能去轮询聊天端口）
@@ -913,63 +1238,80 @@ export class LlamaRuntime implements Runtime {
       let idleCount = 0;
       this.lastDownloadActivityAt = 0;
 
-      while (true) {
-        await Bun.sleep(1000);
-        const status = this.getStatus();
-        if (status !== "starting" && status !== "downloading") break;
-        try {
-          const res = await fetch(healthUrl, { signal: AbortSignal.timeout(2000) });
-          if (res.ok) {
-            this.setStatus("running");
-            this.appendLog("\n[server is ready]\n");
-            markServerStarted();
-            // 启动后回读实测值（T4e）：任何失败只记日志，不影响上面的成功结果。
-            try {
-              await this.readbackMeasured();
-            } catch (e) {
-              logEvent({
-                level: "warn",
-                source: "server",
-                event: "launch_plan.readback_failed",
-                message: `启动回读失败（${e instanceof Error ? e.message : String(e)}），不影响已完成的启动`,
-              });
+      try {
+        while (true) {
+          // 进程一退出就不必等满这一拍（OOM 通常几秒内就退，重试要尽快开始）
+          await Promise.race([Bun.sleep(this.healthPollMs), exitSignal]);
+          if (exited) break;
+          const status = this.getStatus();
+          if (status !== "starting" && status !== "downloading") break;
+          try {
+            const res = await fetch(healthUrl, { signal: AbortSignal.timeout(2000) });
+            if (res.ok) {
+              this.startupProc = null;
+              this.setStatus("running");
+              this.appendLog("\n[server is ready]\n");
+              markServerStarted();
+              // 启动后回读实测值（T4e）：任何失败只记日志，不影响上面的成功结果。
+              try {
+                await this.readbackMeasured();
+              } catch (e) {
+                logEvent({
+                  level: "warn",
+                  source: "server",
+                  event: "launch_plan.readback_failed",
+                  message: `启动回读失败（${e instanceof Error ? e.message : String(e)}），不影响已完成的启动`,
+                });
+              }
+              return { ok: true, error: "" };
             }
-            return { ok: true };
+          } catch {
+            // not ready yet
           }
-        } catch {
-          // not ready yet
-        }
 
-        const downloadActive = Date.now() - this.lastDownloadActivityAt < 5000;
-        if (downloadActive) {
-          idleCount = 0;
-        } else {
-          idleCount += 1;
-          if (idleCount >= maxIdleAttempts) break;
+          const downloadActive = Date.now() - this.lastDownloadActivityAt < 5000;
+          if (downloadActive) {
+            idleCount = 0;
+          } else {
+            idleCount += 1;
+            if (idleCount >= maxIdleAttempts) break;
+          }
         }
+      } finally {
+        this.startupProc = null;
       }
 
-      const status = this.getStatus();
-      if (status === "starting" || status === "downloading") {
-        this.lastError = extractStartupError(
-          this.serverLogs,
-          "Server failed to become ready within timeout",
-        );
-        this.setStatus("error");
-        return { ok: false, error: this.lastError };
+      if (this.getStatus() === "stopped" || this.stopRequested) {
+        return {
+          ok: false,
+          aborted: true,
+          error: extractStartupError(this.attemptLog, "Server stopped before becoming ready"),
+        };
       }
-
-      return this.getStatus() === "running"
-        ? { ok: true }
-        : { ok: false, error: extractStartupError(this.serverLogs, this.lastError) };
+      if (exited) {
+        // 退出后日志管道里可能还有最后几行（根因行往往就在最后），等它落地再挑
+        if (this.exitGraceMs > 0) await Bun.sleep(this.exitGraceMs);
+        return {
+          ok: false,
+          exitCode,
+          error: extractStartupError(this.attemptLog, `Process exited with code ${exitCode ?? 1}`),
+        };
+      }
+      return {
+        ok: false,
+        error: extractStartupError(this.attemptLog, "Server failed to become ready within timeout"),
+      };
     } catch (e) {
-      this.lastError = String(e);
-      this.setStatus("error");
-      return { ok: false, error: this.lastError };
+      this.startupProc = null;
+      return { ok: false, error: String(e) };
     }
   }
 
   async stop(): Promise<void> {
+    // 启动 / 降级重试进行中：让 start() 的循环就此收手（不再起下一次）
+    this.stopRequested = true;
+    this.launchAdjust = {};
+    this.degraded = null;
     if (!this.serverProcess) {
       this.setStatus("stopped");
       return;
@@ -997,6 +1339,7 @@ export class LlamaRuntime implements Runtime {
   }
 
   forceKill() {
+    this.stopRequested = true;
     if (this.serverProcess) {
       try {
         killProcessTree(this.serverProcess, "SIGKILL");

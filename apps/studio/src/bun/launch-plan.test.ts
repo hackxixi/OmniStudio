@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -198,6 +198,15 @@ describe("launch-plan", () => {
     await writeFile(join(repo, "Qwen3-VL-8B-Instruct-BF16-00002-of-00002.gguf"), "gguf");
     await writeFile(join(repo, "mmproj-F16.gguf"), "gguf");
     expect(pairedMmprojPath(join(repo, "Qwen3-VL-8B-Instruct-Q8_0.gguf"))).toBe(join(repo, "mmproj-F16.gguf"));
+  });
+
+  test("HF 缓存式符号链接（snapshots/x.gguf → blobs/…）算完就能命中，不被当成「文件换过」", async () => {
+    const blob = await writeGguf("blob-abc");
+    const link = join(dir, "snapshot-model.gguf");
+    await symlink(blob, link);
+    const key = baseKey(link);
+    await refreshLaunchPlan(key);
+    expect(cachedLaunchPlan(key)).not.toBeNull();
   });
 
   test("clearLaunchPlanCache 清空缓存", async () => {

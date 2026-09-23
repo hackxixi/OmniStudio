@@ -15,7 +15,7 @@
  * 校验（文件被换掉但名字不变时 mtime 兜住；stat 失败不丢弃计划——文件可能在网络盘上）。
  * 只保留最近 4 条，Map 的插入顺序天然就是 LRU（命中时移到队尾）。
  */
-import { lstatSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { getSetting, type SettingsKey } from "./db/settings";
 import { logEvent } from "./app-log";
@@ -80,9 +80,11 @@ function statModelFile(
   modelPath: string,
 ): { mtimeMs: number; size: number } | null {
   try {
-    // lstat 而不是 stat：符号链接指向的源文件（比如引擎目录的 `current`）被替换时
-    // 链接自身的 mtime 会变，能兜住「模型被升级但 GGUF 文件名不变」的情况。
-    const st = lstatSync(resolve(modelPath));
+    // stat（跟随链接），必须与 gguf-meta 记指纹的口径一致：HF 缓存里的 GGUF 全是指向
+    // blobs/ 的符号链接，lstat 拿到的是链接本身（size 76），与计划里记的真文件大小永远
+    // 对不上 —— 每次读缓存都当成「文件换过」作废，HF 下载的模型自动调参从来没生效过。
+    // 链接改指向新文件时，目标的 mtime / size 同样会变，照样能兜住「文件名不变、内容换了」。
+    const st = statSync(resolve(modelPath));
     return { mtimeMs: st.mtimeMs, size: st.size };
   } catch {
     return null;
@@ -185,9 +187,10 @@ export function cachedLaunchPlan(key: LaunchPlanKey): LaunchPlan | null {
 
 /**
  * 自动推算时上下文的下限（token）：设置 `SERVER_AUTO_TUNE_MIN_CTX`，解析不了 / 非正数
- * 回落规划器的 MIN_FIT_CTX（4096）。只影响自动拟合（见 llama.ts），不影响任何设置值。
+ * 回落规划器的 MIN_FIT_CTX（4096）。只影响自动拟合与显存不足时的降级重试（见 llama.ts），
+ * 不影响任何设置值。
  */
-function autoTuneMinCtx(): number {
+export function autoTuneMinCtx(): number {
   const raw = Number(getSetting("SERVER_AUTO_TUNE_MIN_CTX" as SettingsKey));
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : MIN_FIT_CTX;
 }

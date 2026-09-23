@@ -1,5 +1,6 @@
 import type { InferenceEngine } from "./engines";
 import type { StartupErrorKind } from "./engine-errors";
+import type { DegradedLaunch } from "./launch-planner";
 
 /** 本地模型服务实例的状态（与单实例时代的 ServerStatus 同名同义）。 */
 export type ServedModelStatus = "stopped" | "starting" | "downloading" | "running" | "error";
@@ -43,6 +44,11 @@ export type ServedModelInfo = {
    */
   errorKind?: StartupErrorKind;
   startedAt?: number;
+  /**
+   * 这次是「显存不足、自动降级重试」才起来的：临时调小了什么（上下文 / KV 量化 / GPU 层数）。
+   * 只对本次运行有效，不改设置；正常启动 / 没在跑 = 缺省。目前只有 llama.cpp 会降级。
+   */
+  degraded?: DegradedLaunch;
   /**
    * 端口就是该引擎设置里的端口：各 App、`omi`、外部集成默认连它，
    * 所以第一个启动的模型会占住设置端口（UI 上标记「默认端点」）。

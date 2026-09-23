@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { classifyStartupError } from "../../shared/engine-errors";
-import { extractDeadWorkerError, extractStartupError } from "./errors";
+import { extractDeadWorkerError, extractStartupError, isOutOfMemoryLog } from "./errors";
 
 /** mlx_lm.server 遇到不认识的架构时真实打出来的那段（背景见 errors.ts）。 */
 const UNSUPPORTED_MODEL_LOG = [
@@ -83,4 +83,35 @@ test("llama.cpp 读不到 GGUF 魔数时，报根因那一行而不是收尾的�
   const message = extractStartupError(log, "fallback");
   expect(message).toContain("failed to read magic");
   expect(message).not.toContain("exiting due to model loading error");
+});
+
+test("isOutOfMemoryLog：CUDA / Metal / Vulkan 的分配失败措辞都认（降级重试的触发条件）", () => {
+  expect(
+    isOutOfMemoryLog(
+      "llama_model_load: loading\n" +
+        "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 9216.00 MiB on device 0: cudaMalloc failed: out of memory\n" +
+        "llama_init_from_model: failed to initialize the context\n",
+    ),
+  ).toBe(true);
+  expect(isOutOfMemoryLog("ggml_metal_buffer_init: error: failed to allocate buffer, size = 8192.00 MiB\n")).toBe(true);
+  expect(
+    isOutOfMemoryLog("ggml_metal: error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)\n"),
+  ).toBe(true);
+  expect(isOutOfMemoryLog("ggml_vulkan: Device memory allocation failed: ErrorOutOfDeviceMemory\n")).toBe(true);
+});
+
+test("isOutOfMemoryLog：锁页警告 / 我们自己的注解 / 架构不认识都不算（重试也没用）", () => {
+  expect(isOutOfMemoryLog("warning: failed to mlock 1234-byte buffer: Cannot allocate memory\n")).toBe(false);
+  expect(isOutOfMemoryLog("[omni] 显存不足，第 1 次降级重试：上下文 32768 → 16384\n")).toBe(false);
+  expect(isOutOfMemoryLog("llama_model_load: error loading model: unknown model architecture: 'foo'\n")).toBe(false);
+  expect(isOutOfMemoryLog("CUDA error: invalid device function\n")).toBe(false);
+});
+
+test("extractStartupError：超窗那句进根因表，排在派生的收尾句前面", () => {
+  const log = [
+    "srv  send_error: task id = 3, error: the request exceeds the available context size, try increasing it",
+    "srv  log_server_r: request: POST /v1/chat/completions 127.0.0.1 400",
+    "failed to process request",
+  ].join("\n");
+  expect(extractStartupError(log, "fallback")).toContain("exceeds the available context size");
 });

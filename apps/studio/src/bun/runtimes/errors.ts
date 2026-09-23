@@ -64,8 +64,10 @@ export function extractDeadWorkerError(logs: string): string | null {
 // `failed to read magic`：llama.cpp 读到的不是 GGUF（给了个目录、文件没下完、或
 // 根本不是模型文件）。实测 Qwopus3.5-4B-Coder-MTP-GGUF 被当成目录传进去时就是这一行，
 // 而旧规则只认 bad/invalid magic，于是界面只剩收尾那句"模型加载错误"。
+// `exceeds the available context size`：llama-server 对超窗请求的 400 原文（--no-context-shift 下
+// 不再悄悄丢掉前文，而是报这句）；进根因表是为了它出现在日志里时优先于派生的收尾句。
 const ROOT_CAUSE_LINE_PATTERN =
-  /unknown model architecture|not supported|unsupported|no module named|shared object file|no such file|out of memory|failed to allocate|no space left|address already in use|permission denied|bad magic|invalid magic|failed to read magic/i;
+  /exceeds the available context size|unknown model architecture|not supported|unsupported|no module named|shared object file|no such file|out of memory|failed to allocate|no space left|address already in use|permission denied|bad magic|invalid magic|failed to read magic/i;
 
 /** 从后往前找第一条命中 pattern 的日志行（跳过我们自己的注解与警告行）。 */
 function pickErrorLine(lines: string[], pattern: RegExp): string | undefined {
@@ -89,4 +91,29 @@ export function extractStartupError(logs: string, fallback: string): string {
     pickErrorLine(lines, ERROR_LINE_PATTERN) ??
     fallback
   );
+}
+
+/**
+ * 启动失败是不是**显存 / 内存分配失败**（降级重试只对这一类有用）。
+ *
+ * 比 engine-errors 的 vram-insufficient 分类窄：那边把 `cuda error` / `hip error` 这类笼统的
+ * 驱动错误也算进去（给用户的建议一样是「调小参数」），但对自动重试来说，驱动坏了 / 架构
+ * 不支持时把窗口减半再试三次只会白白拖长失败。这里只认明确说「分配不到」的那几种措辞：
+ *   CUDA  `cudaMalloc failed: out of memory` / `CUDA error: out of memory`
+ *   Metal `failed to allocate buffer` / `Insufficient Memory (...kIOGPUCommandBufferCallbackErrorOutOfMemory)`
+ *   Vulkan `ErrorOutOfDeviceMemory`，以及 llama.cpp 通用的 `failed to allocate` / `unable to allocate`。
+ * 警告行（`warning: failed to mlock ... Cannot allocate memory`）不算 —— 那是锁页失败，模型照样能跑。
+ * 扫整段启动日志而不是只看挑出来的那一行：级联日志里根因行后面常跟着别的错误。
+ */
+const OOM_LINE_PATTERN =
+  /out of memory|outofmemory|out_of_memory|failed to allocate|unable to allocate|cannot allocate|can't allocate|not enough memory|insufficient memory|erroroutofdevicememory|cudamalloc failed/i;
+
+export function isOutOfMemoryLog(logs: string): boolean {
+  for (const raw of logs.split("\n")) {
+    const line = raw.replace(ANSI_PATTERN, "").trim();
+    if (!line || line.startsWith("[") || line.startsWith("$")) continue;
+    if (WARNING_LINE_PATTERN.test(line)) continue;
+    if (OOM_LINE_PATTERN.test(line)) return true;
+  }
+  return false;
 }

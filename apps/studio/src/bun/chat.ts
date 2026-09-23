@@ -22,7 +22,8 @@ import * as Served from "./model-servers";
 import { buildChatContext } from "./knowledge";
 import { memoryEnabled, memoryRecallSection } from "./memory";
 import type { KbCitation } from "../shared/knowledge";
-import { mainT } from "./i18n";
+import { mainT, uiLang } from "./i18n";
+import { explainRequestError } from "../shared/engine-errors";
 import * as ModelStore from "./model-store";
 import { resolveSampling } from "./model-sampling";
 import { getModelParams } from "./db/model-params";
@@ -915,7 +916,9 @@ async function streamAssistantReply(opts: {
         : `HTTP ${res.status}`;
       // 请求被拒可能是实例重启换了窗口（max_tokens 超窗 400 等）：作废窗口缓存，下次重新探测。
       invalidateServedContext(base, model);
-      throw new Error(msg);
+      // 超窗（llama.cpp 聊天实例带了 --no-context-shift，超了就是 400 而不是悄悄丢前文）：
+      // 原文只说「exceeds the available context size」，换成一句能照做的话，原文留在括号里。
+      throw new Error(explainRequestError(String(msg), uiLang()));
     }
 
     if (!res.body) throw new Error("No response body");

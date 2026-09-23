@@ -516,6 +516,7 @@ export type PlanReasonCode =
   | "kv.split-per-slot" // 引擎不支持 kv-unified，总窗口会被 slot 均分
   | "batch.raised" // batch 被抬到 max(2, parallel)
   | "gpu.partial-offload" // 装不下，给出了建议的 GPU 层数
+  | "gpu.moe-cpu-offload" // MoE 装不下：层全留 GPU，把前 N 层的专家权重放 CPU（KV 留在显存）
   | "gpu.none"; // 没有可用 GPU
 
 export type PlanReason = { code: PlanReasonCode; detail?: Record<string, string | number | boolean> };
@@ -532,6 +533,13 @@ export type LaunchPlan = {
   kvUnified: boolean;
   /** null 表示不发 --n-gpu-layers（交给引擎自己决定）；数字表示建议卸载的层数 */
   gpuLayers: number | null;
+  /**
+   * MoE 专家下放 CPU 的建议（见 planMoeCpuOffload）；null = 不需要 / 不是 MoE / 算不了。
+   * 有值时 gpuLayers 为 null（所有层都留 GPU），真正发什么由 llama.ts 按 --help 探测决定：
+   * 认 --n-cpu-moe / -ot 就发专家下放；都不认就回落 `fallbackGpuLayers`（按层卸载的老办法）。
+   * 可选：旧代码 / 测试手搓的计划没有它也合法。
+   */
+  moeOffload?: MoeOffloadPlan | null;
   fits: boolean;
   estimates: {
     budgetBytes: number;
@@ -542,6 +550,8 @@ export type LaunchPlan = {
     totalBytes: number;
     /** 这次拟合实际用到的溢出到系统内存的额度（未用到为 0） */
     overflowBytes: number;
+    /** MoE 专家下放到 CPU 的估算字节数（没下放 = 0 / 缺省） */
+    cpuExpertBytes?: number;
   };
   reasons: PlanReason[];
 };
@@ -567,6 +577,71 @@ export function resolveBudgetBytes(hw: PlannerHardware): {
     return { budgetBytes: Math.floor(hw.systemTotalBytes * UNIFIED_MEMORY_BUDGET_RATIO), basis: "unified", overflowBytes: 0 };
   }
   return { budgetBytes: Math.floor(hw.systemFreeBytes * SYSTEM_MEMORY_BUDGET_RATIO), basis: "system", overflowBytes: 0 };
+}
+
+/**
+ * MoE 模型里「路由专家」权重占总权重的比例（估算用）。
+ *
+ * GGUF 头里只有 expert_count / expert_used_count，没有逐张量大小（读张量表要多读一大段
+ * 文件头，这里不做），所以用参数量反推的经验值：
+ *   Qwen3-30B-A3B（128 选 8，总 30.5B / 激活 3.3B）→ 专家约占 95%；
+ *   Mixtral 8x7B（8 选 2，46.7B / 12.9B）→ 约 96%；gpt-oss 同量级。
+ * 取 0.85 是**故意偏低**：每层专家字节估小了，算出来要下放的层数 N 就偏多（更保守），
+ * 留在 GPU 上的非专家部分估大了，「KV 放得下」的判断也偏保守 —— 错的方向是少用一点显存，
+ * 而不是 OOM（真 OOM 还有启动时的降级重试兜底）。
+ */
+export const MOE_EXPERT_WEIGHT_SHARE = 0.85;
+
+export type MoeOffloadPlan = {
+  /** `--n-cpu-moe` 的值：前 N 层的专家权重放 CPU（含前导的稠密层，它们没有专家，计数照算） */
+  cpuMoeLayers: number;
+  /** 有专家的层数（blockCount − 前导稠密层） */
+  moeLayers: number;
+  /** 模型总层数（拼 -ot 正则、UI 展示用） */
+  blockCount: number;
+  /** 估算下放到 CPU 的专家字节数 */
+  cpuExpertBytes: number;
+  /** 引擎两种专家下放开关都不认时的回落：按层卸载的建议层数 */
+  fallbackGpuLayers: number;
+};
+
+/**
+ * MoE 部分卸载：显存装不下时，与其砍 --n-gpu-layers（连注意力层和那一层的 KV 一起挪到 CPU，
+ * 每个 token 都要走一遍 CPU 注意力），不如**所有层留 GPU、只把一部分层的专家权重放 CPU**：
+ * 每个 token 只激活 expert_used_count 个专家，CPU 那边算的量小；KV 与注意力全在显存里。
+ * 这是 llama.cpp `--n-cpu-moe` / Unsloth 的做法。
+ *
+ * N = ceil(超出显存的字节 / 每层专家字节)；把全部专家都放下去 KV 仍然装不下 → null（回落按层卸载）。
+ * 前导稠密层（DeepSeek 系的前 3 层）没有专家，但 --n-cpu-moe 按「前 N 层」计数，所以要加回去。
+ */
+export function planMoeCpuOffload(input: {
+  meta: GgufModelMeta;
+  weightsBytes: number;
+  /** 全部放 GPU 时的总需求（footprint + KV + ctx compute） */
+  totalBytes: number;
+  /** GPU 预算 */
+  budgetBytes: number;
+  fallbackGpuLayers: number;
+}): MoeOffloadPlan | null {
+  const { meta } = input;
+  const blockCount = meta.blockCount ?? 0;
+  if (meta.expertCount == null || meta.expertCount <= 1 || blockCount <= 0) return null;
+  const leadingDense = Math.min(blockCount - 1, Math.max(0, meta.leadingDenseBlockCount ?? 0));
+  const moeLayers = blockCount - leadingDense;
+  if (moeLayers <= 0) return null;
+  const perLayerExpert = (input.weightsBytes * MOE_EXPERT_WEIGHT_SHARE) / moeLayers;
+  if (!(perLayerExpert > 0)) return null;
+  const need = input.totalBytes - input.budgetBytes;
+  if (need <= 0) return null;
+  const n = Math.ceil(need / perLayerExpert);
+  if (n > moeLayers) return null; // 专家全下放了还装不下（KV / 非专家部分本身就超了）
+  return {
+    cpuMoeLayers: Math.min(blockCount, leadingDense + n),
+    moeLayers,
+    blockCount,
+    cpuExpertBytes: Math.ceil(n * perLayerExpert),
+    fallbackGpuLayers: input.fallbackGpuLayers,
+  };
 }
 
 function clampInt(value: number, lo: number, hi: number): number {
@@ -731,6 +806,7 @@ export function planLlamaLaunch(input: LaunchPlanInput): LaunchPlan {
 
   // —— GPU 层数（仍按 GPU 预算 budgetBytes，不用 totalBudget）——
   let gpuLayers: number | null;
+  let moeOffload: MoeOffloadPlan | null = null;
   if (!input.hardware.hasGpu) {
     gpuLayers = 0;
   } else if (planFits && basis !== "vram") {
@@ -754,8 +830,27 @@ export function planLlamaLaunch(input: LaunchPlanInput): LaunchPlan {
     const perLayerKv = kvBytesForLayout > 0 ? kvBytesForLayout / attnLayers : 0;
     const nonWeightFixed = footprintBytes - input.weightsBytes; // CUDA context / mmproj 余量 / 常量 compute buffer
     const room = budgetBytes - nonWeightFixed - ctxComputeBytes;
-    gpuLayers = clampInt(room / (perLayerWeights + perLayerKv), 0, meta.blockCount);
-    reasons.push({ code: "gpu.partial-offload", detail: { gpuLayers, blockCount: meta.blockCount } });
+    const layerSplit = clampInt(room / (perLayerWeights + perLayerKv), 0, meta.blockCount);
+    // 独显上的 MoE 优先「层全留 GPU、专家下放 CPU」（统一内存没有第二块内存可放，不走这条）
+    moeOffload =
+      basis === "vram"
+        ? planMoeCpuOffload({ meta, weightsBytes: input.weightsBytes, totalBytes, budgetBytes, fallbackGpuLayers: layerSplit })
+        : null;
+    if (moeOffload !== null) {
+      gpuLayers = null;
+      reasons.push({
+        code: "gpu.moe-cpu-offload",
+        detail: {
+          cpuMoeLayers: moeOffload.cpuMoeLayers,
+          moeLayers: moeOffload.moeLayers,
+          blockCount: meta.blockCount,
+          cpuExpertBytes: moeOffload.cpuExpertBytes,
+        },
+      });
+    } else {
+      gpuLayers = layerSplit;
+      reasons.push({ code: "gpu.partial-offload", detail: { gpuLayers, blockCount: meta.blockCount } });
+    }
   } else {
     gpuLayers = null;
   }
@@ -771,6 +866,7 @@ export function planLlamaLaunch(input: LaunchPlanInput): LaunchPlan {
     flashAttn,
     kvUnified,
     gpuLayers,
+    moeOffload,
     fits: planFits,
     estimates: {
       budgetBytes,
@@ -780,7 +876,34 @@ export function planLlamaLaunch(input: LaunchPlanInput): LaunchPlan {
       ctxComputeBytes,
       totalBytes,
       overflowBytes: usedOverflow,
+      cpuExpertBytes: moeOffload?.cpuExpertBytes ?? 0,
     },
     reasons,
   };
 }
+
+// ---------- 8. 启动时显存不足的降级重试（类型；逻辑在 bun/runtimes/llama-degrade.ts） ----------
+
+/** llama.ts buildArgs 叠在所有优先级之后的临时调整（不落库）。 */
+export type LaunchAdjust = {
+  /** 上下文上限（--ctx-size 取 min(原值, ctxCap)） */
+  ctxCap?: number;
+  cacheTypeK?: string;
+  cacheTypeV?: string;
+  /** 固定 --n-gpu-layers（盖过计划 / 设置） */
+  gpuLayers?: number;
+  /** 交给 llama.cpp 自己拟合：发 --fit on，不再发 --n-gpu-layers / 专家下放 */
+  fit?: "on";
+  /** MoE 专家下放 CPU 的层数（--n-cpu-moe / -ot） */
+  nCpuMoe?: number;
+};
+
+/** 降级启动成功后给界面 / 日志的记录（ServedModelInfo.degraded 的形状）。 */
+export type DegradedLaunch = {
+  /** 重试了几次才起来 */
+  attempts: number;
+  /** 最终用上的调整（结构化，界面可自己翻译） */
+  adjust: LaunchAdjust;
+  /** 中文一行摘要：每一步的说明用「；」串起来 */
+  summary: string;
+};

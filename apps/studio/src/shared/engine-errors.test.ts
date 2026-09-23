@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  CONTEXT_OVERFLOW_HINT,
+  explainRequestError,
+  isContextOverflowError,
   classifyStartupError,
   isModelSideFailure,
   STARTUP_ERROR_KINDS,
@@ -95,5 +98,29 @@ describe("isModelSideFailure", () => {
     expect(isModelSideFailure("permission")).toBe(false);
     expect(isModelSideFailure("disk-full")).toBe(false);
     expect(isModelSideFailure("unknown")).toBe(false);
+  });
+});
+
+describe("isContextOverflowError / explainRequestError", () => {
+  test("认 llama.cpp / vLLM / OpenAI 的超窗措辞", () => {
+    expect(isContextOverflowError("the request exceeds the available context size, try increasing it")).toBe(true);
+    expect(isContextOverflowError('{"type":"exceed_context_size_error"}')).toBe(true);
+    expect(isContextOverflowError("This model's maximum context length is 8192 tokens.")).toBe(true);
+    expect(isContextOverflowError("context_length_exceeded")).toBe(true);
+  });
+
+  test("不认笼统的「太长」/ 别的 400（避免把用户引去调上下文）", () => {
+    expect(isContextOverflowError("input is too long for batch")).toBe(false);
+    expect(isContextOverflowError("Invalid request: missing model")).toBe(false);
+    expect(isContextOverflowError(null)).toBe(false);
+  });
+
+  test("超窗换成能照做的话并保留原文；其余原样返回", () => {
+    const raw = "the request exceeds the available context size, try increasing it";
+    const zh = explainRequestError(raw, "zh");
+    expect(zh.startsWith(CONTEXT_OVERFLOW_HINT.zh)).toBe(true);
+    expect(zh).toContain(raw);
+    expect(explainRequestError(raw, "en").startsWith(CONTEXT_OVERFLOW_HINT.en)).toBe(true);
+    expect(explainRequestError("HTTP 500", "zh")).toBe("HTTP 500");
   });
 });

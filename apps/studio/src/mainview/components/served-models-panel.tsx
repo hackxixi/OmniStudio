@@ -260,6 +260,16 @@ function ServedModelRow({ model }: { model: ServedModelInfo }) {
         )}
       </div>
 
+      {/* 显存不足时后台自动降级重试成功：跑起来的不是用户设的那套参数，得说出来。 */}
+      {!rawError && model.degraded && (
+        <p className="flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400">
+          <AlertTriangleIcon className="mt-0.5 size-3 shrink-0" />
+          <span className="min-w-0 break-words">
+            {t("models.served.degraded", { summary: model.degraded.summary })}
+          </span>
+        </p>
+      )}
+
       {rawError && (
         <div className="space-y-0.5">
           {hint && (
