@@ -4,26 +4,29 @@ import {
   type MarketSearchResult,
   type SearchFormat,
 } from "../shared/modelscope";
+import { reportSourceFailure } from "./net-sources";
+import { hfEndpointsOf, sourcePlanWithin } from "./model-source-map";
 
 /**
  * HuggingFace 检索 / 列仓库文件。
  *
- * 与下载路径同策略：优先国内镜像 hf-mirror.com（API 与官方同构），失败回退
- * huggingface.co —— 官方域在国内多数网络下不可达，只用官方会让市场直接不可用。
+ * 与下载路径同策略：端点顺序来自下载源路由（net-sources：国内镜像 hf-mirror.com 优先，
+ * 或开着代理 / 海外时官方优先，官方永远在列表里兜底），镜像 API 与官方同构。
+ * 连不上 / 5xx 的端点报给路由降级，换下一个。
  *
  * 格式过滤走平台自己的元数据维度（`?filter=gguf|safetensors|mlx`），
  * 不靠模型名做字符串判断：平台返回的 tags / siblings 就是权威来源。
  */
-const HF_HOSTS = ["https://hf-mirror.com", "https://huggingface.co"] as const;
 
-/** 依次尝试镜像与官方，返回第一个成功的结果；全部失败时抛出最后一个错误。 */
+/** 依次尝试各端点，返回第一个成功的结果；全部失败时抛出最后一个错误。 */
 async function fetchFromHosts(
   buildUrl: (host: string) => string,
   init: RequestInit & { timeoutMs: number },
 ): Promise<unknown> {
   const { timeoutMs, ...rest } = init;
+  const hosts = hfEndpointsOf(await sourcePlanWithin());
   let lastError: Error | null = null;
-  for (const host of HF_HOSTS) {
+  for (const host of hosts) {
     const url = buildUrl(host);
     try {
       const res = await fetch(url, { ...rest, signal: AbortSignal.timeout(timeoutMs) });
@@ -34,6 +37,7 @@ async function fetchFromHosts(
           throw new Error(`HuggingFace 返回 ${res.status}（${new URL(url).pathname}）`);
         }
         lastError = new Error(`HuggingFace API failed: ${res.status} (${host})`);
+        reportSourceFailure(url);
         continue;
       }
       return (await res.json()) as unknown;
@@ -41,6 +45,7 @@ async function fetchFromHosts(
       const err = e instanceof Error ? e : new Error(String(e));
       if (err.message.startsWith("HuggingFace 返回")) throw err;
       lastError = err;
+      reportSourceFailure(url);
     }
   }
   throw lastError ?? new Error("HuggingFace request failed");
@@ -174,9 +179,23 @@ export function buildTreeUrl(host: string, repo: string): string {
   return `${host}/api/models/${repo}/tree/main?recursive=true&blobs=true`;
 }
 
-/** 列出仓库文件（含体积）。走 tree 接口并带 blobs=true，否则大小是 null。 */
+/**
+ * 列出仓库文件（含体积）。走 tree 接口并带 blobs=true，否则大小是 null。
+ * HF 上没有（404，常见于推荐清单里 ModelScope 独有的 iic/…、AI-ModelScope/… 仓库）时，
+ * 同名试一次 ModelScope —— 下载管理器按同样的顺序回退，列的和下的是同一个仓库。
+ */
 export async function listRepoFiles(repo: string): Promise<MarketFile[]> {
-  const body = await fetchFromHosts((host) => buildTreeUrl(host, repo), { timeoutMs: 20_000 });
+  let body: unknown;
+  try {
+    body = await fetchFromHosts((host) => buildTreeUrl(host, repo), { timeoutMs: 20_000 });
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.startsWith("HuggingFace 返回 404")) throw e;
+    // 动态 import：modelscope.ts 反过来静态依赖本文件（它的 404 回退走 HF）。
+    const { listModelScopeFiles } = await import("./modelscope");
+    const files = await listModelScopeFiles(repo).catch(() => null);
+    if (files) return files;
+    throw e;
+  }
 
   const entries = Array.isArray(body) ? (body as HfTreeEntry[]) : [];
   return entries

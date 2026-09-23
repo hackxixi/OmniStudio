@@ -21,6 +21,7 @@ import { Button } from "@ui/button";
 import { Input } from "@ui/input";
 import { useModelDetailStore, type ModelDetailSource } from "@stores/model-detail";
 import { useMarketStore, type MarketFormatFilter } from "@stores/market";
+import { hfHostOf, useMarketSourceFromPlan } from "./use-download-sources";
 import { useT } from "@stores/ui-lang";
 import {
   MODEL_CATEGORIES,
@@ -159,8 +160,11 @@ function SearchResultRow({
   );
 }
 
-/** 平台切换（检索 + 下载链路一起切），显示的是一会儿真正请求的域名。 */
-function SourceSwitch() {
+/**
+ * 平台切换（检索 + 下载链路一起切），显示的是一会儿真正请求的域名。
+ * 默认平台跟随下载源路由；用户点过就记住（见 stores/market）。
+ */
+function SourceSwitch({ hfHost }: { hfHost: string | null }) {
   const t = useT();
   const source = useMarketStore((s) => s.source);
   const setSource = useMarketStore((s) => s.setSource);
@@ -191,7 +195,7 @@ function SourceSwitch() {
                   active ? "text-primary-foreground/70" : "text-muted-foreground/60",
                 )}
               >
-                {meta.host}
+                {s === "huggingface" && hfHost ? hfHost : meta.host}
               </span>
             </button>
           );
@@ -260,6 +264,8 @@ function FormatSwitch({ engineFormat }: { engineFormat: SearchFormat }) {
 export function ModelMarketTab({ onOpenDetail }: { onOpenDetail?: (source: ModelDetailSource) => void }) {
   const t = useT();
   const engine = useEngine().engine;
+  // 默认平台跟随下载源路由（国内 ModelScope / 海外 Hugging Face），用户手动选过的优先。
+  const sourcePlan = useMarketSourceFromPlan();
   const source = useMarketStore((s) => s.source);
   const format = useMarketStore((s) => s.format);
   const [query, setQuery] = useState("");
@@ -335,7 +341,7 @@ export function ModelMarketTab({ onOpenDetail }: { onOpenDetail?: (source: Model
         {t("library.marketHint")}
       </p>
 
-      <SourceSwitch />
+      <SourceSwitch hfHost={hfHostOf(sourcePlan)} />
 
       {/* Search */}
       <div className="flex gap-2">

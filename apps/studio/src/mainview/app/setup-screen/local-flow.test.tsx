@@ -104,6 +104,10 @@ const setupEnv = {
 
 /** 下载计划里最终用的仓库：断言它等于"推荐的那个模型 + 档位"。 */
 const listedRepos: string[] = [];
+/** 列文件 / 下载时带的平台（跟随下载源路由）。 */
+const listedSources: string[] = [];
+/** 下载源路由给的默认平台（用例按需改）。 */
+let planModelSource: "modelscope" | "huggingface" = "modelscope";
 /** 一键安装的调用记录。 */
 const installCalls: string[] = [];
 
@@ -120,8 +124,21 @@ mock.module("@lib/rpc", () => ({
     },
     listInstalledModels: async () => ({ models: [] }),
     listDownloads: async () => ({ tasks: [] }),
-    listModelFiles: async ({ repo }: { repo: string }) => {
+    getDownloadSources: async () => ({
+      mode: planModelSource === "modelscope" ? "cn" : "global",
+      decidedBy: "setting",
+      cnLocale: planModelSource === "modelscope",
+      modelSource: planModelSource,
+      hfEndpoints: planModelSource === "modelscope" ? ["https://hf-mirror.com", "https://huggingface.co"] : ["https://huggingface.co"],
+      pypiIndexes: [],
+      githubPrefixes: [""],
+      homebrewEnv: {},
+      probes: [],
+      at: 0,
+    }),
+    listModelFiles: async ({ repo, source }: { repo: string; source?: string }) => {
       listedRepos.push(repo);
+      listedSources.push(source ?? "");
       return {
         files: [
           {
@@ -302,6 +319,25 @@ test("用户什么都不改时，下载的就是推荐的那个模型与量化�
   expect(view.text()).toContain("unsloth/Qwen3.5-9B-GGUF");
   expect(view.text()).toContain("Qwen3.5-9B-Q4_K_M.gguf");
   await view.cleanup();
+});
+
+test("下载平台跟随下载源路由：海外直接从 Hugging Face 列文件（只列一遍）", async () => {
+  listedRepos.length = 0;
+  listedSources.length = 0;
+  planModelSource = "huggingface";
+  try {
+    const view = await renderFlow();
+    await clickButton("Next"); // → 引擎
+    await clickButton("Next"); // → 模型
+    await clickButton("Next"); // → 启动：解析下载计划
+    await settle();
+
+    expect(listedSources).toEqual(["huggingface"]);
+    expect(view.text()).toContain("优先从 Hugging Face（huggingface.co）下载");
+    await view.cleanup();
+  } finally {
+    planModelSource = "modelscope";
+  }
 });
 
 test("引擎没装：按钮就地点「一键安装」，装完自动重新检测并变成就绪", async () => {

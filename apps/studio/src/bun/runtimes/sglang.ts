@@ -3,7 +3,7 @@ import { getSetting, getServerPort, ENGINE_EXTRA_ARGS_KEYS } from "../db/setting
 import { resolveManagedPython } from "../python-engine";
 import { markServerStarted } from "../stats";
 import { extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
 import { getModelParams } from "../db/model-params";
 import { shellJoin, splitShellArgs } from "./shell-args";
 import type {
@@ -227,7 +227,13 @@ export class SglangRuntime implements Runtime {
     this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
     try {
-      this.serverProcess = spawnServerProcess(cmd, undefined, "sglang");
+      // 同 vLLM：HF 端点按下载源路由；国内且仓库原样在 ModelScope 时走 SGLANG_USE_MODELSCOPE。
+      const env = await downloadSourceEnv({
+        model,
+        python: binary.path,
+        modelScopeVar: "SGLANG_USE_MODELSCOPE",
+      });
+      this.serverProcess = spawnServerProcess(cmd, env, "sglang");
       pumpServerOutput(this.serverProcess, this.appendLog.bind(this));
 
       const self = this;

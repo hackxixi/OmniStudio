@@ -5,7 +5,7 @@ import { getSetting, getServerPort, ENGINE_EXTRA_ARGS_KEYS } from "../db/setting
 import { resolveManagedPython } from "../python-engine";
 import { markServerStarted } from "../stats";
 import { extractDeadWorkerError, extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
 import { getModelParams } from "../db/model-params";
 import {
   cachedMlxHelpSupport,
@@ -32,6 +32,19 @@ function slugModelName(name: string): string {
 }
 
 /** 当前活动引擎是不是 MLX（请求侧判断「要不要换成 mlx 认的模型 id」）。 */
+/** MLX_HF_ENDPOINT 的出厂默认值（db/settings 的默认表）：等于它就当用户没改过。 */
+const MLX_HF_ENDPOINT_DEFAULT = "https://hf-mirror.com";
+
+/**
+ * 用户显式设置的 MLX HF 端点；没改过（仍是出厂默认）返回 null，交给下载源路由决定。
+ * 置空视为「明确要官方」。设置层分不出「存的就是默认值」和「没存」，两者同样跟随路由。
+ */
+export function explicitMlxHfEndpoint(stored: string | null | undefined): string | null {
+  const value = (stored ?? MLX_HF_ENDPOINT_DEFAULT).trim().replace(/\/+$/, "");
+  if (value === MLX_HF_ENDPOINT_DEFAULT) return null;
+  return value || "https://huggingface.co";
+}
+
 export function isMlxActive(): boolean {
   return getSetting("INFERENCE_ENGINE") === "mlx";
 }
@@ -343,10 +356,14 @@ export class MlxRuntime implements Runtime {
 
     this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
-    // 国内环境优先走 hf-mirror；置空 MLX_HF_ENDPOINT 则使用 HuggingFace 官方。
-    const hfEndpoint = (getSetting("MLX_HF_ENDPOINT") || "").trim();
-    const env: Record<string, string> = {};
-    if (hfEndpoint) env.HF_ENDPOINT = hfEndpoint;
+    // HF 端点：默认跟随下载源路由（国内镜像 / 官方直连）；用户显式改过 MLX_HF_ENDPOINT
+    // 就尊重用户（置空 = 官方）。
+    const env = await downloadSourceEnv();
+    const explicit = explicitMlxHfEndpoint(getSetting("MLX_HF_ENDPOINT"));
+    if (explicit) {
+      env.HF_ENDPOINT = explicit;
+      env.MODEL_ENDPOINT = explicit;
+    }
 
     try {
       this.serverProcess = spawnServerProcess(cmd, env, "mlx");

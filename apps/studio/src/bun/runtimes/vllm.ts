@@ -6,7 +6,7 @@ import { modelNameForPath } from "../model-scan";
 import { slugModelFileName } from "../model-store";
 import { markServerStarted } from "../stats";
 import { extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
 import { getModelParams } from "../db/model-params";
 import {
   cachedVllmHelpSupport,
@@ -289,7 +289,14 @@ export class VllmRuntime implements Runtime {
     this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
     try {
-      this.serverProcess = spawnServerProcess(cmd, undefined, "vllm");
+      // 模型是仓库 id 时 vLLM 自己拉权重：HF 端点按下载源路由给；国内且仓库原样在 ModelScope、
+      // python 装了 modelscope 时改走 VLLM_USE_MODELSCOPE（见 downloadSourceEnv）。
+      const env = await downloadSourceEnv({
+        model,
+        python: isPython ? binary.path : null,
+        modelScopeVar: "VLLM_USE_MODELSCOPE",
+      });
+      this.serverProcess = spawnServerProcess(cmd, env, "vllm");
       pumpServerOutput(this.serverProcess, this.appendLog.bind(this));
 
       const self = this;

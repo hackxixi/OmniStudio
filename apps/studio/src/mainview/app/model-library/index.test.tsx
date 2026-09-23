@@ -91,6 +91,8 @@ function model(over: Partial<FakeModel> & { path: string; fileName: string }): F
 }
 
 let installed: FakeModel[] = [];
+/** 下载源路由给的默认平台（市场默认跟随它）。 */
+let planModelSource: "modelscope" | "huggingface" = "modelscope";
 
 mock.module("@lib/rpc", () => ({
   rpcClient: {
@@ -103,6 +105,18 @@ mock.module("@lib/rpc", () => ({
     cloudProviderList: async () => ({ providers: [] }),
     getServerStats: async () => ({}),
     searchMarketModels: async () => ({ models: [], total: 0, totalExact: true, hasMore: false }),
+    getDownloadSources: async () => ({
+      mode: planModelSource === "modelscope" ? "cn" : "global",
+      decidedBy: "probe",
+      cnLocale: false,
+      modelSource: planModelSource,
+      hfEndpoints: planModelSource === "modelscope" ? ["https://hf-mirror.com", "https://huggingface.co"] : ["https://huggingface.co"],
+      pypiIndexes: [],
+      githubPrefixes: [""],
+      homebrewEnv: {},
+      probes: [],
+      at: 0,
+    }),
     toggleFavoriteModel: async () => ({ ok: true }),
     updateSettings: async () => ({ settings: {} }),
     openPath: async () => ({ ok: true }),
@@ -307,4 +321,28 @@ test("没有收藏时给专门的空态文案（不是「本地还没有模型�
   expect(view.text).toContain(zh("library.favoritesEmpty"));
   expect(view.text).not.toContain(zh("library.localEmpty"));
   await view.unmount();
+});
+
+test("模型市场默认平台跟随下载源路由：海外默认 Hugging Face，并显示实际域名", async () => {
+  installed = [];
+  planModelSource = "huggingface";
+  const { useMarketStore } = await import("@stores/market");
+  try {
+    const view = await renderLibrary();
+    await view.clickTab(zh("library.tab.market"));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(useMarketStore.getState().source).toBe("huggingface");
+    const input = [...document.querySelectorAll("input")].find((el) =>
+      (el.getAttribute("placeholder") ?? "").includes("Hugging Face"),
+    );
+    expect(input).not.toBeUndefined();
+    // 海外路由的 HF 端点是官方域名，不再写死 hf-mirror.com。
+    expect(document.body.textContent ?? "").toContain("huggingface.co");
+    await view.unmount();
+  } finally {
+    planModelSource = "modelscope";
+    useMarketStore.setState({ source: "modelscope", sourceChosen: false });
+  }
 });

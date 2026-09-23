@@ -209,7 +209,9 @@ async function handle(req: ControlRequest): Promise<ControlResponse> {
         repo,
         fileName,
         typeof payload.category === "string" ? (payload.category as never) : undefined,
-        (payload.source as "modelscope" | "huggingface") ?? "modelscope",
+        // 没指定平台就交给下载管理器按下载源路由决定（国内 ModelScope / 海外 Hugging Face）；
+        // HF 仓库 id 在 ModelScope 上没有时下载管理器会自己回退。
+        payload.source === "modelscope" || payload.source === "huggingface" ? payload.source : undefined,
         {
           size: Number.isFinite(sizeHint) && sizeHint > 0 ? sizeHint : null,
           explicit: payload.explicit === true,

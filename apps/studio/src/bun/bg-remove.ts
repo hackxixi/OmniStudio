@@ -28,19 +28,21 @@ import { safeJoin } from "./path-safety";
 import { logEvent } from "./app-log";
 import { downloadHttpFile } from "./modelscope";
 import { partialBytesFor, removePartialFiles } from "./downloader";
+import type { SourcePlan } from "../shared/net-sources";
+import { githubCandidates, reportSourceFailure } from "./net-sources";
+import { hfEndpointsOf, sourcePlanWithin } from "./model-source-map";
 
 // ---------------------------------------------------------------------------
 // 模型清单
 // ---------------------------------------------------------------------------
 
 /**
- * 权重来源：rembg 的 GitHub release（u2net 家族，Apache-2.0）。
- * 每个模型给两个源：GitHub 直连 + hf-mirror 镜像。国内网络下 GitHub 经常连不上，
- * 换源时 `downloadHttpFile` 会保留已下载分片从断点续传，不会从头再来。
+ * 权重来源：rembg 的 GitHub release（u2net 家族，Apache-2.0），外加 HF 上的同款副本。
+ * 源顺序跟随下载源路由（sourcesFor）：国内 HF 镜像在前、GitHub（含加速前缀）在后；
+ * 海外 GitHub 直连在前。换源时 `downloadHttpFile` 会保留已下载分片从断点续传。
  */
 const RELEASE_BASE = "https://github.com/danielgatis/rembg/releases/download/v0.0.0";
-const HF_MIRROR = "https://hf-mirror.com/tomjackson2023/rembg/resolve/main";
-const HF_OFFICIAL = "https://huggingface.co/tomjackson2023/rembg/resolve/main";
+const HF_REPO_PATH = "tomjackson2023/rembg/resolve/main";
 
 export type BgModelTier = "fast" | "balanced" | "quality" | "detail";
 
@@ -105,8 +107,16 @@ export function bgModelSpec(id: string): BgModelSpec | undefined {
   return BG_MODELS.find((m) => m.id === id);
 }
 
-function sourcesFor(spec: BgModelSpec): string[] {
-  return [`${RELEASE_BASE}/${spec.file}`, `${HF_MIRROR}/${spec.file}`, `${HF_OFFICIAL}/${spec.file}`];
+/**
+ * 某个模型的下载地址，按下载源路由排序：GitHub 那几条来自 githubCandidates（加速前缀
+ * 或直连），HF 那几条按 plan.hfEndpoints。国内模式 HF 镜像打头（GitHub release 的
+ * 302 目标 objects.githubusercontent.com 经常连不上），其余情况 GitHub 打头。
+ */
+export function sourcesFor(spec: BgModelSpec, plan: SourcePlan): string[] {
+  const github = githubCandidates(`${RELEASE_BASE}/${spec.file}`, plan);
+  const hf = hfEndpointsOf(plan).map((e) => `${e}/${HF_REPO_PATH}/${spec.file}`);
+  const ordered = plan.mode === "cn" ? [...hf, ...github] : [...github, ...hf];
+  return [...new Set(ordered)];
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +234,7 @@ export async function downloadBgModel(
   }
   mkdirSync(path.dirname(dest), { recursive: true });
 
-  const sources = sourcesFor(spec);
+  const sources = sourcesFor(spec, await sourcePlanWithin());
   let lastError = "download failed";
   for (const url of sources) {
     try {
@@ -259,6 +269,7 @@ export async function downloadBgModel(
       lastError = e instanceof Error ? e.message : String(e);
       // 用户主动取消就不要再换源重试 —— 他刚点了取消。
       if (options.signal?.aborted) break;
+      reportSourceFailure(url);
       logEvent({
         level: "warn",
         source: "image",

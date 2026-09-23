@@ -86,7 +86,8 @@ export const MODEL_SOURCE_META: Record<ModelSource, ModelSourceMeta> = {
   },
   huggingface: {
     label: "Hugging Face",
-    host: "hf-mirror.com",
+    // 这里只是徽标 tooltip 的平台域名；实际走官方还是 hf-mirror 由下载源路由决定（net-sources）
+    host: "huggingface.co",
   },
 };
 

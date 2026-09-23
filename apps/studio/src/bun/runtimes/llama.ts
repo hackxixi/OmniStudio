@@ -53,7 +53,7 @@ import {
 } from "./llama-flash-attn";
 import { shellJoin, splitShellArgs } from "./shell-args";
 import { loadModeArgs, loadModeUnsupported, type LoadModeSupport } from "./llama-load-mode";
-import { MAX_LOG_CHARS, killProcessTree, pumpServerOutput, spawnServerProcess, waitExit } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, pumpServerOutput, spawnServerProcess, waitExit } from "./proc";
 import type {
   BinaryCheckResult,
   LogListener,
@@ -1195,7 +1195,9 @@ export class LlamaRuntime implements Runtime {
         ? ["script", "-q", "/dev/null", llamaPath, ...args]
         : [llamaPath, ...args];
 
-      const proc = spawnServerProcess(cmd);
+      // `-hf repo:quant` 由 llama-server 自己拉权重：HF_ENDPOINT / MODEL_ENDPOINT 按下载源路由给
+      // （国内镜像或官方直连）。env 不进 argv，复制出来的命令不受影响。
+      const proc = spawnServerProcess(cmd, await downloadSourceEnv());
       this.serverProcess = proc;
       this.startupProc = proc;
       pumpServerOutput(proc, this.appendLog.bind(this));

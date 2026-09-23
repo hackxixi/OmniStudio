@@ -113,7 +113,10 @@ def _generate(req):
 
 def main():
     # 让 mflux 的 tqdm 步进条打到 stderr，主进程从 stderr 解析「3/9」。
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    # HF 端点：主进程按下载源路由排好序经 OMNI_HF_ENDPOINTS 传入（逗号分隔），取首选；
+    # 没传（老主进程 / 手动运行）保持老行为走镜像。显式设过 HF_ENDPOINT 的不覆盖。
+    preferred = [e.strip().rstrip("/") for e in os.environ.get("OMNI_HF_ENDPOINTS", "").split(",") if e.strip()]
+    os.environ.setdefault("HF_ENDPOINT", preferred[0] if preferred else "https://hf-mirror.com")
     for line in sys.stdin:
         line = line.strip()
         if not line:
