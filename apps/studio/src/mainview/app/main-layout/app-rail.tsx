@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   MessageCircleDashedIcon,
-  SquareTerminalIcon,
+  BotIcon,
   PhoneIcon,
   AudioWaveformIcon,
   ShapesIcon,
@@ -17,6 +17,7 @@ import {
   GaugeIcon,
   LayoutGridIcon,
   SlidersHorizontalIcon,
+  WaypointsIcon,
 } from "lucide-react";
 
 import { rpcClient } from "@lib/rpc";
@@ -33,9 +34,12 @@ import { APP_RAIL_LAYOUT_KEY, resolveRailLayout, visibleRailEntries } from "@/sh
 // 导出给设置 → 外观 的菜单配置卡复用 —— 配置里看到的图标必须就是菜单里那个。
 export const APP_ICONS: Record<AppId, ReactNode> = {
   chat: <MessageCircleDashedIcon className="size-5" />,
-  agent: <SquareTerminalIcon className="size-5" />,
-  // JEV：滑杆 == "在档位/选项上做判定"，与 Agent 的终端方块、其它具象图标区分开
-  jev: <SlidersHorizontalIcon className="size-5" />,
+  // Agent：机器人 == 会自己规划、调工具、多步干活的智能体（全应用 Agent 的统一语义，
+  // 与「让 Agent 解决」按钮同款 BotIcon）；SquareTerminal 是终端，只能表示执行手段
+  agent: <BotIcon className="size-5" />,
+  // JEV / SystemOne：节点间选路 == "类型化判定 / 路由决策"（给定选项选出走哪条路），
+  // 抽象几何线条，与 Agent 的机器人、其它具象图标区分开
+  jev: <WaypointsIcon className="size-5" />,
   voicecall: <PhoneIcon className="size-5" />,
   voice: <AudioWaveformIcon className="size-5" />,
   image: <ShapesIcon className="size-5" />,
