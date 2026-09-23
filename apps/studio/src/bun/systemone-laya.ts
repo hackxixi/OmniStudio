@@ -18,7 +18,10 @@ import { logEvent } from "./app-log";
 import { getSetting } from "./db/settings";
 import { getDataDir } from "./paths";
 import { proxyChildEnv } from "./proxy";
+import { getSourcePlan, peekSourcePlan } from "./net-sources";
+import { installEnv, installFromIndexes, installUv, pythonChildEnv, resolveUv } from "./python-sources";
 import { removeManifest, writeManifest } from "./install-manifest";
+import { defaultCommandRunner, type CommandRunner } from "./command-runner";
 
 export type LayaPhase = "idle" | "installing" | "loading" | "ready" | "error";
 
@@ -372,10 +375,12 @@ async function ensureWorker(): Promise<Worker | null> {
       stdout: "pipe",
       stderr: "pipe",
       stdin: "pipe",
-      // 权重首次加载要下 Hugging Face，必须继承代理设置（子进程只认环境变量）。
+      // 权重首次加载要下 Hugging Face，必须继承代理设置（子进程只认环境变量）；
+      // HF 端点按下载源计划给：HF_ENDPOINT 取首选，OMNI_HF_ENDPOINTS 供 worker 失败时逐个换。
       env: {
         ...process.env,
         ...proxyChildEnv(),
+        ...pythonChildEnv(peekSourcePlan()),
         LAYA_DTYPE: getSetting("SYSTEMONE_LOCAL_DTYPE") || "float16",
       },
     }) as unknown as PipeProc;
@@ -598,7 +603,7 @@ export async function getLayaStatus(): Promise<LayaStatus> {
   const supported = platformSupported();
   // 装不装得起来看的是"有没有解释器来源"：系统 Python 或 uv，有一个就够。
   const pythonPath = supported
-    ? ((await findPython()) ?? Bun.which("uv", { PATH: getSearchPath() }))
+    ? ((await findPython()) ?? resolveUv(getSearchPath()))
     : null;
   const version = await getLayaVersion();
   return {
@@ -620,43 +625,63 @@ export async function getLayaStatus(): Promise<LayaStatus> {
  * 要么我们去碰系统的解释器 —— 都不合适。uv 是单个二进制，装完它自己会按需下载并
  * 缓存合规的解释器（见 `UV_PYTHON_VERSION`），引擎安装那一步就能接着往下走。
  *
- * 优先用 Homebrew（这台机器上有的话，装出来的东西归 brew 管，用户后面好卸）；
+ * 海外：优先用 Homebrew（这台机器上有的话，装出来的东西归 brew 管，用户后面好卸），
  * 没有 brew 才用官方安装脚本装到 `~/.local/bin`。
+ * 国内（或上面两条都失败）：经 GitHub 加速镜像下官方单文件包，再不行用已有的 Python
+ * 从 PyPI 镜像 `pip install uv`，都装进托管目录（见 python-sources.ts 的 installUv）。
  */
 export async function installLayaDeps(): Promise<{ ok: boolean; error?: string; tool?: string }> {
   if (!platformSupported()) {
     return { ok: false, error: "本地 JEV 运行时需要 Apple Silicon 的 macOS（MLX），当前平台不支持" };
   }
   resetPythonCache();
-  if (Bun.which("uv", { PATH: getSearchPath() }) || (await findPython())) {
+  if (resolveUv(getSearchPath()) || (await findPython())) {
     return { ok: true, tool: "already" };
   }
-  const brew = Bun.which("brew", { PATH: getSearchPath() });
-  const cmd = brew
-    ? [brew, "install", "uv"]
-    : ["/bin/sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"];
   emitPhase("installing", "安装 uv…");
-  emitLog(`$ ${cmd.join(" ")}`);
-  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", env: { ...process.env, ...proxyChildEnv() } });
-  await Promise.all([streamLines(proc.stdout), streamLines(proc.stderr, true)]);
-  const code = await proc.exited;
+  const plan = await getSourcePlan();
+  const result = await installUv({
+    plan,
+    log: emitLog,
+    searchPath: getSearchPath(),
+    source: "systemone",
+    runner: layaRunner,
+  });
   resetPythonCache();
-  const installed = Bun.which("uv", { PATH: getSearchPath() });
-  if (code !== 0 || !installed) {
+  if (!result.ok || !result.path) {
     logEvent({
       level: "error",
       source: "systemone",
       event: "systemone.laya.deps_failed",
-      message: `安装 uv 失败（退出码 ${code}）`,
-      detail: { viaBrew: !!brew, exitCode: code },
+      message: "安装 uv 失败",
+      detail: { mode: plan.mode, error: result.error },
     });
     emitPhase("error", "依赖安装失败");
-    return { ok: false, error: `安装 uv 失败（退出码 ${code}），详见安装日志` };
+    return { ok: false, error: `安装 uv 失败（${result.error ?? "未知错误"}），详见安装日志` };
   }
-  emitLog(`uv 已就绪：${installed}`);
+  emitLog(`uv 已就绪：${result.path}`);
   emitPhase("idle", "");
-  return { ok: true, tool: brew ? "brew" : "script" };
+  return { ok: true, tool: result.via };
 }
+
+/** 装 uv 用的执行器：流式输出进安装日志，子进程带上代理变量（再叠调用方给的镜像变量）。 */
+const layaRunner: CommandRunner = {
+  run: (cmd, timeoutMs) => defaultCommandRunner.run(cmd, timeoutMs),
+  runStreaming: async (cmd, onLine, opts) => {
+    try {
+      const proc = Bun.spawn(cmd, {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, ...proxyChildEnv(), ...opts?.env },
+      });
+      await Promise.all([streamLines(proc.stdout), streamLines(proc.stderr, true)]);
+      return await proc.exited;
+    } catch (e) {
+      onLine(e instanceof Error ? e.message : String(e));
+      return -1;
+    }
+  },
+};
 
 let installInFlight: Promise<LayaInstallResult> | null = null;
 
@@ -672,7 +697,7 @@ export function installLayaRuntime(): Promise<LayaInstallResult> {
     if (!platformSupported()) {
       return { ok: false, error: "本地 JEV 运行时需要 Apple Silicon 的 macOS（MLX），当前平台不支持" };
     }
-    const uv = Bun.which("uv", { PATH: getSearchPath() });
+    const uv = resolveUv(getSearchPath());
     const python = await findPython();
     /*
      * 有 uv 就不需要系统 Python。
@@ -696,6 +721,8 @@ export function installLayaRuntime(): Promise<LayaInstallResult> {
     }
     emitPhase("installing", "创建虚拟环境…");
     const engineDir = layaEngineDir();
+    const plan = await getSourcePlan();
+    const env = installEnv(plan);
     try {
       mkdirSync(engineDir, { recursive: true });
       writeFileSync(installMarkerPath(), String(Date.now()));
@@ -718,7 +745,8 @@ export function installLayaRuntime(): Promise<LayaInstallResult> {
         ? [uv, "venv", looksLikeVenv ? "--clear" : "--allow-existing", "--python", python ?? UV_PYTHON_VERSION, engineDir]
         : [python as string, "-m", "venv", "--clear", engineDir];
       emitLog(`$ ${cmd.join(" ")}`);
-      const venv = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+      // 没有系统 Python 时 uv 要去 GitHub 下解释器：UV_PYTHON_INSTALL_MIRROR 让它走加速镜像。
+      const venv = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", env: { ...process.env, ...proxyChildEnv(), ...env } });
       if (venv.exitCode !== 0) {
         try {
           rmSync(installMarkerPath(), { force: true });
@@ -728,7 +756,6 @@ export function installLayaRuntime(): Promise<LayaInstallResult> {
     }
 
     emitPhase("installing", "安装 laya-mlx…");
-    const mirror = "https://pypi.tuna.tsinghua.edu.cn/simple";
     const runInstall = async (indexArgs: string[]): Promise<number> => {
       const cmd = uv
         ? [uv, "pip", "install", "--python", enginePython, "--upgrade", "laya-mlx", ...indexArgs]
@@ -737,17 +764,13 @@ export function installLayaRuntime(): Promise<LayaInstallResult> {
       const proc = Bun.spawn(cmd, {
         stdout: "pipe",
         stderr: "pipe",
-        env: { ...process.env, ...proxyChildEnv() },
+        env: { ...process.env, ...proxyChildEnv(), ...env },
       });
       await Promise.all([streamLines(proc.stdout), streamLines(proc.stderr, true)]);
       return await proc.exited;
     };
 
-    let code = await runInstall([]);
-    if (code !== 0) {
-      emitLog(`默认 PyPI 源安装失败（退出码 ${code}），改用清华镜像重试…`);
-      code = await runInstall(["-i", mirror]);
-    }
+    const { code } = await installFromIndexes({ plan, what: "laya-mlx", run: runInstall, log: emitLog });
     try {
       rmSync(installMarkerPath(), { force: true });
     } catch {}

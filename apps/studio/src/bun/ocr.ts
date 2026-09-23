@@ -12,6 +12,7 @@ import { writeManifest } from "./install-manifest";
 import { chatImageUrl } from "../shared/server-info";
 import { ocrLangEntry, OCR_LANG_CATALOG, OCR_TESSDATA_BRANCH, OCR_TESSDATA_REPO } from "../shared/ocr";
 import { fetchAssetFromSources, githubRawUrls } from "./mirror-download";
+import { getSourcePlan } from "./net-sources";
 import { convertFileToImages, generate, type ModelEndpoint } from "./vllm";
 import { getLocalModelName } from "./vllm/model";
 import { getCurrentModelProfile } from "./vllm/model-profile";
@@ -222,10 +223,14 @@ export async function installTesseractEngine(): Promise<{ ok: boolean; error?: s
     emitTessLog(err);
     return { ok: false, error: err };
   }
-  emitTessLog("$ brew install tesseract");
+  // 国内加速模式下带上 Homebrew 镜像变量（API / bottles 走镜像；海外模式为空，行为不变）。
+  const { homebrewEnv } = await getSourcePlan();
+  const mirrored = Object.keys(homebrewEnv).length > 0;
+  emitTessLog(`$ brew install tesseract${mirrored ? `（Homebrew 镜像：${homebrewEnv.HOMEBREW_BOTTLE_DOMAIN ?? "已启用"}）` : ""}`);
   const proc = Bun.spawn([brew, "install", "tesseract"], {
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...process.env, ...homebrewEnv },
   });
   // 保留末尾若干行：失败时附在错误里，用户不必翻日志就能看到原因。
   const tail: string[] = [];

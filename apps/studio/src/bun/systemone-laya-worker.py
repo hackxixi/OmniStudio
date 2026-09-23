@@ -148,6 +148,24 @@ def to_official_answer(answer: dict[str, Any]) -> dict[str, Any]:
 
 MAX_LOADED = int(os.environ.get("LAYA_MAX_LOADED", "2"))
 
+HF_OFFICIAL = "https://huggingface.co"
+
+
+def hf_endpoints() -> list[str]:
+    """下载权重的 HF 端点，按优先级。
+
+    主进程按下载源路由（bun/net-sources.ts）排好序，经 OMNI_HF_ENDPOINTS（逗号分隔）传入；
+    没传（老主进程 / 手动运行）就用 HF_ENDPOINT 或官方。官方永远补在最后兜底：
+    镜像偶尔缺文件 / 限流，换官方还有机会下完。
+    """
+    out: list[str] = []
+    raw = os.environ.get("OMNI_HF_ENDPOINTS", "")
+    for item in raw.split(",") + [os.environ.get("HF_ENDPOINT", ""), HF_OFFICIAL]:
+        item = item.strip().rstrip("/")
+        if item and item not in out:
+            out.append(item)
+    return out
+
 
 class Runtime:
     def __init__(self) -> None:
@@ -243,10 +261,19 @@ class Runtime:
         box: dict[str, Any] = {}
 
         def run() -> None:
-            try:
-                box["path"] = snapshot_download(weights, allow_patterns=WEIGHT_PATTERNS)
-            except Exception as exc:  # noqa: BLE001 —— 后台线程的异常要带回主线程
-                box["error"] = f"{type(exc).__name__}: {exc}"
+            # 端点逐个试：镜像失败就换下一个（已落盘的分片留在缓存里，下一个端点接着续传）。
+            # 全部失败报**第一个**端点的错 —— 它是首选源，最有排查价值。
+            first_error = ""
+            for endpoint in hf_endpoints():
+                try:
+                    box["path"] = snapshot_download(
+                        weights, allow_patterns=WEIGHT_PATTERNS, endpoint=endpoint
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001 —— 后台线程的异常要带回主线程
+                    if not first_error:
+                        first_error = f"{type(exc).__name__}: {exc} (endpoint {endpoint})"
+            box["error"] = first_error or "no Hugging Face endpoint available"
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()

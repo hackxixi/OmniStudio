@@ -25,6 +25,8 @@ import { resyncCopyTargets } from "./sync-engine";
 import { audit } from "./audit";
 import { writeSkillMeta } from "./meta-sync";
 import { logEvent } from "../app-log";
+import { gitRemoteCandidates } from "../github-api";
+import { getSourcePlan } from "../net-sources";
 
 // ---------------------------------------------------------------------------
 // 进度推送
@@ -66,7 +68,7 @@ export function cancelInstall(ref: string): boolean {
 
 async function git(
   args: string[],
-  opts?: { cwd?: string; onSpawn?: (kill: () => void) => void },
+  opts?: { cwd?: string; onSpawn?: (kill: () => void) => void; timeoutMs?: number },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(["git", ...args], {
     cwd: opts?.cwd,
@@ -79,12 +81,73 @@ async function git(
       proc.kill();
     } catch {}
   });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
+  // 探路用的短超时：直连 github.com 不通时 TCP 要等 75s 才失败，不能让它拖住整个安装。
+  const timer = opts?.timeoutMs
+    ? setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+      }, opts.timeoutMs)
+    : null;
+  try {
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { code, stdout, stderr };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** 单条远端的探路预算（`git ls-remote <remote> HEAD`，正常 1～2s）。 */
+const REMOTE_PROBE_MS = 15_000;
+
+/**
+ * 远端尝试顺序：候选按下载源计划排好（GitHub 仓库带前缀镜像，海外直连在前），
+ * 逐个用短超时 ls-remote 探路，第一条答得上的排到最前、其余保持原序（clone 失败还能换）。
+ * 只有一个候选（非 GitHub 远端）时不探，原样返回。
+ */
+export async function orderGitRemotes(
+  candidates: string[],
+  probe: (remote: string) => Promise<boolean>,
+): Promise<string[]> {
+  if (candidates.length <= 1) return candidates;
+  for (const remote of candidates) {
+    if (await probe(remote)) return [remote, ...candidates.filter((c) => c !== remote)];
+  }
+  return candidates;
+}
+
+async function gitRemotesFor(url: string): Promise<string[]> {
+  const candidates = gitRemoteCandidates(url, await getSourcePlan());
+  return orderGitRemotes(candidates, async (remote) => {
+    const r = await git(["ls-remote", remote, "HEAD"], { timeoutMs: REMOTE_PROBE_MS });
+    return r.code === 0 && r.stdout.trim().length > 0;
+  });
+}
+
+/**
+ * clone 走多链路：按 gitRemotesFor 的顺序逐条 clone，失败清掉半截目录换下一条。
+ * `argsFor` 拿到实际用的远端拼参数；返回最后一次的结果。记录里的来源地址仍是原始 URL。
+ */
+async function cloneWithMirrors(
+  url: string,
+  dest: string,
+  argsFor: (remote: string) => string[],
+  opts?: { onSpawn?: (kill: () => void) => void; canceled?: () => boolean },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  let last = { code: -1, stdout: "", stderr: "no remote" };
+  for (const remote of await gitRemotesFor(url)) {
+    if (opts?.canceled?.()) break;
+    last = await git(argsFor(remote), { onSpawn: opts?.onSpawn });
+    if (last.code === 0 || opts?.canceled?.()) return last;
+    try {
+      if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
+    } catch {}
+  }
+  return last;
 }
 
 /** 校验 git URL：允许 https/http/ssh/git@ 与 "owner/repo" 简写；拒绝 file:// 与本地路径。 */
@@ -276,8 +339,14 @@ export async function installFromSkillssh(
   emitProgress({ ref, phase: "cloning" });
   try {
     ensureCentralRepo();
-    const clone = await git(["clone", "--depth", "1", repoUrl, tmp], {
-      onSpawn: (kill) => activeInstalls.set(ref, kill),
+    const clone = await cloneWithMirrors(repoUrl, tmp, (remote) => ["clone", "--depth", "1", remote, tmp], {
+      // 取消既要杀掉当前 git，也要让多链路循环停下（不然会接着试下一条镜像）。
+      onSpawn: (kill) =>
+        activeInstalls.set(ref, () => {
+          killed = true;
+          kill();
+        }),
+      canceled: () => killed,
     });
     if (killed) {
       emitProgress({ ref, phase: "canceled" });
@@ -331,10 +400,11 @@ export async function gitPreview(
   const tmp = join(getTmpDir(), `preview-${randomUUID().slice(0, 8)}`);
   const ref = `preview:${tmp}`;
   emitProgress({ ref, phase: "cloning" });
-  const args = norm.subpath
-    ? ["clone", "--depth", "1", "--filter", "blob:none", "--no-checkout", norm.url!, tmp]
-    : ["clone", "--depth", "1", norm.url!, tmp];
-  const clone = await git(args);
+  const clone = await cloneWithMirrors(norm.url!, tmp, (remote) =>
+    norm.subpath
+      ? ["clone", "--depth", "1", "--filter", "blob:none", "--no-checkout", remote, tmp]
+      : ["clone", "--depth", "1", remote, tmp],
+  );
   if (clone.code !== 0) {
     try {
       if (existsSync(tmp)) rmSync(tmp, { recursive: true, force: true });
@@ -543,7 +613,12 @@ export async function checkSkillUpdate(skillId: string): Promise<SkillUpdateStat
   const url = row.sourceType === "skillssh" ? `https://github.com/${row.sourceRef.split("/").slice(0, 2).join("/")}.git` : row.sourceRef;
   const norm = normalizeGitUrl(url);
   if (!norm.ok) return { id: skillId, status: "unknown", remoteRevision: null };
-  const remote = await git(["ls-remote", norm.url!]);
+  // 逐条远端试（GitHub 仓库带镜像），每条短超时；第一条成功的结果为准。
+  let remote = { code: -1, stdout: "", stderr: "" };
+  for (const candidate of gitRemoteCandidates(norm.url!, await getSourcePlan())) {
+    remote = await git(["ls-remote", candidate], { timeoutMs: REMOTE_PROBE_MS * 2 });
+    if (remote.code === 0) break;
+  }
   if (remote.code !== 0) return { id: skillId, status: "unknown", remoteRevision: null };
   const lines = remote.stdout.split("\n").filter(Boolean);
   if (lines.length === 0) return { id: skillId, status: "unknown", remoteRevision: null };
@@ -590,10 +665,11 @@ export async function updateSkill(skillId: string): Promise<{ ok: boolean; error
   const ref = `update:${skillId}`;
   emitProgress({ ref, phase: "cloning" });
   const tmp = join(getTmpDir(), `update-${randomUUID().slice(0, 8)}`);
-  const args = row.sourceSubpath
-    ? ["clone", "--depth", "1", "--filter", "blob:none", "--no-checkout", norm.url!, tmp]
-    : ["clone", "--depth", "1", norm.url!, tmp];
-  const clone = await git(args);
+  const clone = await cloneWithMirrors(norm.url!, tmp, (remote) =>
+    row.sourceSubpath
+      ? ["clone", "--depth", "1", "--filter", "blob:none", "--no-checkout", remote, tmp]
+      : ["clone", "--depth", "1", remote, tmp],
+  );
   if (clone.code !== 0) {
     emitProgress({ ref, phase: "error", message: clone.stderr.slice(0, 300) });
     try {

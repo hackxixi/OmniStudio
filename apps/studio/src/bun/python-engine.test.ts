@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { dirname } from "path";
 
+import type { SourcePlan } from "../shared/net-sources";
 import type { CommandResult, CommandRunner } from "./command-runner";
 import { engineVersionFilePath, pythonEngineDir, pythonEnginePython } from "./engine-paths";
 import {
@@ -23,6 +24,23 @@ import {
  * 默认源失败怎么换镜像、装完怎么验证、验证不过怎么清理。
  */
 const created: string[] = [];
+
+/** 固定的下载源计划：用例不去跑真实探测（那要联网）。 */
+function planOf(mode: "cn" | "global", pypiIndexes: string[]): SourcePlan {
+  return {
+    mode,
+    decidedBy: "setting",
+    cnLocale: mode === "cn",
+    modelSource: mode === "cn" ? "modelscope" : "huggingface",
+    hfEndpoints: mode === "cn" ? ["https://hf-mirror.com", "https://huggingface.co"] : ["https://huggingface.co"],
+    pypiIndexes,
+    githubPrefixes: mode === "cn" ? ["https://gh-proxy.com/", ""] : [""],
+    homebrewEnv: {},
+    probes: [],
+    at: Date.now(),
+  };
+}
+const GLOBAL_PLAN = planOf("global", ["https://pypi.org/simple", "https://pypi.tuna.tsinghua.edu.cn/simple"]);
 
 afterEach(() => {
   for (const dir of created.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -61,8 +79,9 @@ function fakeRunner(options: {
   probeVersion?: string;
   /** venv 创建是否失败（缺 python3-venv 的现场）。 */
   venvFails?: boolean;
-}): CommandRunner & { calls: string[][] } {
+}): CommandRunner & { calls: string[][]; envs: (Record<string, string> | undefined)[] } {
   const calls: string[][] = [];
+  const envs: (Record<string, string> | undefined)[] = [];
   let pipCalls = 0;
 
   const handle = (cmd: string[]): CommandResult | null => {
@@ -85,9 +104,11 @@ function fakeRunner(options: {
 
   return {
     calls,
+    envs,
     run: (cmd) => handle(cmd) ?? { code: -1, stdout: "", stderr: `unexpected: ${cmd.join(" ")}` },
-    runStreaming: async (cmd, onLine) => {
+    runStreaming: async (cmd, onLine, opts) => {
       calls.push(cmd);
+      envs.push(opts?.env);
       const joined = cmd.join(" ");
       if (joined.includes("venv")) {
         if (options.venvFails) {
@@ -190,6 +211,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: fakeRunner({ probeVersion: "0.28.4" }),
       findPython: () => "/usr/bin/python3.12",
     });
@@ -211,6 +233,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: run,
       findPython: () => "/usr/bin/python3.12",
     });
@@ -221,7 +244,7 @@ describe("installPythonEngine", () => {
     expect(report.lines.some((line) => line.includes("已安装"))).toBe(true);
   });
 
-  test("默认 PyPI 源失败 → 自动换清华镜像重试一次", async () => {
+  test("首选索引（官方）失败 → 按计划换下一个索引（清华镜像）重试", async () => {
     const report = reporter();
     const run = fakeRunner({ pipSucceedsAt: 2, probeVersion: "0.28.4" });
     const result = await installPythonEngine({
@@ -230,6 +253,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: run,
       findPython: () => "/usr/bin/python3.12",
       // 钉住"机器上没有 uv"这条形状：本机恰好装着 uv 时走的是 `uv pip install
@@ -241,8 +265,10 @@ describe("installPythonEngine", () => {
     const pipCalls = installCalls(run.calls);
     expect(pipCalls).toHaveLength(2);
     expect(pipCalls[0]!.join(" ")).toContain("pip3 install");
-    expect(pipCalls[1]!.join(" ")).toContain("-i https://pypi.tuna.tsinghua.edu.cn/simple");
-    expect(report.lines.some((line) => line.includes("清华镜像"))).toBe(true);
+    // 官方源不带索引参数（用户自己的 pip.conf 照样生效）
+    expect(pipCalls[0]!.join(" ")).not.toContain("--index-url");
+    expect(pipCalls[1]!.join(" ")).toContain("--index-url https://pypi.tuna.tsinghua.edu.cn/simple");
+    expect(report.lines.some((line) => line.includes("清华 PyPI 镜像"))).toBe(true);
   });
 
   test("有 uv 时走 uv 那条形状（venv 与 index 参数都不一样）", async () => {
@@ -254,6 +280,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: run,
       findPython: () => "/usr/bin/python3.12",
       findUv: () => "/opt/homebrew/bin/uv",
@@ -268,6 +295,42 @@ describe("installPythonEngine", () => {
     expect(pipCalls[1]!.join(" ")).toContain("--index-url https://pypi.tuna.tsinghua.edu.cn/simple");
   });
 
+  test("国内计划：第一次就用最优镜像（阿里云），失败再按顺序换，镜像变量传给子进程", async () => {
+    const report = reporter();
+    const run = fakeRunner({ pipSucceedsAt: 2, probeVersion: "0.28.4" });
+    const plan = planOf("cn", [
+      "https://mirrors.aliyun.com/pypi/simple",
+      "https://pypi.tuna.tsinghua.edu.cn/simple",
+      "https://pypi.org/simple",
+    ]);
+    const result = await installPythonEngine({
+      id: "mlx-lm",
+      label: "MLX",
+      packages: ["mlx-lm"],
+      probeModule: "mlx_lm",
+      reporter: report,
+      plan,
+      runner: run,
+      findPython: () => "/usr/bin/python3.12",
+      findUv: () => "/opt/homebrew/bin/uv",
+    });
+
+    expect(result.ok).toBe(true);
+    const pipCalls = installCalls(run.calls);
+    expect(pipCalls).toHaveLength(2);
+    expect(pipCalls[0]!.join(" ")).toContain("--index-url https://mirrors.aliyun.com/pypi/simple");
+    expect(pipCalls[1]!.join(" ")).toContain("--index-url https://pypi.tuna.tsinghua.edu.cn/simple");
+    expect(report.lines.some((line) => line.includes("用 阿里云 PyPI 镜像安装"))).toBe(true);
+    expect(report.lines.some((line) => line.includes("改用 清华 PyPI 镜像重试"))).toBe(true);
+    // venv 与装包都带上镜像变量；默认索引变量被拿掉（索引由参数逐次决定）
+    for (const env of run.envs) {
+      expect(env?.UV_PYTHON_INSTALL_MIRROR).toContain("python-build-standalone");
+      expect(env?.HF_ENDPOINT).toBe("https://hf-mirror.com");
+      expect(env?.PIP_INDEX_URL).toBeUndefined();
+      expect(env?.UV_DEFAULT_INDEX).toBeUndefined();
+    }
+  });
+
   test("两次都失败：如实报错，收尾行走失败分支", async () => {
     const report = reporter();
     const result = await installPythonEngine({
@@ -276,6 +339,7 @@ describe("installPythonEngine", () => {
       packages: ["vllm"],
       probeModule: "vllm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: fakeRunner({ pipSucceedsAt: 0 }),
       findPython: () => "/usr/bin/python3.12",
     });
@@ -295,6 +359,7 @@ describe("installPythonEngine", () => {
       packages: ["vllm"],
       probeModule: "vllm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: fakeRunner({ probeOk: false }),
       findPython: () => "/usr/bin/python3.12",
     });
@@ -313,6 +378,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: run,
       findPython: () => null,
     });
@@ -332,6 +398,7 @@ describe("installPythonEngine", () => {
       packages: ["sglang[all]"],
       probeModule: "sglang",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: run,
       findPython: () => "/usr/bin/python3.11",
     });
@@ -355,6 +422,7 @@ describe("installPythonEngine", () => {
       packages: ["mlx-lm"],
       probeModule: "mlx_lm",
       reporter: report,
+      plan: GLOBAL_PLAN,
       runner: fakeRunner({ probeVersion: "0.28.4" }),
       findPython: () => "/usr/bin/python3.12",
     });

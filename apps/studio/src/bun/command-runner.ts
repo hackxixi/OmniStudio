@@ -17,7 +17,12 @@ export type CommandRunner = {
    * 实时输出而不是等它跑完），返回退出码。必须实现，否则安装类流程在测试里会去执行
    * 真实命令 —— 那正是不该发生的事。
    */
-  runStreaming: (cmd: string[], onLine: (line: string) => void) => Promise<number>;
+  runStreaming: (
+    cmd: string[],
+    onLine: (line: string) => void,
+    /** `env`：叠在当前进程环境之上的附加变量（下载源镜像、代理等）。 */
+    opts?: { env?: Record<string, string> },
+  ) => Promise<number>;
 };
 
 /** 多数命令用这个超时：够 `sysctl` / `tar` / `codesign` 跑完，也够快失败。 */
@@ -59,9 +64,13 @@ export const defaultCommandRunner: CommandRunner = {
       return { code: -1, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
     }
   },
-  runStreaming: async (cmd, onLine) => {
+  runStreaming: async (cmd, onLine, opts) => {
     try {
-      const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+      const proc = Bun.spawn(cmd, {
+        stdout: "pipe",
+        stderr: "pipe",
+        ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
+      });
       await Promise.all([
         streamInto(proc.stdout as ReadableStream<Uint8Array>, onLine),
         streamInto(proc.stderr as ReadableStream<Uint8Array>, onLine),
