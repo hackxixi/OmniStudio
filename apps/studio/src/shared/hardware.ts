@@ -357,6 +357,87 @@ export function parseDisplaysChipset(stdout: string): GpuInfo | null {
   return { kind, name: chipset, vramBytes: vram ? parseVramText(vram) : null };
 }
 
+// ---------------------------------------------------------------------------
+// 资源余量（顶栏状态胶囊用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一块内存（RAM / 显存）的读数。`totalBytes` 拿不到时给 null（胶囊按「只有剩余」展示），
+ * `freeBytes` 拿不到时给 null —— 两者都是实测读数，不猜。
+ */
+export type ResourceUsage = {
+  totalBytes: number | null;
+  freeBytes: number | null;
+};
+
+/**
+ * 顶栏状态胶囊的读数。`vram` 为 null = 这台机器没有可读的独立显存；
+ * `unifiedMemory` = 统一内存（Apple Silicon / AMD APU）—— GPU 与 CPU 共用同一块物理内存，
+ * 「显存」不是独立预算，界面只展示内存一段并在 tooltip 里说明。
+ */
+export type ResourceUsageInfo = {
+  ram: ResourceUsage;
+  vram: ResourceUsage | null;
+  unifiedMemory: boolean;
+};
+
+/**
+ * macOS 的「可用内存」：解析 `vm_stat` 输出。`node:os` 的 freemem() 只数 free 页，
+ * 而 macOS 把刚释放的页记成 inactive、把可丢弃的缓存记成 purgeable —— 进程要用时立刻
+ * 就能收回来，freemem() 把它们全当「已用」，空闲内存被少报几个 GB。这里把
+ * free + inactive + speculative + purgeable 都算可用（接近活动监视器的口径）。
+ *
+ * 行形如 `Pages free:   106677.`（数字末尾带句点）；页大小在首行 `(page size of 16384 bytes)`。
+ * 页大小或 `Pages free` 读不出来就返回 null，调用方回退 freemem()。
+ */
+export function parseVmStatAvailable(stdout: string): number | null {
+  const pageSize = Number(/page size of (\d+) bytes/i.exec(stdout)?.[1]);
+  if (!Number.isFinite(pageSize) || pageSize <= 0) return null;
+  const pages = (name: string): number | null => {
+    const m = new RegExp(`^\\s*Pages ${name}:\\s*(\\d+)\\.?\\s*$`, "m").exec(stdout);
+    return m ? Number(m[1]) : null;
+  };
+  const free = pages("free");
+  if (free === null) return null;
+  const total = free + (pages("inactive") ?? 0) + (pages("speculative") ?? 0) + (pages("purgeable") ?? 0);
+  return total * pageSize;
+}
+
+/**
+ * `nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits` 的输出：
+ * 一行一张卡，两列 MiB。多卡求和 —— 胶囊要的是「这台机器还剩多少显存」的总量，
+ * 不是 gpu-stats 那边「按哪张卡算预算」的选最大。
+ *
+ * 一行两列按逗号切开。一行里任何一列读不出数字（`[N/A]` / 驱动不支持）就跳过该行，
+ * 而不是把缺失当 0 —— 少算一卡会把剩余显存虚高。
+ */
+export function parseNvidiaSmiMemory(stdout: string): {
+  totalBytes: number;
+  freeBytes: number;
+} | null {
+  let total = 0;
+  let free = 0;
+  let matched = 0;
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const parsed = parseMemoryLine(line);
+    if (!parsed) continue;
+    total += parsed.total;
+    free += parsed.free;
+    matched++;
+  }
+  return matched > 0 ? { totalBytes: total, freeBytes: free } : null;
+}
+
+/** 单行：`24564, 20133`（MiB）。两列都读得出才算数。 */
+function parseMemoryLine(line: string): { total: number; free: number } | null {
+  const fields = line.split(/,\s*/);
+  const total = Number.parseFloat(fields[0] ?? "");
+  const free = Number.parseFloat(fields[1] ?? "");
+  if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(free) || free < 0) return null;
+  return { total: Math.round(total * 1024 * 1024), free: Math.round(free * 1024 * 1024) };
+}
+
 /** `4 GB` / `1536 MB` → bytes。认不出来时给 null（预算随后落到「内存 60%」口径）。 */
 export function parseVramText(text: string): number | null {
   const match = /([\d.]+)\s*(TB|GB|MB|KB)/i.exec(text);
@@ -366,4 +447,15 @@ export function parseVramText(text: string): number | null {
   const unit = match[2]!.toUpperCase();
   const scale = unit === "TB" ? 1e12 : unit === "GB" ? 1e9 : unit === "MB" ? 1e6 : 1e3;
   return Math.round(value * scale);
+}
+
+/**
+ * 「已用比例」（0-1，越界钳住），进度条与颜色档位共用：
+ * 总量或空闲读数缺失时返回 null（条不画），free > total（读数交叉）时当满空处理给 0。
+ */
+export function usedRatio(
+  usage: Pick<ResourceUsage, "totalBytes" | "freeBytes">,
+): number | null {
+  if (usage.totalBytes === null || usage.freeBytes === null || usage.totalBytes <= 0) return null;
+  return Math.min(1, Math.max(0, 1 - usage.freeBytes / usage.totalBytes));
 }

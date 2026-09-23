@@ -197,6 +197,8 @@ import * as ModelStore from "../model-store";
 import type { InstalledModel } from "../model-store";
 import { updateModelCategory } from "../model-category";
 import { getServerStats, type ServerStats } from "../stats";
+import { getResourceUsage, type GetResourceUsageOptions } from "../hardware";
+import type { ResourceUsageInfo } from "../../shared/hardware";
 import { getUsageStats } from "../usage";
 import type { UsageStats } from "../../shared/usage";
 import {
@@ -637,6 +639,16 @@ export type AppRPC = {
       getServerStats: {
         params: undefined;
         response: ServerStats;
+      };
+      /**
+       * 顶栏状态胶囊的机器余量（仅本地模式轮询，5 秒一次）：内存 / 显存总量与剩余。
+       * `vram` 为 null = 没有独立显存（Apple Silicon 是统一内存，`unifiedMemory: true`，
+       * 胶囊只展示内存一段）；`freeBytes` 为 null = 总量能读但空闲读不出（条不画，不算错）。
+       * 主进程缓存 2 秒，轮询不会每次都 spawn vm_stat / nvidia-smi。
+       */
+      getResourceUsage: {
+        params: { refresh?: boolean } | undefined;
+        response: ResourceUsageInfo;
       };
       /**
        * 用量统计（设置 → 数据 → 使用统计）。`rangeDays` 只影响趋势与分组表，
@@ -1990,6 +2002,11 @@ export type AppRPC = {
           sessionStartedAt: number;
           basePath: string;
           dataDir: string;
+          /** 主进程（也就是应用）跑在哪个 OS 上 —— webview 里 navigator.platform 是空的，
+           *  只有主进程知道自己是 darwin / linux / win32（诊断提示词的环境行用它）。 */
+          platform: string;
+          /** 主进程的 CPU 架构（arm64 / x64）：MLX 只在 Apple Silicon 上跑，诊断时要分得清。 */
+          arch: string;
         };
       };
       // Benchmark（速度扫描 + 能力评测：异步任务 + 历史记录）
@@ -3520,6 +3537,8 @@ const rpcRequests: NonNullable<
     return getServerStats(Served.getServedModels().models);
   },
 
+  getResourceUsage: async (params?: GetResourceUsageOptions) => getResourceUsage(params ?? {}),
+
   getUsageStats: async ({ rangeDays } = {}) => {
     return getUsageStats(rangeDays);
   },
@@ -5034,6 +5053,11 @@ const rpcRequests: NonNullable<
       sessionStartedAt,
       basePath: ModelStore.getModelsBaseDirForRuntime(),
       dataDir: getUserDataDir(),
+      // webview 侧 navigator.platform 是空的（Electrobun 的 webview 不暴露平台字符串），
+      // 只有主进程知道自己是 darwin / linux / win32。诊断提示词的环境行用它，
+      // Agent 诊断时才能把"我在哪台机器上"说清楚。
+      platform: process.platform,
+      arch: process.arch,
     };
   },
 
