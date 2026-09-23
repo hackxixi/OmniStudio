@@ -328,12 +328,24 @@ export function detectHardware(options: DetectHardwareOptions = {}): HardwareInf
 
 let cached: HardwareInfo | null = null;
 
+export type GetHardwareInfoOptions = {
+  refresh?: boolean;
+  /** 读「此刻空闲内存」的入口，默认 `node:os` 的 freemem()（测试注入）。 */
+  readFreeMemory?: () => number;
+};
+
 /**
- * 机器画像（进程内缓存）。芯片与内存在运行期不会变，引导页的「重新检测」只关心
- * 引擎二进制，不必把 sysctl / system_profiler 再跑一遍。
+ * 机器画像（进程内缓存）。芯片、核数、总内存、显卡在运行期不会变，引导页的「重新检测」
+ * 只关心引擎二进制，不必把 sysctl / system_profiler 再跑一遍。
+ *
+ * 但空闲内存是随时在变的：之前把 freemem() 连同整份画像一起缓存到进程结束，
+ * 规划器（CPU-only 预算、显存溢出到内存的余量）和引导页的「当前空闲」拿到的都是
+ * App 刚启动那一刻的数 —— 开着浏览器 / 另一个模型之后仍按启动时的空闲来算，会高估。
+ * 所以只缓存静态部分，freeMemoryBytes 每次调用现读（freemem() 是一次 sysctl/proc 读，很便宜）。
+ * 注意：因此每次返回的是新对象，调用方不要拿引用相等判断「画像没变」。
  */
-export function getHardwareInfo(options: { refresh?: boolean } = {}): HardwareInfo {
-  if (!options.refresh && cached) return cached;
-  cached = detectHardware();
-  return cached;
+export function getHardwareInfo(options: GetHardwareInfoOptions = {}): HardwareInfo {
+  if (options.refresh || !cached) cached = detectHardware();
+  const readFree = options.readFreeMemory ?? freemem;
+  return { ...cached, freeMemoryBytes: readFree() };
 }

@@ -56,8 +56,8 @@ export type SettingsKey =
   | "SERVER_GPU_LAYERS"
   | "SERVER_CACHE_TYPE_K"
   | "SERVER_CACHE_TYPE_V"
-  // llama.cpp 自动启动参数（T4）：总开关，默认关（行为与关闭前逐字节一致，见
-  // bun/runtimes/llama.ts 的 buildArgs / launch-plan.ts）。
+  // llama.cpp 自动启动参数（T4）：总开关，默认开（"0" = 手动，启动参数与未引入自动推算时
+  // 逐字节一致，见 bun/runtimes/llama.ts 的 buildArgs / launch-plan.ts）。
   | "SERVER_AUTO_TUNE"
   /** 自动推算时上下文的下限（token），低于这个值不如不跑。 */
   | "SERVER_AUTO_TUNE_MIN_CTX"
@@ -381,8 +381,13 @@ const DEFAULTS: Record<SettingsKey, string> = {
   SERVER_GPU_LAYERS: "-1",
   SERVER_CACHE_TYPE_K: "q8_0",
   SERVER_CACHE_TYPE_V: "q8_0",
-  // 默认关：启动参数全部走设置里的现值，开「自动推算」是显式选择。
-  SERVER_AUTO_TUNE: "0",
+  // 默认开：按本机空闲显存 / 内存与模型元数据推算 ctx / batch / ubatch。手动默认值
+  // （固定 ctx 等）在小显存机器上常常起不来或白白浪费大显存，没碰过这个开关的人应得到
+  // 「能起来且尽量大」的那一份。算不出计划（HF 引用 / 元数据不足）时照旧回落到手动值。
+  // 迁移语义：DEFAULTS 只是读侧回落，不落库（getSetting 读不到行才用它；各页面保存
+  // 只提交自己改过的键），所以库里存着 "0" 的只可能是用户显式选过「手动」—— 不动它们，
+  // 从没碰过的用户自然拿到 "1"。
+  SERVER_AUTO_TUNE: "1",
   // 上下文下限 4096（与 launch-planner 的 MIN_FIT_CTX 同一量级，设置里可再调低）。
   SERVER_AUTO_TUNE_MIN_CTX: "4096",
   // auto = 不传参数（llama.cpp 自己的默认：能用 mmap 就用）。

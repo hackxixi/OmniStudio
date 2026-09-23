@@ -211,13 +211,8 @@ import {
 } from "../benchmark";
 import { listEvalSuites, type EvalSuiteInfo } from "../eval";
 import { downloadManager, type DownloadTask } from "../download-manager";
-import {
-  buildLaunchPlanKeyFromSettings,
-  refreshLaunchPlan,
-  type LaunchPlan,
-} from "../launch-plan";
-import { effectiveFlashAttnForPlan } from "../runtimes/llama";
-import { readGgufMeta, type GgufReadFailure } from "../gguf-meta";
+import type { LaunchPlan } from "../launch-plan";
+import { launchPlanPreviewForRpc } from "./launch-plan-preview";
 import * as Voice from "../voice";
 import type { VoiceRecordRow, VoiceRecordKind, VoiceClone } from "../voice";
 import * as Asr from "../asr";
@@ -4925,35 +4920,8 @@ const rpcRequests: NonNullable<
     return { models: ModelStore.listInstalledModels() };
   },
 
-  getLaunchPlanPreview: async ({ path }) => {
-    const modelPath = path.trim();
-    if (modelPath === "") {
-      return { ok: false as const, error: "no model path", reason: "not-found" };
-    }
-    // 与 llama.ts 启动时完全同源的 key：同一函数、同一设置读法、同一个
-    // 「设置 + 上次实测」的 FA 折算（预览端没有 Runtime 实例，实测值读设置里回写的
-    // SERVER_FLASH_ATTN_EFFECTIVE —— 启动过之后两者必然相等）。
-    const key = buildLaunchPlanKeyFromSettings(
-      modelPath,
-      (k) => getSetting(k as SettingsKey),
-      effectiveFlashAttnForPlan(
-        getSetting("SERVER_FLASH_ATTN") as "" | "off" | "on",
-        getSetting("SERVER_FLASH_ATTN_EFFECTIVE") as "" | "off" | "on" | null | undefined,
-      ),
-    );
-    const plan = await refreshLaunchPlan(key);
-    if (plan !== null) return { ok: true as const, plan };
-
-    // refreshLaunchPlan 对「读不到 GGUF」静默返回 null，这里补一次读取只为拿到
-    // 失败原因码（该读取自身有 mtime 缓存，成本可忽略）。
-    const read = await readGgufMeta(modelPath);
-    if (read.ok) {
-      // GGUF 读得到但计划算不出来：元数据不足以估算 KV cache。
-      return { ok: false as const, error: read.data.filePath, reason: "no-metadata" };
-    }
-    const reason: GgufReadFailure = read.reason;
-    return { ok: false as const, error: read.error, reason };
-  },
+  // 实现在 ./launch-plan-preview（可测）：路径先过 llamaLoadablePath，与真正启动同源。
+  getLaunchPlanPreview: async ({ path }) => launchPlanPreviewForRpc(path),
 
   toggleFavoriteModel: async ({ path }) => {
     ModelStore.toggleFavorite(path);

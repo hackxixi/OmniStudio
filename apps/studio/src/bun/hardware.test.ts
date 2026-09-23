@@ -383,7 +383,8 @@ describe("detectHardware AMD (ROCm)", () => {
 describe("getHardwareInfo", () => {
   test("首次探测后走缓存；refresh 时才重新探测（本机的真实探测结果）", () => {
     const first = getHardwareInfo();
-    expect(getHardwareInfo()).toBe(first);
+    // 静态部分走缓存：同一次探测的 gpu 对象原样复用（没有重新跑 detectHardware）。
+    expect(getHardwareInfo().gpu).toBe(first.gpu);
     expect(first.totalMemoryBytes).toBeGreaterThan(0);
     expect(first.budgetBytes).toBeGreaterThan(0);
     expect(first.budgetBytes).toBeLessThanOrEqual(first.totalMemoryBytes);
@@ -391,7 +392,20 @@ describe("getHardwareInfo", () => {
     expect(first.cpuCores).toBeGreaterThanOrEqual(1);
 
     const refreshed = getHardwareInfo({ refresh: true });
-    expect(refreshed).not.toBe(first);
+    expect(refreshed.gpu).not.toBe(first.gpu);
     expect(refreshed.totalMemoryBytes).toBe(first.totalMemoryBytes);
+  });
+
+  test("空闲内存不随画像缓存：每次调用现读（规划器不能拿 App 启动时的空闲来算）", () => {
+    const GB = 1024 ** 3;
+    const a = getHardwareInfo({ readFreeMemory: () => 40 * GB });
+    const b = getHardwareInfo({ readFreeMemory: () => 3 * GB });
+    expect(a.freeMemoryBytes).toBe(40 * GB);
+    expect(b.freeMemoryBytes).toBe(3 * GB);
+    // 静态部分仍是同一次探测
+    expect(b.gpu).toBe(a.gpu);
+    expect(b.chipName).toBe(a.chipName);
+    // 不注入时读真实 freemem()，是个正数
+    expect(getHardwareInfo().freeMemoryBytes).toBeGreaterThan(0);
   });
 });
