@@ -11,6 +11,8 @@ import {
 import { refreshSamplingMetadata, resolveSampling } from "../model-sampling";
 import * as Served from "../model-servers";
 import * as ServerManager from "../server-manager";
+import { effectiveFromArgv, type EffectiveLaunch } from "../../shared/launch-effective";
+import { splitShellArgs } from "../runtimes/shell-args";
 import type { ModelParams, ResolvedSampling } from "../../shared/model-params";
 
 export type GetModelParamsResult = {
@@ -22,6 +24,11 @@ export type GetModelParamsResult = {
   sampling: ResolvedSampling;
   /** 按现在的参数会发出去的启动命令（跑着的实例用它自己的端口 / 服务名；算不出 = 缺省）。 */
   launchPreview?: string;
+  /**
+   * 启动命令里解析出来的实际取值（界面把「自动 / 跟随全局」后面补上括号里的值）。
+   * 命令里没写 / 引擎不认就缺省 —— 算不出就不标。
+   */
+  effective?: EffectiveLaunch;
   /** 这个模型正在跑，且按现在的参数重启后 argv 会变（参数改了还没生效）。 */
   needsRestart: boolean;
 };
@@ -46,7 +53,11 @@ export async function getModelParamsForRpc(model: string): Promise<GetModelParam
   } catch {
     needsRestart = false;
   }
-  return { model: key, params, sampling, launchPreview, needsRestart };
+  // 把命令切成 argv（shared 不能 import bun 侧的 shell-args），解析出实际生效的参数值。
+  const effective = launchPreview
+    ? effectiveFromArgv(splitShellArgs(launchPreview))
+    : undefined;
+  return { model: key, params, sampling, launchPreview, effective, needsRestart };
 }
 
 export function setModelParamsForRpc(

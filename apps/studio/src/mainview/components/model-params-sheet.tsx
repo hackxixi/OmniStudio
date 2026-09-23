@@ -36,6 +36,7 @@ import {
   type ThinkingMode,
 } from "@/shared/model-params";
 import { SAMPLING_PRESETS } from "@/shared/sampling-presets";
+import type { EffectiveLaunch } from "@/shared/launch-effective";
 import { cn } from "@/mainview/lib/utils";
 
 /**
@@ -91,6 +92,14 @@ const LAUNCH_NUMBER_FIELDS: LaunchNumberField[] = ["ctxSize", "parallel", "gpuLa
 
 /** 下拉里「不覆盖」的占位值（radix Select 不接受空串）。 */
 const INHERIT = "__inherit";
+
+/**
+ * 输入框留空 = 走自动 / 全局；把实际生效的值补在文字后面（如「自动 / 跟随全局 (81920)」），
+ * 算不出来（effective 里没有该字段）就不加括号，退回原文案。
+ */
+function effectiveValueLabel(base: string, value: number | string | undefined): string {
+  return value !== undefined && value !== "" ? `${base} (${value})` : base;
+}
 
 export type ModelParamsDraft = {
   ctxSize: string;
@@ -365,6 +374,7 @@ export function ModelParamsBody({ model }: { model: string }) {
       params={data.params}
       sampling={data.sampling}
       launchPreview={data.launchPreview}
+      effective={data.effective}
       hasSaved={data.params !== null}
       saving={saveMutation.isPending}
       clearing={clearMutation.isPending}
@@ -383,6 +393,7 @@ function ModelParamsForm({
   params,
   sampling,
   launchPreview,
+  effective,
   hasSaved,
   saving,
   clearing,
@@ -397,6 +408,7 @@ function ModelParamsForm({
   params: ModelParams | null;
   sampling: ResolvedSampling;
   launchPreview?: string;
+  effective?: EffectiveLaunch;
   hasSaved: boolean;
   saving: boolean;
   clearing: boolean;
@@ -441,14 +453,14 @@ function ModelParamsForm({
               label={t("modelParams.ctxSize")}
               hint={t("modelParams.ctxSizeHint")}
               value={draft.ctxSize}
-              placeholder={t("modelParams.inheritAuto")}
+              placeholder={effectiveValueLabel(t("modelParams.inheritAuto"), effective?.ctxSize)}
               error={errorText(errors.ctxSize)}
               onChange={(v) => set("ctxSize", v)}
             />
             <NumberField
               label={t("modelParams.parallel")}
               value={draft.parallel}
-              placeholder={t("modelParams.inheritGlobal")}
+              placeholder={effectiveValueLabel(t("modelParams.inheritGlobal"), effective?.parallel)}
               error={errorText(errors.parallel)}
               onChange={(v) => set("parallel", v)}
             />
@@ -456,7 +468,7 @@ function ModelParamsForm({
               label={t("modelParams.gpuLayers")}
               hint={t("modelParams.gpuLayersHint")}
               value={draft.gpuLayers}
-              placeholder={t("modelParams.inheritGlobal")}
+              placeholder={effectiveValueLabel(t("modelParams.inheritGlobal"), effective?.gpuLayers)}
               error={errorText(errors.gpuLayers)}
               onChange={(v) => set("gpuLayers", v)}
             />
@@ -464,12 +476,14 @@ function ModelParamsForm({
               label={t("modelParams.cacheTypeK")}
               value={draft.cacheTypeK}
               onChange={(v) => set("cacheTypeK", v)}
+              inheritValue={effective?.cacheTypeK}
               options={KV_CACHE_TYPE_OPTIONS.map((v) => ({ value: v, label: v }))}
             />
             <SelectField
               label={t("modelParams.cacheTypeV")}
               value={draft.cacheTypeV}
               onChange={(v) => set("cacheTypeV", v)}
+              inheritValue={effective?.cacheTypeV}
               options={KV_CACHE_TYPE_OPTIONS.map((v) => ({ value: v, label: v }))}
             />
             <SelectField
@@ -477,6 +491,7 @@ function ModelParamsForm({
               label={t("modelParams.flashAttn")}
               value={draft.flashAttn}
               onChange={(v) => set("flashAttn", v)}
+              inheritValue={effective?.flashAttn}
               options={[
                 { value: "auto", label: t("models.params.flashAttn.auto") },
                 { value: "on", label: t("models.params.flashAttn.on") },
@@ -697,12 +712,14 @@ function SelectField({
   value,
   onChange,
   options,
+  inheritValue,
   className,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  inheritValue?: string;
   className?: string;
 }) {
   const t = useT();
@@ -714,7 +731,11 @@ function SelectField({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value={INHERIT}>{t("modelParams.inheritGlobal")}</SelectItem>
+          <SelectItem value={INHERIT}>
+            {inheritValue
+              ? `${t("modelParams.inheritGlobal")} (${inheritValue})`
+              : t("modelParams.inheritGlobal")}
+          </SelectItem>
           {options.map((o) => (
             <SelectItem key={o.value} value={o.value}>
               {o.label}

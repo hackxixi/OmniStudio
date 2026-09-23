@@ -30,6 +30,8 @@ describe("model params RPC", () => {
     // HF 引用在默认引擎（llama.cpp）下走 -hf：命令里是按模型的窗口与温度
     expect(res.launchPreview).toContain("--ctx-size 12288");
     expect(res.launchPreview).toContain("--temp 0.42");
+    // 命令解析出的实际值随结果一起回给界面（「自动 / 跟随全局」后面补的括号里的值）
+    expect(res.effective?.ctxSize).toBe(12288);
   });
 
   test("clear 后回到没存过；空 model 报错不抛", async () => {
