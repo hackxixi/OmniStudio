@@ -58,6 +58,25 @@ for (const key of DOM_GLOBALS) {
 /** 每次 updateSettings 的补丁，用来确认保存了哪些键。 */
 const settingsPatches: Record<string, string>[] = [];
 let proxyStatusCalls = 0;
+/** getDownloadSources 的调用参数（确认「重新检测」带 refresh:true）。 */
+const planCalls: ({ refresh?: boolean } | undefined)[] = [];
+
+/** 国内加速计划：HF 走 hf-mirror、PyPI 走阿里云、GitHub 走 gh-proxy。 */
+const CN_PLAN = {
+  mode: "cn" as const,
+  decidedBy: "probe" as const,
+  cnLocale: true,
+  modelSource: "modelscope" as const,
+  hfEndpoints: ["https://hf-mirror.com", "https://huggingface.co"],
+  pypiIndexes: ["https://mirrors.aliyun.com/pypi/simple", "https://pypi.org/simple"],
+  githubPrefixes: ["https://gh-proxy.com/", ""],
+  homebrewEnv: {},
+  probes: [
+    { url: "https://huggingface.co", ok: false, latencyMs: null, kind: "hf" as const, official: true },
+    { url: "https://hf-mirror.com", ok: true, latencyMs: 120, kind: "hf" as const, official: false },
+  ],
+  at: 0,
+};
 
 mock.module("@lib/rpc", () => ({
   rpcClient: {
@@ -74,6 +93,10 @@ mock.module("@lib/rpc", () => ({
       };
     },
     testProxy: async () => ({ ok: true, url: "http://127.0.0.1:7890", source: "custom", latencyMs: 42, status: 200 }),
+    getDownloadSources: async (params?: { refresh?: boolean }) => {
+      planCalls.push(params);
+      return CN_PLAN;
+    },
     updateSettings: async ({ settings }: { settings: Record<string, string> }) => {
       settingsPatches.push(settings);
       return { ok: true };
@@ -196,5 +219,40 @@ test("「允许访问本地网络地址」关掉后，局域网采样改走代�
   });
   // 云端两个 + 局域网一个 = 3 行走代理，只有本地推理服务直连。
   expect(tab.viaProxy()).toBe(3);
+  await tab.cleanup();
+});
+
+test("下载源：显示当前计划（模式 / 决定方式 / 各类首选源），明细可展开", async () => {
+  const tab = await renderTab({ DOWNLOAD_REGION: "auto" });
+  const summary = tab.container.querySelector('[data-slot="download-plan-summary"]')?.textContent ?? "";
+  expect(summary).toContain("当前：国内加速（自动检测）");
+  expect(summary).toContain("模型：魔搭");
+  expect(summary).toContain("HF：hf-mirror.com");
+  expect(summary).toContain("PyPI：阿里云");
+  expect(summary).toContain("GitHub：gh-proxy.com");
+  // 明细默认收起，点开后逐行给出可达与延迟
+  expect(tab.container.querySelectorAll('[data-slot="download-probe"]')).toHaveLength(0);
+  const toggle = [...tab.container.querySelectorAll("button")].find((b) => b.textContent?.includes(zh("settings.download.details")));
+  await act(async () => {
+    toggle!.click();
+  });
+  const rows = [...tab.container.querySelectorAll('[data-slot="download-probe"]')];
+  expect(rows).toHaveLength(2);
+  expect(rows[0]!.getAttribute("data-ok")).toBe("false");
+  expect(rows[1]!.textContent).toContain("120 ms");
+  await tab.cleanup();
+});
+
+test("下载源：「重新检测」带 refresh:true 重新探测", async () => {
+  planCalls.length = 0;
+  const tab = await renderTab({});
+  const button = [...tab.container.querySelectorAll("button")].find((b) => b.textContent?.includes(zh("settings.download.recheck")));
+  await act(async () => {
+    button!.click();
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(planCalls.some((p) => p?.refresh === true)).toBe(true);
   await tab.cleanup();
 });

@@ -9,6 +9,7 @@ import { DEFAULT_INFERENCE_PORT } from "../../shared/server-info";
 import { VOICE_CALL_OMNI_DEFAULT_MODEL } from "../../shared/voice-call-omni";
 import { encryptSecret, isEncryptedSecret, tryDecryptSecret } from "../secrets";
 import { logEvent } from "../app-log";
+import { DOWNLOAD_REGION_VALUES } from "../../shared/net-sources";
 
 export type SettingsKey =
   | "SETUP_COMPLETE"
@@ -91,6 +92,12 @@ export type SettingsKey =
   | "PROXY_URL"
   /** 「允许访问本地网络地址」：开（默认）= 局域网直连，关 = 连局域网也走代理。 */
   | "PROXY_ALLOW_LOCAL_NETWORK"
+  // 下载源（设置 → 通用，见 bun/net-sources.ts）：auto = 探测决定走国内加速还是官方直连，
+  // cn / global = 强制。下面三个是高级覆盖：填了就排在对应列表最前（空串 = 不覆盖）。
+  | "DOWNLOAD_REGION"
+  | "DOWNLOAD_HF_ENDPOINT"
+  | "DOWNLOAD_PYPI_INDEX"
+  | "DOWNLOAD_GITHUB_MIRROR"
   | "MAX_VLLM_RETRIES"
   | "MAX_VLLM_FAILURE_RETRIES"
   | "PAGE_CONCURRENCY"
@@ -420,6 +427,10 @@ const DEFAULTS: Record<SettingsKey, string> = {
   PROXY_MODE: "system",
   PROXY_URL: "",
   PROXY_ALLOW_LOCAL_NETWORK: "1",
+  DOWNLOAD_REGION: "auto",
+  DOWNLOAD_HF_ENDPOINT: "",
+  DOWNLOAD_PYPI_INDEX: "",
+  DOWNLOAD_GITHUB_MIRROR: "",
   MAX_VLLM_RETRIES: "6",
   MAX_VLLM_FAILURE_RETRIES: "0",
   PAGE_CONCURRENCY: "3",
@@ -434,6 +445,8 @@ const DEFAULTS: Record<SettingsKey, string> = {
   MLX_MODEL: "",
   MLX_CACHE_SIZE_GB: "8",
   // 国内环境优先走 hf-mirror，置空则使用 HuggingFace 官方。
+  // 注意：下载源已统一由 bun/net-sources.ts 按探测结果决定（HF_ENDPOINT 见 sourceEnv），
+  // 这个键只为兼容老用户的 MLX 配置保留，别在新代码里读它。
   MLX_HF_ENDPOINT: "https://hf-mirror.com",
   VLLM_MAX_MODEL_LEN: "8192",
   VLLM_TENSOR_PARALLEL_SIZE: "1",
@@ -872,6 +885,10 @@ export function updateSettings(values: Record<string, string>) {
       key === "SERVER_FLASH_ATTN" &&
       !(FLASH_ATTN_SETTING_VALUES as readonly string[]).includes(value)
     ) {
+      continue;
+    }
+    // 下载源只认三态（读侧 net-sources 也会把非法值当 auto，这里先拒，免得界面显示错位）。
+    if (key === "DOWNLOAD_REGION" && !(DOWNLOAD_REGION_VALUES as readonly string[]).includes(value)) {
       continue;
     }
     // SERVER_FLASH_ATTN_EFFECTIVE 是程序状态（上次启动的实际值），不走枚举白名单，

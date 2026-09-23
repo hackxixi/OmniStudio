@@ -8,7 +8,14 @@ import {
   fetchAssetFromSources,
   githubRawUrls,
   githubReleaseUrls,
+  officialWithMirrors,
 } from "./mirror-download";
+import { __resetNetSourcesForTest, __setSourcePlanForTest, decidePlan } from "./net-sources";
+
+/** 不跑探测：直接给一份「国内加速 / 官方直连」计划（镜像顺序为清单原序）。 */
+function usePlan(mode: "cn" | "global"): void {
+  __setSourcePlanForTest(decidePlan({ region: mode, cnLocale: mode === "cn", probes: [] }));
+}
 
 const realFetch = globalThis.fetch;
 
@@ -46,21 +53,22 @@ function install(fn: Handler): void {
 
 beforeEach(() => {
   clearSourceProbeCache();
+  // 下面的下载用例都模拟「直连 GitHub 不通」，对应国内加速计划（镜像在前）。
+  usePlan("cn");
   dir = mkdtempSync(path.join(tmpdir(), "omni-mirror-"));
   dest = path.join(dir, "asset.bin");
 });
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  __resetNetSourcesForTest();
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe("候选链路排序", () => {
-  test("直连 GitHub 不通：镜像在前，直连降到最后兜底", async () => {
-    install((url) => {
-      const r = githubDown(url);
-      if (r) return r;
-      throw new Error("不该走到这里");
+describe("候选链路排序（按下载源计划）", () => {
+  test("国内加速：镜像在前，直连降到最后兜底", async () => {
+    install(() => {
+      throw new Error("排序不该发请求");
     });
     const urls = await githubReleaseUrls("o/r", "v1", "a.tgz");
     expect(urls).toHaveLength(GITHUB_MIRRORS.length + 1);
@@ -70,25 +78,52 @@ describe("候选链路排序", () => {
     expect(urls[urls.length - 1]).toBe("https://github.com/o/r/releases/download/v1/a.tgz");
   });
 
-  test("直连 GitHub 可达：直连排第一（海外用户不必绕镜像）", async () => {
-    install((url) => {
-      if (url === "https://github.com/robots.txt") return reply(blob(8));
-      throw new Error("不该走到这里");
+  test("官方直连：直连排第一（海外 / 开代理的用户不必绕镜像）", async () => {
+    usePlan("global");
+    install(() => {
+      throw new Error("排序不该发请求");
     });
     const urls = await githubReleaseUrls("o/r", "v1", "a.tgz");
     expect(urls[0]).toBe("https://github.com/o/r/releases/download/v1/a.tgz");
+    expect(urls).toHaveLength(GITHUB_MIRRORS.length + 1);
   });
 
-  test("raw 文件多一条 jsDelivr（独立 CDN），且排在直连兜底之前", async () => {
-    install((url) => {
-      const r = githubDown(url);
-      if (r) return r;
-      throw new Error("不该走到这里");
-    });
+  test("raw 文件多一条 jsDelivr（独立 CDN）：国内加速时排在直连兜底之前", async () => {
     const urls = await githubRawUrls("tesseract-ocr/tessdata_fast", "main", "eng.traineddata");
     const jsdelivr = "https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_fast@main/eng.traineddata";
+    const direct = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata";
     expect(urls).toContain(jsdelivr);
-    expect(urls.indexOf(jsdelivr)).toBeLessThan(urls.indexOf("https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata"));
+    expect(urls.indexOf(jsdelivr)).toBeLessThan(urls.indexOf(direct));
+    expect(urls[urls.length - 1]).toBe(direct);
+  });
+
+  test("raw 文件在官方直连时：直连第一，jsDelivr 垫底", async () => {
+    usePlan("global");
+    const urls = await githubRawUrls("o/r", "main", "f.txt");
+    expect(urls[0]).toBe("https://github.com/o/r/raw/main/f.txt");
+    expect(urls[urls.length - 1]).toBe("https://cdn.jsdelivr.net/gh/o/r@main/f.txt");
+  });
+
+  test("非 GitHub 源：国内加速直接镜像在前，不探测官方", async () => {
+    install(() => {
+      throw new Error("国内加速不该探测");
+    });
+    expect(await officialWithMirrors("https://example.com/a.bin", ["https://m.example.cn/a.bin"])).toEqual([
+      "https://m.example.cn/a.bin",
+      "https://example.com/a.bin",
+    ]);
+  });
+
+  test("非 GitHub 源：官方直连且官方可达时直连在前", async () => {
+    usePlan("global");
+    install((url) => {
+      if (url === "https://example.com/robots.txt") return reply(blob(8));
+      throw new Error("不该走到这里");
+    });
+    expect(await officialWithMirrors("https://example.com/a.bin", ["https://m.example.cn/a.bin"])).toEqual([
+      "https://example.com/a.bin",
+      "https://m.example.cn/a.bin",
+    ]);
   });
 });
 

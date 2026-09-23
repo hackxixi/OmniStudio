@@ -1,6 +1,16 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, CircleAlertIcon, GlobeIcon, LoaderIcon, NetworkIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CircleAlertIcon,
+  GlobeIcon,
+  LoaderIcon,
+  NetworkIcon,
+  RefreshCwIcon,
+  XIcon,
+} from "lucide-react";
 
 import { rpcClient } from "@lib/rpc";
 import { Button } from "@ui/button";
@@ -24,6 +34,11 @@ import {
   type ProxyConfig,
   type ProxyMode,
 } from "@/shared/proxy";
+import {
+  DOWNLOAD_REGION_VALUES,
+  type DownloadRegionSetting,
+  type SourcePlan,
+} from "@/shared/net-sources";
 import { cn } from "@/mainview/lib/utils";
 import { PageHeader, SettingsSection, SettingRow } from "@components/setting-ui";
 
@@ -274,6 +289,180 @@ export function GeneralTab({
       </SettingsSection>
 
       <p className="text-[11px] text-muted-foreground">{t("settings.proxy.updateHint")}</p>
+
+      <DownloadSourcesSection form={form} updateField={updateField} />
     </div>
+  );
+}
+
+type TFn = ReturnType<typeof useT>;
+
+/** 源地址 → 界面上给人看的短名（国内镜像用常见叫法，其余显示主机名）。 */
+function sourceLabel(url: string, t: TFn): string {
+  if (url === "") return t("settings.download.direct");
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    // 用户填的覆盖地址不一定是合法 URL，原样显示
+  }
+  if (host === "mirrors.aliyun.com") return t("settings.download.aliyun");
+  if (host === "pypi.tuna.tsinghua.edu.cn") return t("settings.download.tuna");
+  if (host === "mirrors.ustc.edu.cn") return `${t("settings.download.ustc")} Homebrew`;
+  if (host === "pypi.org" || host === "huggingface.co" || host === "github.com") {
+    return `${host}（${t("settings.download.official")}）`;
+  }
+  return host;
+}
+
+/**
+ * 设置 → 通用：下载源。
+ *
+ * 选项改了立刻写库并重新取计划（没有单独的保存按钮：这是个三选一，选了就是要用）；
+ * 计划由主进程探测得出（bun/net-sources.ts），这里只展示结论与探测明细，
+ * 让「为什么走了镜像 / 为什么没走」有据可查。
+ */
+function DownloadSourcesSection({
+  form,
+  updateField,
+}: {
+  form: Record<string, string>;
+  updateField: (key: string, value: string) => void;
+}) {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const [showDetails, setShowDetails] = useState(false);
+
+  const region: DownloadRegionSetting = (DOWNLOAD_REGION_VALUES as readonly string[]).includes(
+    form.DOWNLOAD_REGION ?? "",
+  )
+    ? (form.DOWNLOAD_REGION as DownloadRegionSetting)
+    : "auto";
+
+  const planQuery = useQuery({
+    queryKey: ["download-sources"],
+    queryFn: () => rpcClient.getDownloadSources({}),
+    // 主进程自己缓存 10 分钟；界面上只在进页面 / 改设置 / 点「重新检测」时取。
+    staleTime: 60_000,
+  });
+
+  const recheckMutation = useMutation({
+    mutationFn: () => rpcClient.getDownloadSources({ refresh: true }),
+    onSuccess: (plan) => queryClient.setQueryData(["download-sources"], plan),
+  });
+
+  const regionMutation = useMutation({
+    mutationFn: (value: DownloadRegionSetting) =>
+      rpcClient.updateSettings({ settings: { DOWNLOAD_REGION: value } }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+      // 主进程按设置指纹作废缓存，这里重取即是新设置下的计划。
+      queryClient.invalidateQueries({ queryKey: ["download-sources"] });
+    },
+  });
+
+  const plan: SourcePlan | undefined = planQuery.data;
+  const busy = planQuery.isFetching || recheckMutation.isPending || regionMutation.isPending;
+  const error = recheckMutation.error ?? planQuery.error;
+
+  const summary = plan
+    ? [
+        t("settings.download.current", {
+          mode: t(`settings.download.mode.${plan.mode}`),
+          by: t(`settings.download.by.${plan.decidedBy}`),
+        }),
+        `${t("settings.download.model")}：${t(`settings.download.modelSource.${plan.modelSource}`)}`,
+        `HF：${sourceLabel(plan.hfEndpoints[0] ?? "", t)}`,
+        `PyPI：${sourceLabel(plan.pypiIndexes[0] ?? "", t)}`,
+        `GitHub：${sourceLabel(plan.githubPrefixes[0] ?? "", t)}`,
+      ].join(" · ")
+    : null;
+
+  return (
+    <SettingsSection title={t("settings.download.title")} description={t("settings.download.desc")}>
+      <SettingRow title={t("settings.download.region")} description={t("settings.download.regionDesc")}>
+        <Select
+          value={region}
+          onValueChange={(value) => {
+            updateField("DOWNLOAD_REGION", value);
+            regionMutation.mutate(value as DownloadRegionSetting);
+          }}
+        >
+          <SelectTrigger className="h-8 w-56 text-xs" aria-label={t("settings.download.region")}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {DOWNLOAD_REGION_VALUES.map((v) => (
+              <SelectItem key={v} value={v}>
+                {t(`settings.download.region.${v}`)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SettingRow>
+
+      <div className="flex items-start gap-3 px-4 py-3">
+        <p data-slot="download-plan-summary" className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+          {summary ?? (error ? t("settings.download.error", { error: String(error) }) : t("settings.download.loading"))}
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-7 shrink-0 text-xs"
+          disabled={busy}
+          onClick={() => recheckMutation.mutate()}
+        >
+          {recheckMutation.isPending ? (
+            <LoaderIcon data-icon="inline-start" className="animate-spin" />
+          ) : (
+            <RefreshCwIcon data-icon="inline-start" />
+          )}
+          {recheckMutation.isPending ? t("settings.download.checking") : t("settings.download.recheck")}
+        </Button>
+      </div>
+
+      {plan && plan.probes.length > 0 && (
+        <div className="flex flex-col gap-1 px-4 pb-3">
+          <button
+            type="button"
+            className="flex w-fit items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+            onClick={() => setShowDetails((v) => !v)}
+            aria-expanded={showDetails}
+          >
+            {showDetails ? <ChevronDownIcon className="size-3" /> : <ChevronRightIcon className="size-3" />}
+            {showDetails ? t("settings.download.hideDetails") : t("settings.download.details")}
+          </button>
+          {showDetails && (
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="text-left text-muted-foreground">
+                  <th className="py-0.5 font-normal">{t("settings.download.col.host")}</th>
+                  <th className="w-16 py-0.5 font-normal">{t("settings.download.col.ok")}</th>
+                  <th className="w-16 py-0.5 text-right font-normal">{t("settings.download.col.latency")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plan.probes.map((p) => (
+                  <tr key={p.url} data-slot="download-probe" data-ok={p.ok ? "true" : "false"}>
+                    <td className="truncate py-0.5 font-mono text-muted-foreground">{sourceLabel(p.url, t)}</td>
+                    <td className="py-0.5">
+                      {p.ok ? (
+                        <CheckIcon className="size-3 text-primary" aria-label={t("settings.download.reachable")} />
+                      ) : (
+                        <XIcon className="size-3 text-destructive" aria-label={t("settings.download.unreachable")} />
+                      )}
+                    </td>
+                    <td className="py-0.5 text-right font-mono text-muted-foreground">
+                      {p.latencyMs != null ? `${p.latencyMs} ms` : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </SettingsSection>
   );
 }

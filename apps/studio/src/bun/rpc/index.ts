@@ -176,6 +176,8 @@ import * as Hooks from "../agent-hooks";
 import * as CloudProviders from "../cloud-providers";
 import * as Proxy from "../proxy";
 import type { ProxyStatus, ProxyTestResult } from "../proxy";
+import * as NetSources from "../net-sources";
+import type { SourcePlan } from "../../shared/net-sources";
 import type {
   CloudModelEntry,
   CloudProviderInfo,
@@ -495,6 +497,14 @@ export type AppRPC = {
       testProxy: {
         params: Proxy.ProxyTestOverride | undefined;
         response: ProxyTestResult;
+      };
+      /**
+       * 下载源（设置 → 通用）：当前路由结论 —— 国内加速还是官方直连、各类下载先走哪个源。
+       * refresh = 忽略缓存重新探测（「重新检测」按钮）。
+       */
+      getDownloadSources: {
+        params: { refresh?: boolean } | undefined;
+        response: SourcePlan;
       };
       checkConnection: {
         params: { baseUrl?: string; apiKey?: string } | undefined;
@@ -3393,6 +3403,8 @@ const rpcRequests: NonNullable<
 
   testProxy: async (params) => Proxy.testProxyConnection(params),
 
+  getDownloadSources: async (params) => NetSources.getSourcePlan({ refresh: params?.refresh === true }),
+
   checkConnection: async (params) => {
     const baseUrl = (params?.baseUrl ?? getSetting("VLLM_API_BASE") ?? "").trim();
     const apiKey = params?.apiKey ?? getSetting("VLLM_API_KEY");
@@ -4910,14 +4922,15 @@ const rpcRequests: NonNullable<
   // 模型市场
   searchMarketModels: async ({ query, page, source, format }) => {
     const p = page ?? 1;
-    return source === "huggingface"
+    // 没指定平台时跟下载源路由走（国内默认魔搭、海外默认 Hugging Face），不再写死魔搭
+    return (source ?? NetSources.peekSourcePlan().modelSource) === "huggingface"
       ? await HuggingFace.searchModels(query, p, 20, format)
       : await ModelScope.searchModels(query, p, 20, format);
   },
 
   listModelFiles: async ({ repo, source }) => {
     const files =
-      source === "huggingface"
+      (source ?? NetSources.peekSourcePlan().modelSource) === "huggingface"
         ? await HuggingFace.listRepoFiles(repo)
         : await ModelScope.listRepoFiles(repo);
     return { files };
