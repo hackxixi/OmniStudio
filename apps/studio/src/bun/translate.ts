@@ -3,7 +3,7 @@ import { db } from "./db";
 import { translationRecords } from "./db/schema";
 import { getSetting } from "./db/settings";
 import { getChatModelLabel, getChatRequestModelId } from "./chat-model";
-import { ensureServerReady, getChatBaseUrl, maxOutputTokens } from "./chat";
+import { ensureServerReady, getChatBaseUrl, resolveMaxOutputTokens } from "./chat";
 import { recordUsage } from "./stats";
 import { currentUpstream, providerLabelFor, recordUsageEvent } from "./usage";
 import { logEvent } from "./app-log";
@@ -184,7 +184,15 @@ export async function runTranslation(params: {
           { role: "user", content: text },
         ],
         // 译文长度与原文同量级；显式给上限，免得 mlx-lm 默认的 512 被推理模型的思考吃光。
-        max_tokens: maxOutputTokens(),
+        max_tokens: await resolveMaxOutputTokens({
+          base,
+          model,
+          headers,
+          promptMessages: [
+            { role: "system", content: instruction },
+            { role: "user", content: text },
+          ],
+        }),
         stream: false,
       }),
       signal: AbortSignal.timeout(600_000),

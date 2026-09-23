@@ -115,7 +115,8 @@ globalThis.fetch = mock(async (_url: unknown, init: unknown) => {
 
 const { createConversation, sendMessage, deleteMessage, regenerateMessage, translateMessage, getConversation, onChatChunk, onChatDone, onChatStats, onChatMessageStarted, titleFromMessage } = await import("./chat");
 const { clearAppLog, readAppLogsInMemory } = await import("./app-log");
-const { forkConversation, stopChatGeneration } = await import("./chat");
+const { forkConversation, stopChatGeneration, maxOutputTokens, resolveMaxOutputTokens } = await import("./chat");
+const { resetServedContextCache } = await import("./served-context");
 
 afterAll(() => {
   // 恢复全局 fetch，避免把 mock 泄漏给同一批次运行的其他测试文件。
@@ -450,4 +451,113 @@ test("停止生成：保留已生成的部分、标上「已停止」，不当�
 test("没有在生成时按停止：如实回 ok:false，不报错", () => {
   const conv = createConversation(undefined, "chat");
   expect(stopChatGeneration(conv.id)).toEqual({ ok: false });
+});
+
+// ---------------------------------------------------------------------------
+// 本地 max_tokens：以正在跑的实例的真实窗口为准（/props、max_model_len），
+// 探不到才退回 SERVER_CTX_SIZE。以前只看设置，自动规划 / 多 slot 下会超出真实窗口。
+// ---------------------------------------------------------------------------
+
+/** 按路径分流的假本地服务；记录请求过的 URL 与 chat 请求体里的 max_tokens。 */
+function fakeLocalServer(opts: { props?: unknown; models?: unknown }) {
+  const seen: { urls: string[]; maxTokens: number[] } = { urls: [], maxTokens: [] };
+  globalThis.fetch = mock(async (url: unknown, init: unknown) => {
+    const u = String(url);
+    seen.urls.push(u);
+    if (u.endsWith("/props")) {
+      return opts.props ? Response.json(opts.props) : new Response("", { status: 404 });
+    }
+    if (u.endsWith("/v1/models")) {
+      return opts.models ? Response.json(opts.models) : new Response("", { status: 404 });
+    }
+    const body = JSON.parse(String((init as { body?: unknown }).body ?? "{}"));
+    if (typeof body.max_tokens === "number") seen.maxTokens.push(body.max_tokens);
+    const enc = new TextEncoder();
+    let i = 0;
+    return new Response(
+      new ReadableStream({
+        pull(c) {
+          if (i < sseChunks.length) c.enqueue(enc.encode(sseChunks[i++]));
+          else c.close();
+        },
+      }),
+      { status: 200 },
+    );
+  }) as never;
+  return seen;
+}
+
+test("本地 max_tokens：llama.cpp 用 /props 的每 slot n_ctx（小于 SERVER_CTX_SIZE 时不超窗）", async () => {
+  resetServedContextCache();
+  const realFetch = globalThis.fetch;
+  const seen = fakeLocalServer({ props: { default_generation_settings: { n_ctx: 6144 }, total_slots: 4 } });
+  try {
+    await withSetting("SERVER_MODE", "local", () =>
+      withSetting("SERVER_CTX_SIZE", "65536", async () => {
+        // 探测前同步版本只能用兜底（设置值）
+        expect(maxOutputTokens()).toBe(65536);
+        expect(await resolveMaxOutputTokens()).toBe(6144);
+        expect(seen.urls[0]).toBe("http://127.0.0.1:18080/props");
+        // 探测结果进了缓存：同步版本（translate / miniapps）也跟上
+        expect(maxOutputTokens()).toBe(6144);
+        // 缓存期内不重复探测
+        await resolveMaxOutputTokens();
+        expect(seen.urls.filter((u) => u.endsWith("/props"))).toHaveLength(1);
+      }),
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetServedContextCache();
+  }
+});
+
+test("本地 max_tokens：vLLM 按 max_model_len 扣掉 prompt", async () => {
+  resetServedContextCache();
+  const realFetch = globalThis.fetch;
+  fakeLocalServer({ models: { data: [{ id: "test-model", max_model_len: 8192 }] } });
+  try {
+    await withSetting("SERVER_MODE", "local", async () => {
+      const out = await resolveMaxOutputTokens({ promptMessages: [{ role: "user", content: "x".repeat(8000) }] });
+      expect(out).toBeLessThan(8192 - 2000);
+      expect(out).toBeGreaterThan(0);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    resetServedContextCache();
+  }
+});
+
+test("本地 max_tokens：探不到窗口（mlx-lm）退回 SERVER_CTX_SIZE；云端恒为 8k 不探测", async () => {
+  resetServedContextCache();
+  const realFetch = globalThis.fetch;
+  const seen = fakeLocalServer({ models: { data: [{ id: "test-model" }] } });
+  try {
+    await withSetting("SERVER_MODE", "local", () =>
+      withSetting("SERVER_CTX_SIZE", "16384", async () => {
+        expect(await resolveMaxOutputTokens()).toBe(16384);
+      }),
+    );
+    seen.urls.length = 0;
+    expect(await resolveMaxOutputTokens()).toBe(8192);
+    expect(seen.urls).toHaveLength(0);
+  } finally {
+    globalThis.fetch = realFetch;
+    resetServedContextCache();
+  }
+});
+
+test("云端发消息：max_tokens 仍是 8k，且不去探测 /props", async () => {
+  resetServedContextCache();
+  const realFetch = globalThis.fetch;
+  const seen = fakeLocalServer({ props: { default_generation_settings: { n_ctx: 2048 } } });
+  try {
+    const conv = createConversation(undefined, "chat");
+    const res = await sendMessage(conv.id, "hello");
+    expect(res.ok).toBe(true);
+    expect(seen.maxTokens).toEqual([8192]);
+    expect(seen.urls.some((u) => u.endsWith("/props"))).toBe(false);
+  } finally {
+    globalThis.fetch = realFetch;
+    resetServedContextCache();
+  }
 });

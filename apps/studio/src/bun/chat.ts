@@ -7,7 +7,8 @@ import { getSetting, getActiveServerPort } from "./db/settings";
 import { getChatModelLabel, getChatProviderLabel, getChatRequestModelId } from "./chat-model";
 import { mergeSystemMessages, parseChatDelta } from "./chat-messages";
 import { computeTokenStats, parseMessageStats, type MessageStats } from "./chat-stats";
-import { estimateMessagesTokens, estimateTokens } from "../shared/token-estimate";
+import { estimateMessagesTokens, estimateTokens, type MessageLike } from "../shared/token-estimate";
+import { getServedContext, invalidateServedContext, localMaxTokens, peekServedContext } from "./served-context";
 import { CLOUD_MAX_OUTPUT_TOKENS, LOCAL_CTX_DEFAULT } from "../shared/model-context";
 import { chatImageDir, getImagesBaseDir } from "./image-server";
 import { logEvent } from "./app-log";
@@ -565,25 +566,74 @@ async function probeLocalServer(): Promise<boolean> {
  *   （deepseek-chat 只让输出 8k），按窗口给会被 400 拒掉；而且这里**不能**读
  *   `SERVER_CTX_SIZE` —— 那是本地 llama.cpp 的 KV 旋钮，本地调到 128k 后切到云端，
  *   发出的 `max_tokens: 131072` 必然被厂商拒。
- * - **本地**：优先用已安装模型的 contextLength（从 config.json 解析），否则
- *   `SERVER_CTX_SIZE`（默认 8192），再封顶 256K。
+ * - **本地**：以正在跑的实例**实际**的窗口为准（llama.cpp `/props` 的每 slot n_ctx、
+ *   vLLM / SGLang 的 `max_model_len`，见 `served-context.ts`）—— 自动规划出的 ctx、
+ *   `--parallel` 均分后的 slot 窗口都可能小于设置值，按设置给会让 vLLM 整请求 400。
+ *   探不到（mlx-lm 等）才用旧口径：已安装模型 config.json 的 contextLength 与
+ *   `SERVER_CTX_SIZE`（默认 8192）取大，夹在 [1024, 256K]。
+ *
+ * 这是**同步**版本（translate / miniapps 在用）：只读探测缓存，不发请求；
+ * 对话主链路用 `resolveMaxOutputTokens`（会探测并带上 prompt 估算）。
  */
 export function maxOutputTokens(): number {
   if (getSetting("SERVER_MODE") !== "local") return CLOUD_MAX_OUTPUT_TOKENS;
-
-  // 尝试从当前模型读取 contextLength
   const model = getChatRequestModelId();
-  let ctx = Number(getSetting("SERVER_CTX_SIZE")) || LOCAL_CTX_DEFAULT;
+  const base = getChatBaseUrl();
+  const served = model && base ? peekServedContext(base, model) : undefined;
+  return localMaxTokens({ served, fallbackWindow: fallbackLocalContext(model) });
+}
 
-  if (model) {
-    const models = ModelStore.listInstalledModels();
-    const currentModel = models.find((m: ModelStore.InstalledModel) => m.runtimeTarget === model || m.path === model);
-    if (currentModel?.contextLength && currentModel.contextLength > ctx) {
-      ctx = currentModel.contextLength;
-    }
+/**
+ * 异步版本：本地模式先问正在跑的实例拿真实窗口（按 base+模型缓存 30s），再按窗口来源
+ * 决定要不要给 prompt 让位（`localMaxTokens`）。云端同 `maxOutputTokens`。
+ */
+export async function resolveMaxOutputTokens(
+  opts: { base?: string; model?: string; headers?: Record<string, string>; promptMessages?: MessageLike[] } = {},
+): Promise<number> {
+  if (getSetting("SERVER_MODE") !== "local") return CLOUD_MAX_OUTPUT_TOKENS;
+  const model = opts.model ?? getChatRequestModelId();
+  const base = opts.base ?? getChatBaseUrl();
+  const served = model && base ? await getServedContext(base, model, opts.headers) : null;
+  return localMaxTokens({
+    served,
+    fallbackWindow: fallbackLocalContext(model),
+    promptMessages: opts.promptMessages,
+  });
+}
+
+/** 兜底窗口缓存：`listInstalledModels` 要扫目录、逐个读 config.json，不能每条消息都跑一遍。 */
+const FALLBACK_CTX_TTL_MS = 60_000;
+let fallbackCtxCache: { key: string; value: number; expiresAt: number } | null = null;
+
+/**
+ * 探不到实例窗口时的旧口径：`SERVER_CTX_SIZE` 与已安装模型 config.json 的 contextLength 取大。
+ * GGUF 没有 config.json（`<x.gguf>/config.json` 永远不存在），直接跳过扫描、只看设置。
+ */
+function fallbackLocalContext(model: string | null | undefined): number {
+  const settingCtx = Number(getSetting("SERVER_CTX_SIZE")) || LOCAL_CTX_DEFAULT;
+  if (!model || /\.gguf$/i.test(model)) return settingCtx;
+
+  const key = `${model}\u0000${settingCtx}`;
+  const now = Date.now();
+  if (fallbackCtxCache && fallbackCtxCache.key === key && fallbackCtxCache.expiresAt > now) {
+    return fallbackCtxCache.value;
   }
+  let ctx = settingCtx;
+  try {
+    const current = ModelStore.listInstalledModels().find(
+      (m: ModelStore.InstalledModel) => m.runtimeTarget === model || m.path === model,
+    );
+    if (current?.contextLength && current.contextLength > ctx) ctx = current.contextLength;
+  } catch {
+    // 扫描失败不影响发消息：退回设置值。
+  }
+  fallbackCtxCache = { key, value: ctx, expiresAt: now + FALLBACK_CTX_TTL_MS };
+  return ctx;
+}
 
-  return Math.min(Math.max(1024, ctx), 262144);
+/** 测试用：清掉兜底窗口缓存。 */
+export function resetLocalContextCacheForTest(): void {
+  fallbackCtxCache = null;
 }
 
 /**
@@ -664,18 +714,20 @@ async function streamAssistantReply(opts: {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey && apiKey !== "EMPTY") headers.Authorization = `Bearer ${apiKey}`;
 
+  // 时间 / 场景提示词 / 检索 / 知识库 / 记忆都是 system：Qwen 系模板只允许开头一条，
+  // 多条会被它整请求拒掉（"System message must be at the beginning."），这里合并成一条。
+  const requestMessages = mergeSystemMessages([
+    ...(opts.extraSystem ? [{ role: "system", content: opts.extraSystem }] : []),
+    currentTimeSystemMessage(),
+    ...payloadMessages,
+  ]);
   const payload = {
     model,
-    // 时间 / 场景提示词 / 检索 / 知识库 / 记忆都是 system：Qwen 系模板只允许开头一条，
-    // 多条会被它整请求拒掉（"System message must be at the beginning."），这里合并成一条。
-    messages: mergeSystemMessages([
-      ...(opts.extraSystem ? [{ role: "system", content: opts.extraSystem }] : []),
-      currentTimeSystemMessage(),
-      ...payloadMessages,
-    ]),
-    // 生成上限跟随上下文设置：本地引擎各有默认值，mlx-lm 只有 512 —— 推理模型光思考
+    messages: requestMessages,
+    // 生成上限必须显式给：本地引擎各有默认值，mlx-lm 只有 512 —— 推理模型光思考
     // 就能用光它，正文一个字都出不来（界面上就是「空白回复 + 0 tokens」）。
-    max_tokens: maxOutputTokens(),
+    // 本地按实例实际窗口算（vLLM 还要给 prompt 让位），见 resolveMaxOutputTokens。
+    max_tokens: await resolveMaxOutputTokens({ base, model, headers, promptMessages: requestMessages }),
     stream: true,
     // llama.cpp / Qwen3 等支持：通话等场景要求直接回答，不打思考草稿。
     ...(opts.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}),
@@ -824,6 +876,8 @@ async function streamAssistantReply(opts: {
             }
           })()
         : `HTTP ${res.status}`;
+      // 请求被拒可能是实例重启换了窗口（max_tokens 超窗 400 等）：作废窗口缓存，下次重新探测。
+      invalidateServedContext(base, model);
       throw new Error(msg);
     }
 
