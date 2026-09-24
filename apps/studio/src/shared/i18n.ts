@@ -359,6 +359,13 @@ const zh: Record<string, string> = {
   "settings.agentCaps.vision.current": "当前模型",
   "settings.agentCaps.vision.available": "已可用",
   "settings.agentCaps.vision.unavailable": "未启用（当前模型看起来不支持图片输入）",
+  "settings.agentCaps.toolStrategy.title": "工具调用方式",
+  "settings.agentCaps.toolStrategy.desc":
+    "控制 Agent 每回合拿到哪些工具。经典方式把全部工具一次交给模型；精简路由只常驻核心工具，其余按组按需加载。",
+  "settings.agentCaps.toolStrategy.mode": "调用方式",
+  "settings.agentCaps.toolStrategy.classic": "经典（全部工具一次交给模型，适合云端 / 大模型）",
+  "settings.agentCaps.toolStrategy.routed": "精简路由（常驻核心工具，按需加载创作 / 开发 / 已连接应用等工具组，适合本地小模型）",
+  "settings.agentCaps.toolStrategy.hint": "切换只影响之后新开始的回合，Plan 模式不受影响。",
   "settings.permissions.title": "Agent 权限",
   "agent.approval.desc":
     "决定 Agent 执行哪些操作前需要你点一下确认。smart 只拦危险动作（rm -rf、sudo、git push、工作区外访问），manual 每个有副作用的工具都问，auto 全部放行，strict 全部拒绝。",
@@ -4041,6 +4048,13 @@ const en: Record<string, string> = {
   "settings.agentCaps.vision.current": "Current model",
   "settings.agentCaps.vision.available": "Available",
   "settings.agentCaps.vision.unavailable": "Not enabled (the current model does not look multimodal)",
+  "settings.agentCaps.toolStrategy.title": "Tool invocation style",
+  "settings.agentCaps.toolStrategy.desc":
+    "Controls which tools the agent gets each turn. Classic hands the full tool list to the model up front; routed keeps only the core tools resident and loads the rest on demand, grouped.",
+  "settings.agentCaps.toolStrategy.mode": "Invocation style",
+  "settings.agentCaps.toolStrategy.classic": "Classic (all tools up front — cloud / large models)",
+  "settings.agentCaps.toolStrategy.routed": "Routed (core tools resident, load creative / dev / connected-app groups on demand — local small models, shorter prefix, faster first turn)",
+  "settings.agentCaps.toolStrategy.hint": "The change only applies to turns that start afterwards; Plan mode is not affected.",
   "settings.permissions.title": "Agent permissions",
   "agent.approval.desc":
     "Choose which actions the agent may take without asking. smart only gates dangerous ones (rm -rf, sudo, git push, outside the workspace); manual asks for every tool with side effects; auto allows everything; strict denies everything.",

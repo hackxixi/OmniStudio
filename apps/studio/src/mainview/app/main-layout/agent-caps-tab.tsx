@@ -69,6 +69,11 @@ export function AgentCapsTab() {
     mutationFn: (mode: "auto" | "on" | "off") => rpcClient.setAgentCapabilities({ visionTool: mode }),
     onSuccess: invalidate,
   });
+  const setToolStrategy = useMutation({
+    mutationFn: (strategy: "classic" | "routed") =>
+      rpcClient.setAgentCapabilities({ toolStrategy: strategy }),
+    onSuccess: invalidate,
+  });
   const setSnapshots = useMutation({
     mutationFn: (enabled: boolean) => rpcClient.setAgentSnapshots({ enabled }),
     onSuccess: invalidate,
@@ -240,6 +245,54 @@ export function AgentCapsTab() {
             )}
           </span>
         </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t("settings.agentCaps.toolStrategy.title")}
+        description={t("settings.agentCaps.toolStrategy.desc")}
+      >
+        <SettingRow title={t("settings.agentCaps.toolStrategy.mode")} stacked>
+          <Select
+            value={caps?.toolStrategy ?? "classic"}
+            onValueChange={(value) => setToolStrategy.mutate(value as "classic" | "routed")}
+          >
+            <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="classic">
+                {t("settings.agentCaps.toolStrategy.classic")}
+              </SelectItem>
+              <SelectItem value="routed">{t("settings.agentCaps.toolStrategy.routed")}</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-[11px] text-muted-foreground">
+            {t("settings.agentCaps.toolStrategy.hint")}
+          </p>
+        </SettingRow>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t("settings.agentCaps.toolStrategy.title")}
+        description={t("settings.agentCaps.toolStrategy.desc")}
+      >
+        <SettingRow title={t("settings.agentCaps.toolStrategy.mode")}>
+          <Select
+            value={caps?.toolStrategy ?? "classic"}
+            onValueChange={(value) => setToolStrategy.mutate(value as "classic" | "routed")}
+          >
+            <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="classic">{t("settings.agentCaps.toolStrategy.classic")}</SelectItem>
+              <SelectItem value="routed">{t("settings.agentCaps.toolStrategy.routed")}</SelectItem>
+            </SelectContent>
+          </Select>
+        </SettingRow>
+        <p className="border-b px-4 py-3 text-xs text-muted-foreground last:border-b-0">
+          {t("settings.agentCaps.toolStrategy.hint")}
+        </p>
       </SettingsSection>
 
       <SettingsSection

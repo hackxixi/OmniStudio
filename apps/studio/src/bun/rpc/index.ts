@@ -40,6 +40,7 @@ import {
   type AppLogSource,
 } from "../app-log";
 import { LOG_THROTTLE_MS, PROGRESS_THROTTLE_MS, throttleBatch, throttleLatest } from "../throttle";
+import { parseToolStrategy, type AgentToolStrategy } from "../../shared/agent-tool-strategy";
 import * as ServerManager from "../server-manager";
 import type { ServerStatus } from "../server-manager";
 import * as Served from "../model-servers";
@@ -1368,10 +1369,12 @@ export type AppRPC = {
           /** 当前模型看起来能不能收图片（auto 档的实际判定结果）。 */
           visionAvailable: boolean;
           modelName: string;
+          /** 工具调用方式：classic（全部工具一次给模型）/ routed（精简路由）。 */
+          toolStrategy: AgentToolStrategy;
         };
       };
       setAgentCapabilities: {
-        params: { visionTool?: "auto" | "on" | "off" };
+        params: { visionTool?: "auto" | "on" | "off"; toolStrategy?: AgentToolStrategy };
         response: { ok: boolean };
       };
       getAgentInstructions: {
@@ -4541,9 +4544,13 @@ const rpcRequests: NonNullable<
     visionTool: (getSetting("AGENT_VISION_TOOL") as "auto" | "on" | "off") || "auto",
     visionAvailable: chatModelSupportsImages(),
     modelName: getChatModelLabel(),
+    toolStrategy: parseToolStrategy(getSetting("AGENT_TOOL_STRATEGY")),
   }),
-  setAgentCapabilities: async ({ visionTool }) => {
+  setAgentCapabilities: async ({ visionTool, toolStrategy }) => {
     if (visionTool) updateSettings({ AGENT_VISION_TOOL: visionTool });
+    if (toolStrategy !== undefined) {
+      updateSettings({ AGENT_TOOL_STRATEGY: parseToolStrategy(toolStrategy) });
+    }
     return { ok: true };
   },
   getAgentInstructions: async (params) => {

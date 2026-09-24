@@ -245,6 +245,8 @@ export type SettingsKey =
   | "AGENT_GOAL_TOKEN_BUDGET"
   /** 看图工具（view_image）开关：auto / on / off。 */
   | "AGENT_VISION_TOOL"
+  /** 工具调用方式：classic（经典，全部工具一次给模型）/ routed（精简路由，常驻核心 + 按需工具组）。 */
+  | "AGENT_TOOL_STRATEGY"
   /** 回合快照（影子 git 仓库，支持「撤销本轮」）开关。 */
   | "AGENT_SNAPSHOTS"
   /** 影子仓库自动整理的体积阈值（MB，默认 256）。 */
@@ -582,6 +584,8 @@ const DEFAULTS: Record<SettingsKey, string> = {
   AGENT_GOAL_TOKEN_BUDGET: "0",
   /** 看图工具（view_image）：auto = 按模型名猜，on / off = 强制开或关。 */
   AGENT_VISION_TOOL: "auto",
+  /** 工具调用方式：classic = 全部工具一次交给模型；routed = 精简路由（本地小模型前缀更短）。 */
+  AGENT_TOOL_STRATEGY: "classic",
   // 回合快照：影子 git 仓库记下每轮开始前的工作区状态，界面可一键「撤销本轮」。
   AGENT_SNAPSHOTS: "1",
   // 影子仓库维护：占用超过 256MB 或快照条数到顶时自动 git gc（设置页可手动清理）。
