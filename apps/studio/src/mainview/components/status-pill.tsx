@@ -63,24 +63,24 @@ function usageTitleLine(label: string, usage: ResourceUsage, t: (key: string, va
  * 整段含百分比（<130px），最窄时只剩「运行模型数:n」，胶囊永远不会空。
  */
 /**
- * 按资源段数选的容器档位（按钮宽度）。Tailwind 只认字面量 class，所以两套档位写死在这里：
- * 一段（Apple 统一内存）内容约 230px；两段（独显）约 370px，阈值随之放大，
- * 否则两段时剩余量永远挤不下、一段时按钮又空出一截。
+ * 按资源段数选的容器档位。Tailwind 只认字面量 class，所以两套档位写死在这里。
+ * 容器查询量的是按钮**内容区**（宽度减去 px-2 与边框约 18px），阈值按真机量出的内容宽度定：
+ * 一段（Apple 统一内存）全显示约 220px，两段（独显）约 368px；每少一样（剩余量 / 进度条）约省 36px。
  */
 const SEGMENT_TIERS = {
   one: {
-    button: "flex-[0_1_236px]",
-    segment: "@[130px]:flex",
-    pct: "@[130px]:inline",
-    bar: "@[170px]:inline-block",
-    left: "@[230px]:inline",
+    button: "w-[240px]",
+    segment: "@[146px]:flex",
+    pct: "@[146px]:inline",
+    bar: "@[182px]:inline-block",
+    left: "@[220px]:inline",
   },
   two: {
-    button: "flex-[0_1_380px]",
-    segment: "@[190px]:flex",
-    pct: "@[190px]:inline",
-    bar: "@[270px]:inline-block",
-    left: "@[370px]:inline",
+    button: "w-[388px]",
+    segment: "@[222px]:flex",
+    pct: "@[222px]:inline",
+    bar: "@[294px]:inline-block",
+    left: "@[368px]:inline",
   },
 } as const;
 
@@ -231,9 +231,11 @@ export function StatusPill() {
           title={t("console.open")}
           className={cn(
             "flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors hover:bg-muted",
-            // 有余量段时按钮做容器：container-type 让宽度不再由内容撑开，所以给一个可收缩的基准宽，
-            // 顶栏挤的时候按钮变窄，段内按档位依次藏掉剩余量 → 进度条 → 百分比 / 整段。
-            tier && ["@container min-w-[110px] overflow-hidden", tier.button],
+            // 有余量段时按钮做容器：container-type 让宽度不再由内容撑开，所以给一个显式宽度
+            // （用 width 而不是 flex-basis —— 父级 ml-auto 容器按子项的内在宽度收缩，size 包含的
+            // 元素内在宽度为 0，flex-basis 不计入，WebKit 上会被压到 min-w）。shrink 允许顶栏挤时
+            // 变窄，段内按档位依次藏掉剩余量 → 进度条 → 百分比 / 整段。
+            tier && ["@container min-w-[110px] shrink overflow-hidden", tier.button],
           )}
         >
           <div className={cn("size-1.5 flex-none rounded-full", dotClass)} />
