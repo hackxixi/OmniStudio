@@ -207,6 +207,18 @@ Views must be configured in `electrobun.config.ts` to be built and copied into t
   `SYSTEMONE_CLOUD_API_KEY` matches `REMOTE_SECRET_KEY`, so they are ciphertext at rest and
   blanked for web clients. Maintainer doc: docs/jev-systemone.md; bundled skill with examples:
   `builtin-skills/jev-typed-decisions/`.
+- **The Agent has two tool strategies, switched in 设置 → Agent 能力 (`AGENT_TOOL_STRATEGY`)**: `classic`
+  (default, unchanged behavior: every tool in every request) and `routed` (for small local models):
+  `bun/agent-routed-tools.ts` splits the full toolset into a fixed core (`recall` merges knowledge / notes /
+  memory search, `find` merges glob / grep, flow-control tools and `jev_evaluate` are dropped) plus groups
+  (`creation` / `dev` / `mcp` = everything else), and `bun/agent-routing.ts` asks JEV each turn which groups
+  to load (falls back to all groups when JEV is unavailable). Three rules keep it cheap and correct: tool
+  order is fixed and loaded groups are append-only within a session (the inference engine's prefix cache
+  must see byte-identical prefixes); a `load_tools` call only takes effect through
+  `prepareNextTurnWithContext` (the kernel copies the tool list at run start, so mutating
+  `agent.state.tools` mid-run does nothing); and the strategy is part of the session cache key. Plan mode is
+  always classic. The evidence and the rejected alternatives (model-driven tool search, English embeddings)
+  are in `docs/experiments/e5-tool-disclosure/`.
 - **Public exposure goes through `bun/tunnel.ts`, never through `GATEWAY_HOST=0.0.0.0`**:
   Settings → Services → Remote Access runs a supervised `cloudflared` child process
   (`bun/cloudflared.ts` downloads the official binary into `<dataDir>/engines/cloudflared/`;
