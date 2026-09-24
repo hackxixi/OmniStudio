@@ -479,7 +479,7 @@ export async function startControlServer(): Promise<void> {
   try {
     server = Bun.serve({
       unix: sockPath,
-      fetch: async (req) => {
+      fetch: async (req, srv) => {
         if (req.method !== "POST") {
           return new Response("method not allowed", { status: 405 });
         }
@@ -492,6 +492,13 @@ export async function startControlServer(): Promise<void> {
         // 无头执行要能把事件"边跑边吐"给外部脚本：这一条走 NDJSON 流式响应，
         // 其余命令仍是「一次请求 → 一个 JSON」。
         if (body.cmd === "agentRun" && body.payload?.stream === true) {
+          /**
+           * 这条连接关掉空闲超时（Bun 默认 10 秒没有数据就断开）。模型预填充期间流里可能几十秒
+           * 一行都没有 —— 本地小模型读 4～8K token 的提示就要 25～45 秒 —— 默认值会让
+           * `omi agent run` 以「socket connection was closed unexpectedly」失败，而应用里那一轮
+           * 还在继续跑、占着推理槽，后面排队的请求跟着超时。只监听本机 Unix socket，没有暴露面。
+           */
+          srv.timeout(req, 0);
           return streamAgentRun(body.payload);
         }
         const response = await handle(body);
