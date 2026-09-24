@@ -50,8 +50,8 @@ import {
   type RoutedGroupId,
   type RoutedToolset,
 } from "./agent-routed-tools";
-import { TurnLoopGuard } from "./agent-loop-guard";
-import { pickToolGroups, routedArgProblem, routedTurnNote } from "./agent-routing";
+import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
+import { pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
 import { buildSystemOneAgentTools } from "./systemone-tools";
@@ -2278,10 +2278,13 @@ async function routeToolGroups(
 ): Promise<string> {
   const routed = session.routed;
   if (!routed) return "";
-  routed.guard = new TurnLoopGuard();
   const available = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
   const pick = await pickToolGroups(content, available, {
     attachments: [...files.map((f) => f.name), ...imagePaths.map((p) => path.basename(p))],
+  });
+  // dev 组（bash / apply_patch）只给开发类请求：请求里有开发类说法、JEV 给 dev 的概率不低，或 JEV 不可用时放行。
+  routed.guard = new TurnLoopGuard({
+    devAllowed: DEV_INTENT.test(content) || pick.via === "fallback" || (pick.probabilities?.dev ?? 0) >= 0.25,
   });
   const added = pick.groups.filter((g) => !routed.loaded.includes(g));
   routed.loaded.push(...added);
@@ -2307,7 +2310,12 @@ async function routeToolGroups(
     });
   }
   const notLoaded = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
-  const note = routedTurnNote(notLoaded);
+  const notes = [routedTurnNote(notLoaded)];
+  // 「记住…」：E6 里模型只口头答应、不调 remember，这一轮明确要求先保存。
+  if (REMEMBER_INTENT.test(content) && routed.set.core.some((t) => t.name === "remember")) {
+    notes.push("--- 本轮要求 ---\n用户要你记住一件事：先调用 remember 把它保存成一句话，再回复用户。\n--- 要求结束 ---");
+  }
+  const note = notes.filter(Boolean).join("\n\n");
   return note ? `\n\n${note}` : "";
 }
 
@@ -2458,7 +2466,7 @@ async function getOrCreateSession(
       const args = (context.args ?? {}) as Record<string, unknown>;
       // 精简路由策略的参数兜底：小模型缺信息时爱填占位符（"<收件人>"、"unknown"），拦下来让它先问用户。
       if (session.routed) {
-        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName);
+        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName, args);
         if (problem) return { block: true, reason: problem };
       }
       const fingerprint = `${toolName}:${JSON.stringify(args)}`;

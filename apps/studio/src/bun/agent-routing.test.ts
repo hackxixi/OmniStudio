@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { groupQuestionCriteria, groupsFromProbabilities, routedArgProblem, routedTurnNote } from "./agent-routing";
+import { groupQuestionCriteria, groupsFromProbabilities, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 
 describe("groupsFromProbabilities：JEV 概率 → 要加载的工具组", () => {
   test("第一名是 none 就只用核心工具", () => {
@@ -41,5 +41,17 @@ describe("routedArgProblem：占位参数兜底", () => {
     expect(routedArgProblem("web_search", { query: "NA 联赛赛程" })).toBeNull();
     expect(routedArgProblem("write_file", { path: "a.md", content: "TODO" })).toBeNull();
     expect(routedArgProblem("bash", { command: "" })).toBeNull();
+  });
+});
+
+describe("REMEMBER_INTENT：「记住…」类请求", () => {
+  test("中英文说法都认", () => {
+    expect(REMEMBER_INTENT.test("记住：我对花生过敏")).toBe(true);
+    expect(REMEMBER_INTENT.test("Please remember that my manager's name is Priya.")).toBe(true);
+    expect(REMEMBER_INTENT.test("以后推荐菜谱的时候注意")).toBe(true);
+  });
+  test("普通请求不误判", () => {
+    expect(REMEMBER_INTENT.test("我之前跟你说过我喜欢什么音乐来着？")).toBe(false);
+    expect(REMEMBER_INTENT.test("画一只猫")).toBe(false);
   });
 });

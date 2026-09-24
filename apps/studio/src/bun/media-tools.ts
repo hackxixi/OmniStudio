@@ -724,7 +724,8 @@ function createGenerateImage(ctx: ToolContext): BuiltTool {
 
         // 后端没配好 / 没选模型 / 本地模型没下载时，先弹窗让用户配好并确认；
         // 用户没指定模型时，扫到的候选超过一个会再弹一次确认用哪个生图。
-        const prep = await prepareImageGeneration({ signal, explicitModel: params.model });
+        // 没人能回答弹窗（无人值守 / 自动化）时不弹窗：askUser 缺席就是这个信号。
+        const prep = await prepareImageGeneration({ signal, explicitModel: params.model, interactive: Boolean(ctx.askUser) });
         if (!prep.ok) return errorResult(prep.message);
 
         const { records, error } = await ImageGen.generateImage({

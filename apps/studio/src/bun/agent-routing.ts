@@ -98,6 +98,9 @@ export function routedTurnNote(notLoaded: RoutedGroupId[]): string | null {
   );
 }
 
+/** 「记住…」类请求的说法（中英文）。 */
+export const REMEMBER_INTENT = /记住|记下|记一下|帮我记|别忘了|不要忘了|以后.*(注意|记得)|remember|don't forget|keep in mind|note that/i;
+
 /** 小模型缺信息时常填的占位值：尖括号 / 花括号模板、TODO、unknown、问号、xxx 等。 */
 const PLACEHOLDER = /^\s*(<[^<>]{0,40}>|\{\{[^{}]{0,40}\}\}|\[[^[\]]{0,40}\]|todo|tbd|unknown|placeholder|n\/a|x{3,}|\?+|？+|待定|未知|某人|收件人)\s*$/i;
 /** 这些工具的字符串参数本来就可能是占位写法（补丁 / 命令 / 文件正文），不查。 */

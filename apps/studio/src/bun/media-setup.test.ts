@@ -335,3 +335,44 @@ test("等待中的弹窗可被中断收尾（停止按钮 / 会话重置）", as
     stop();
   }
 });
+
+test("无人值守（界面开着但这一轮没人看）：后端没配好时直接失败，不弹窗", async () => {
+  updateSettings({ IMG_BACKEND: "api", IMG_PROVIDER_ID: "", IMG_MODEL: "" });
+  // 界面在监听、而且会回答 —— 若真的弹了窗，这里会被记下来
+  const { seen, stop } = fakeWebview([{ action: "confirm" }]);
+  try {
+    const res = await MediaSetup.prepareImageGeneration({ interactive: false });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.message).toContain("无人值守");
+      expect(res.message).toContain("本轮不要重试");
+    }
+    expect(seen).toHaveLength(0);
+  } finally {
+    stop();
+  }
+});
+
+test("无人值守：扫到多个候选时自动用第一个，不弹窗确认", async () => {
+  const provider = addCloudProvider({ name: "无人值守候选", baseUrl: "http://127.0.0.1:9/v1", models: [] });
+  updateSettings({ IMG_BACKEND: "api", IMG_PROVIDER_ID: provider, IMG_MODEL: "" });
+  globalThis.fetch = mock(async (url: URL | string) => {
+    if (String(url).includes("/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "flux-dev" }, { id: "sdxl-turbo" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  }) as never;
+  const { seen, stop } = fakeWebview([]);
+  try {
+    const res = await MediaSetup.prepareImageGeneration({ interactive: false });
+    expect(res).toEqual({ ok: true, model: "flux-dev" });
+    expect(seen).toHaveLength(0);
+  } finally {
+    stop();
+    globalThis.fetch = originalFetch;
+    removeCloudProvider(provider);
+  }
+});
