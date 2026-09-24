@@ -8,9 +8,29 @@
  *
  * 用法（在 ycs2 上）：bun bench.ts [A,B,B0,C] [任务 id 前缀]
  * 环境变量：SMALL_URL / SMALL_MODEL / MID_URL / MID_MODEL / JEV_URL / JEV_KEY_FILE / OUT
+ *   SET=r2    第二轮任务集（tasks2.ts）
+ *   HINTS=1   工具侧修正：上下文带两周日历、枚举值写清含义
+ *   TAG=4B    写进结果的模型标签
  */
 import { appendFileSync, readFileSync } from "node:fs";
-import { NOW, TASKS, TOOLS, resetStubs, runStub, type Task, type ToolSpec } from "./tasks";
+import type { Task, ToolSpec } from "./tasks";
+
+type TaskSet = {
+  NOW: string;
+  TASKS: Task[];
+  TOOLS: ToolSpec[];
+  resetStubs: () => void;
+  runStub: (tool: string, args: Record<string, unknown>) => string;
+  CALENDAR?: string;
+};
+const SET = process.env.SET ?? "r1";
+const set = (SET === "r2" ? await import("./tasks2") : await import("./tasks")) as TaskSet;
+const { NOW, TASKS, resetStubs, runStub } = set;
+const HINTS = process.env.HINTS === "1";
+const TAG = process.env.TAG ?? "";
+/** HINTS 下把枚举含义拼进描述；日历拼进上下文。 */
+const TOOLS: ToolSpec[] = set.TOOLS.map((t) => (HINTS && t.hint ? { ...t, description: `${t.description} ${t.hint}` } : t));
+const clock = () => `Current local time: ${NOW}.${HINTS && set.CALENDAR ? ` ${set.CALENDAR}` : ""}`;
 
 const SMALL_URL = process.env.SMALL_URL ?? "http://127.0.0.1:30001";
 const SMALL_MODEL = process.env.SMALL_MODEL ?? "Qwen/Qwen3.5-4B";
@@ -25,6 +45,9 @@ type Call = { tool: string; args: Record<string, unknown>; result: string };
 type Decision = { choice: string; top: number; margin: number; options: number };
 type Run = {
   arm: string;
+  tag?: string;
+  set?: string;
+  hints?: boolean;
   task: string;
   level: string;
   calls: Call[];
@@ -117,9 +140,10 @@ function stripToolCalls(text: string): string {
 function systemPrompt(task: Task): string {
   const files = task.attachments?.map((a) => a.name).join(", ");
   return (
-    `You are a helpful assistant with tools. Current local time: ${NOW}.` +
+    `You are a helpful assistant with tools. ${clock()}` +
     (files ? ` The user attached these files: ${files}.` : " The user attached no files.") +
     " Use a tool only when it is needed; when you have what you need, answer the user directly in their language." +
+    " If information you need from the user is missing, ask them instead of guessing." +
     " When you produce an image or audio, tell the user its reference (e.g. img_1 / aud_1)."
   );
 }
@@ -173,7 +197,7 @@ function context(task: Task, calls: Call[]): string {
   const history = calls.length
     ? calls.map((c, i) => `${i + 1}. ${c.tool}(${JSON.stringify(c.args)}) → ${c.result}`).join("\n")
     : "(none yet)";
-  return `Current local time: ${NOW}\nAttached files: ${files}\nUser request: ${task.request}\n\nActions taken so far:\n${history}`;
+  return `${clock()}\nAttached files: ${files}\nUser request: ${task.request}\n\nActions taken so far:\n${history}`;
 }
 
 const FINISH =
@@ -181,17 +205,28 @@ const FINISH =
   "either the actions above already did everything the request asks for, or the request can be answered directly " +
   "without any tool (translation, rewriting, arithmetic, general explanation).";
 
-function feasibleTools(task: Task, filter: boolean): ToolSpec[] {
+const ASK_USER =
+  "Ask the user a question first: the request is missing information that only the user can provide " +
+  "(what exactly, when, to whom, how much), so no tool can be called correctly yet.";
+
+/** 可行性过滤：需要某类输入的工具，只有在附件或前面步骤的产物里有这类输入时才给 JEV 选。 */
+function feasibleTools(task: Task, calls: Call[], filter: boolean): ToolSpec[] {
   if (!filter) return TOOLS;
-  const kinds = new Set(task.attachments?.map((a) => a.kind));
+  const kinds = new Set<string>(task.attachments?.map((a) => a.kind));
+  for (const c of calls) {
+    if (/\bimg_\d/.test(c.result)) kinds.add("image");
+    if (/\baud_\d/.test(c.result)) kinds.add("audio");
+  }
   return TOOLS.filter((t) => !t.needs || kinds.has(t.needs));
 }
 
 async function runJev(arm: string, task: Task, filter: boolean): Promise<Run> {
   const run: Run = { arm, task: task.id, level: task.level, calls: [], answer: "", decisions: [], ms: 0, llmCalls: 0, jevCalls: 0 };
+  let asked = false;
   for (let step = 0; step < MAX_STEPS; step++) {
-    const tools = feasibleTools(task, filter);
+    const tools = feasibleTools(task, run.calls, filter);
     const criteria: Record<string, string> = { finish: FINISH };
+    if (SET === "r2" && !run.calls.length) criteria.ask_user = ASK_USER;
     for (const t of tools) criteria[t.name] = `Call ${t.name} next: ${t.description}`;
     const answers = await jev(
       { messages: [{ role: "user", content: context(task, run.calls) }] },
@@ -211,6 +246,10 @@ async function runJev(arm: string, task: Task, filter: boolean): Promise<Run> {
     const probs = Object.values(a.probabilities).sort((x, y) => y - x);
     run.decisions.push({ choice: a.choice, top: probs[0] ?? 0, margin: (probs[0] ?? 0) - (probs[1] ?? 0), options: probs.length });
     if (a.choice === "finish") break;
+    if (a.choice === "ask_user") {
+      asked = true;
+      break;
+    }
     const tool = TOOLS.find((t) => t.name === a.choice)!;
     const filled = await chat(
       SMALL_URL,
@@ -233,13 +272,15 @@ async function runJev(arm: string, task: Task, filter: boolean): Promise<Run> {
     if (step === MAX_STEPS - 1) run.error = "max steps";
   }
   const final = await chat(SMALL_URL, SMALL_MODEL, [
-    { role: "system", content: `You are a helpful assistant. Current local time: ${NOW}.` },
+    { role: "system", content: `You are a helpful assistant. ${clock()}` },
     {
       role: "user",
-      content:
-        `${context(task, run.calls)}\n\nAll needed actions are done. Now write the reply to the user in the language of their request, ` +
-        "using the results above. If an image or audio was produced, give its reference (e.g. img_1 / aud_1). " +
-        "If there were no actions, just answer the request yourself.",
+      content: asked
+        ? `${context(task, run.calls)}\n\nThe request is missing information. Ask the user one short question, in the language of their request, ` +
+          "to get what is missing. Do not do the task yet."
+        : `${context(task, run.calls)}\n\nAll needed actions are done. Now write the reply to the user in the language of their request, ` +
+          "using the results above. If an image, audio, music or video was produced, give its reference (e.g. img_1 / aud_1). " +
+          "If there were no actions, just answer the request yourself.",
     },
   ]);
   run.llmCalls++;
@@ -274,10 +315,14 @@ export function score(task: Task, run: Run) {
   const ci = (re: RegExp) => new RegExp(re.source, re.flags.includes("i") ? re.flags : `${re.flags}i`);
   const names = run.calls.map((c) => c.tool);
   const want = task.steps.map((s) => s.tool);
-  const toolsOk = names.length === want.length && want.every((w, i) => names[i] === w);
+  const sorted = (xs: string[]) => [...xs].sort().join(",");
+  const toolsOk =
+    names.length === want.length && (task.anyOrder ? sorted(names) === sorted(want) : want.every((w, i) => names[i] === w));
+  // 顺序不计时按工具名配对（同名工具在任务里不重复出现）
+  const callFor = (s: { tool: string }, i: number) => (task.anyOrder ? run.calls.find((c) => c.tool === s.tool) : run.calls[i]);
   const argsOk =
     toolsOk &&
-    task.steps.every((s, i) => Object.entries(s.args).every(([k, re]) => ci(re).test(String(run.calls[i]!.args[k] ?? ""))));
+    task.steps.every((s, i) => Object.entries(s.args).every(([k, re]) => ci(re).test(String(callFor(s, i)?.args[k] ?? ""))));
   const answerOk = task.answer.every((re) => ci(re).test(run.answer));
   return { toolsOk, argsOk, answerOk, pass: toolsOk && argsOk && answerOk && !run.error };
 }
@@ -306,17 +351,18 @@ for (const arm of arms) {
       run = { arm, task: task.id, level: task.level, calls: [], answer: "", decisions: [], ms: 0, llmCalls: 0, jevCalls: 0, error: String(e) };
     }
     run.ms = Math.round(performance.now() - t0);
+    Object.assign(run, { tag: TAG, set: SET, hints: HINTS });
     ms += run.ms;
     const s = score(task, run);
     rows.push(s);
     appendFileSync(OUT, `${JSON.stringify({ ...run, ...s })}\n`);
     console.log(
-      `${arm.padEnd(3)} ${task.id.padEnd(22)} ${s.pass ? "PASS" : "fail"}  tools=${+s.toolsOk} args=${+s.argsOk} answer=${+s.answerOk}` +
+      `${TAG}${arm.padEnd(3)} ${task.id.padEnd(22)} ${s.pass ? "PASS" : "fail"}  tools=${+s.toolsOk} args=${+s.argsOk} answer=${+s.answerOk}` +
         `  [${run.calls.map((c) => c.tool).join(" → ")}]${run.error ? ` ERR ${run.error.slice(0, 80)}` : ""}  ${run.ms}ms`,
     );
   }
   const pct = (k: keyof ReturnType<typeof score>) => `${Math.round((rows.filter((r) => r[k]).length / rows.length) * 100)}%`;
   console.log(
-    `== ${arm}: pass ${pct("pass")}  tools ${pct("toolsOk")}  args ${pct("argsOk")}  answer ${pct("answerOk")}  avg ${Math.round(ms / rows.length)}ms\n`,
+    `== ${TAG}${arm} ${SET}${HINTS ? "+hints" : ""}: pass ${pct("pass")}  tools ${pct("toolsOk")}  args ${pct("argsOk")}  answer ${pct("answerOk")}  avg ${Math.round(ms / rows.length)}ms\n`,
   );
 }

@@ -15,8 +15,10 @@ export type ToolSpec = {
     properties: Record<string, { type: string; description: string; enum?: string[] }>;
     required: string[];
   };
-  /** 需要用户附件的工具：没有对应附件时 B 组把它从选项里拿掉。 */
-  needs?: "audio" | "document";
+  /** 需要某类输入的工具（附件或前面步骤的产物）：没有时 B 组把它从选项里拿掉。 */
+  needs?: "audio" | "document" | "image";
+  /** HINTS=1 时追加到描述后面的说明（工具侧修正：把枚举值的含义写清楚）。 */
+  hint?: string;
 };
 
 export const TOOLS: ToolSpec[] = [
@@ -114,11 +116,15 @@ export type Task = {
   id: string;
   level: "L1" | "L2" | "L3";
   request: string;
-  attachments?: { name: string; kind: "audio" | "document" }[];
+  attachments?: { name: string; kind: "audio" | "document" | "image" }[];
   /** 期望的工具调用序列；空数组 = 不该调任何工具。 */
   steps: Step[];
   /** 最终回答必须命中的每一组关键词（组内任一即可）。 */
   answer: RegExp[];
+  /** 步骤之间没有先后依赖，顺序不计。 */
+  anyOrder?: boolean;
+  /** 信息不足，正确做法是反问用户（不调工具、回答里带问号）。 */
+  ask?: boolean;
 };
 
 /** 「现在」固定下来，定提醒类任务的日期。 */
