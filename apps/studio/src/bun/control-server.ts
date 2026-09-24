@@ -422,15 +422,23 @@ function streamAgentRun(payload: Record<string, unknown>): Response {
     );
   }
 
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      const write = (line: Headless.HeadlessLine) => {
+      const write = (line: Headless.HeadlessLine | { type: "heartbeat" }) => {
         try {
           controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`));
         } catch {
           // 客户端断开：后面的行没人要了，runHeadlessAgent 会照常跑完（会话仍落库）。
         }
       };
+      /**
+       * 心跳：每 5 秒吐一行 `{"type":"heartbeat"}`。Bun 的连接 10 秒没有数据就会被掐断，
+       * 而模型预填充期间流里可能几十秒一行都没有 —— 本地小模型读 4～8K token 的提示就要
+       * 25～45 秒 —— 于是 `omi agent run` 以「socket connection was closed unexpectedly」失败，
+       * 应用里那一轮却还在跑、占着推理槽，后面排队的请求跟着超时。客户端忽略这种行。
+       */
+      heartbeat = setInterval(() => write({ type: "heartbeat" }), 5_000);
       void Headless.runHeadlessAgent({
         prompt,
         workspace: typeof payload.workspace === "string" ? payload.workspace : undefined,
@@ -451,12 +459,16 @@ function streamAgentRun(payload: Record<string, unknown>): Response {
           });
         })
         .finally(() => {
+          clearInterval(heartbeat);
           try {
             controller.close();
           } catch {
             // 已经关了
           }
         });
+    },
+    cancel() {
+      clearInterval(heartbeat);
     },
   });
   return new Response(stream, { headers: { "content-type": "application/x-ndjson" } });
@@ -479,7 +491,7 @@ export async function startControlServer(): Promise<void> {
   try {
     server = Bun.serve({
       unix: sockPath,
-      fetch: async (req, srv) => {
+      fetch: async (req) => {
         if (req.method !== "POST") {
           return new Response("method not allowed", { status: 405 });
         }
@@ -492,13 +504,6 @@ export async function startControlServer(): Promise<void> {
         // 无头执行要能把事件"边跑边吐"给外部脚本：这一条走 NDJSON 流式响应，
         // 其余命令仍是「一次请求 → 一个 JSON」。
         if (body.cmd === "agentRun" && body.payload?.stream === true) {
-          /**
-           * 这条连接关掉空闲超时（Bun 默认 10 秒没有数据就断开）。模型预填充期间流里可能几十秒
-           * 一行都没有 —— 本地小模型读 4～8K token 的提示就要 25～45 秒 —— 默认值会让
-           * `omi agent run` 以「socket connection was closed unexpectedly」失败，而应用里那一轮
-           * 还在继续跑、占着推理槽，后面排队的请求跟着超时。只监听本机 Unix socket，没有暴露面。
-           */
-          srv.timeout(req, 0);
           return streamAgentRun(body.payload);
         }
         const response = await handle(body);
