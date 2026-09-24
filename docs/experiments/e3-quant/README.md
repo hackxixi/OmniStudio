@@ -102,6 +102,5 @@ bun analyze-mac.ts results-mac.jsonl
 
 ## 未做
 
-- 服务器上为 4B 下载的 SGLang 量化版本（FP8 / W8A8 / AWQ / w4a16，`ycs2:/home/yc/models/*Qwen3.5-4B-*`）
-  因目标改成 Mac 而没有跑；需要时可用 E2 的 `run-e2.sh` 同法测。
-- JEV 提示的前缀缓存（见结论 7）；端到端路由（本地 4B + 云端验收与兜底，原计划的 E4）。
+- 服务器 SGLang 上的 4B 量化版本（FP8 / W8A8 / AWQ / w4a16）：目标改成 Mac 后没有跑，权重已删除。
+- JEV 提示的前缀缓存（见结论 7）。端到端路由已在 [E4](../e4-e2e/README.md) 完成。
