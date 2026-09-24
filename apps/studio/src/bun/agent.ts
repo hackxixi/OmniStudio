@@ -6,6 +6,7 @@ import { and, asc, eq, gt, inArray, like, sql } from "drizzle-orm";
 
 import {
   Agent,
+  type AfterToolCallContext,
   type AfterToolCallResult,
   type AgentEvent,
   type AgentMessage,
@@ -49,6 +50,7 @@ import {
   type RoutedGroupId,
   type RoutedToolset,
 } from "./agent-routed-tools";
+import { TurnLoopGuard } from "./agent-loop-guard";
 import { pickToolGroups, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
@@ -1154,6 +1156,8 @@ type RoutedState = {
   loaded: RoutedGroupId[];
   /** load_tools 在本轮加载了新组：下一轮开始前（prepareNextTurnWithContext）换上新工具列表。 */
   pendingReload: boolean;
+  /** 本轮循环守卫（搜索打转、生成失败后反复重试）：每轮用户消息开始时换新的。 */
+  guard: TurnLoopGuard;
 };
 
 /** 当前应发给模型的工具列表：核心 + 已加载的组 + （还有没加载的组时）load_tools。 */
@@ -2229,12 +2233,34 @@ export function makeContextTransform(
 }
 
 /**
+ * 精简路由策略：在工具结果落定前过一遍本轮循环守卫（agent-loop-guard.ts），需要时在结果末尾追加
+ * 「停止搜索 / 不要重试生成」的提示。经典策略原样返回超限转存钩子的结果。
+ * 工具失败有两种形态：抛错（内核标 isError）与 errorResult（details.error），两种都算。
+ */
+function withLoopGuard(
+  session: Session,
+  spill: ReturnType<typeof makeToolOutputHook>,
+): (context: AfterToolCallContext) => Promise<AfterToolCallResult | undefined> {
+  return async (context) => {
+    const base = await spill(context);
+    const guard = session.routed?.guard;
+    if (!guard) return base;
+    const details = (context.result as { details?: { error?: unknown } } | undefined)?.details;
+    const failed = context.isError || Boolean(details?.error);
+    const notice = guard.record(context.toolCall.name, resultText(context.result), failed);
+    if (!notice) return base;
+    const content = base?.content ?? context.result.content ?? [];
+    return { ...base, content: [...content, { type: "text" as const, text: `\n\n${notice}` }] };
+  };
+}
+
+/**
  * 按策略装配会话初始工具：经典策略原样返回；精简路由策略切成核心 + 各组，
  * 一开始只给核心（与 load_tools），每轮开始时再由 routeToolGroups 按请求加组。
  */
 function withToolStrategy<T extends Parameters<typeof partitionRoutedTools>[0]>(session: Session, tools: T): T {
   if (session.toolStrategy !== "routed") return tools;
-  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false };
+  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard() };
   return routedToolList(session.routed) as T;
 }
 
@@ -2252,6 +2278,7 @@ async function routeToolGroups(
 ): Promise<string> {
   const routed = session.routed;
   if (!routed) return "";
+  routed.guard = new TurnLoopGuard();
   const available = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
   const pick = await pickToolGroups(content, available, {
     attachments: [...files.map((f) => f.name), ...imagePaths.map((p) => path.basename(p))],
@@ -2431,7 +2458,7 @@ async function getOrCreateSession(
       const args = (context.args ?? {}) as Record<string, unknown>;
       // 精简路由策略的参数兜底：小模型缺信息时爱填占位符（"<收件人>"、"unknown"），拦下来让它先问用户。
       if (session.routed) {
-        const problem = routedArgProblem(toolName, args);
+        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName);
         if (problem) return { block: true, reason: problem };
       }
       const fingerprint = `${toolName}:${JSON.stringify(args)}`;
@@ -2468,7 +2495,7 @@ async function getOrCreateSession(
      * 工具结果的最后一道处理：超限就转存 + 截断 + 给出读回路径（见 makeToolOutputHook）。
      * 放在这里而不是每个工具里，是为了让 MCP / 媒体 / 未来新增的工具自动享受同一套。
      */
-    afterToolCall: makeToolOutputHook(conversationId),
+    afterToolCall: withLoopGuard(session, makeToolOutputHook(conversationId)),
   });
   session.agent = agent;
   sessions.set(conversationId, session);
