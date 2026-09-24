@@ -73,9 +73,35 @@ bun analyze-mac.ts results-mac.jsonl
 | 必须开 | 工具定义前缀缓存；工具说明带日历与枚举含义（E1 的 HINTS） |
 | 交给云端 | 结束时的验收（云端 JEV）；领先幅度 < 0.3 或验收不过时整步 / 整题重做 |
 
+## 追加：Qwopus3.5-4B（GGUF / llama.cpp）对比
+
+本机已有 `Jackrong/Qwopus3.5-4B-Coder-MTP-GGUF`（Q4_K_M，Qwen3.5-4B 的微调版）。GGUF 不能跑 MLX，
+所以用 OmniStudio 自带的 llama.cpp（build 11005）+ `llama_jev_server.py`：llama.cpp 只给 top-N logprob，
+取 top-400 读选项标签（实测 168 次 JEV 调用标签全部在内）；Qwopus 与 Qwen3.5 分词完全一致，但**改了聊天模板**
+（合并 system / developer），测试用它自己的模板。为区分「微调」与「引擎 + 量化」的影响，加了同引擎同量化的
+**原版 Qwen3.5-4B Q4_K_M**（魔搭 `unsloth/Qwen3.5-4B-GGUF`）做对照。llama.cpp 自带 `cache_prompt` 做前缀复用。
+
+| 版本 | 引擎 | 内存（权重 + 运行时） | 生成 tok/s | JEV 单次 | 选下一步 | 其中工具 | 该反问 | 验收 AUC | 误报≤10% 拦截 | 原生调用通过 | 每题平均 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.5-4B 4bit | MLX + 前缀缓存 | 峰值 4.3 GB | 22.3 | 3.6～5.8 s | 91% | 33/37 | 2/4 | 0.64 | 24% | 87～94% | 10 s |
+| Qwen3.5-4B Q4_K_M（对照） | llama.cpp | 2.7 + 0.5 ≈ 3.3 GB | 17.1 | 2.9 s | 90% | 34/37 | 1/4 | 0.72 | 26% | 87% | 13 s |
+| **Qwopus3.5-4B Q4_K_M** | llama.cpp | 2.8 + 0.5 ≈ 3.3 GB | 17.2 | 2.9 s | 87% | 32/37 | 1/4 | 0.65 | 24% | 87% | 10 s |
+
+各自做错的题（原生调用）：Qwopus `l1-translate` `ask-email` `ask-edit` `m-note-web`；对照 `ask-email` `ask-edit`
+`m-rain-umbrella` `m-note-web`；MLX 4bit `ask-edit` `m-minutes-email` `m-note-web` `m-lease-calendar`。
+
+结论：
+
+1. **Qwopus 相对原版没有提升**：同引擎同量化下，调工具同为 87%，选下一步 87% vs 90%、验收 AUC 0.65 vs 0.72
+   略低（31 / 68 题的样本上 1～2 题的差距，不显著）。它是面向编码 / 推理的蒸馏微调，这组日常工具任务上不占优；
+   `l1-translate` 做错是它独有的（翻译题里去调了工具）。
+2. **llama.cpp 与 MLX 各有长短**：llama.cpp 内存更省（约 3.3 GB vs 4.3 GB）、JEV 单次更快（2.9 s，自带前缀复用对
+   JEV 也生效），但生成更慢（17 vs 22 tok/s）；准确率在误差范围内。两条路都能当本地默认，MLX 仅限 Apple Silicon，
+   llama.cpp 跨平台——**Windows / Linux 用户的本地组合可以直接用 GGUF Q4_K_M + llama.cpp**。
+3. 本地默认模型维持原版 Qwen3.5-4B；换微调模型之前应先过这套测试，不能按名字或榜单判断。
+
 ## 未做
 
 - 服务器上为 4B 下载的 SGLang 量化版本（FP8 / W8A8 / AWQ / w4a16，`ycs2:/home/yc/models/*Qwen3.5-4B-*`）
   因目标改成 Mac 而没有跑；需要时可用 E2 的 `run-e2.sh` 同法测。
-- GGUF（llama.cpp）：OpenJev 需要按 token id 取 logprob，llama.cpp 只给 top-N，没有接。
 - JEV 提示的前缀缓存（见结论 7）；端到端路由（本地 4B + 云端验收与兜底，原计划的 E4）。
