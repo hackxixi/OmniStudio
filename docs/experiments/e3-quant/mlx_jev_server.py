@@ -142,6 +142,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--port", type=int, default=18130)
     parser.add_argument("--prefix-cache", action="store_true")
+    parser.add_argument("--prefix-keep", type=int, default=4, help="snapshots kept per role (one per distinct shared prefix)")
     args = parser.parse_args()
 
     loaded_at = time.perf_counter()
@@ -151,8 +152,8 @@ def main() -> None:
     weights_bytes = mx.get_active_memory()
 
     lock = asyncio.Lock()
-    jev_prefix = PrefixCache(model, args.prefix_cache)
-    chat_prefix = PrefixCache(model, args.prefix_cache)
+    jev_prefix = PrefixCache(model, args.prefix_cache, args.prefix_keep)
+    chat_prefix = PrefixCache(model, args.prefix_cache, args.prefix_keep)
     backend = MLXBackend(model, lock, jev_prefix)
     settings = Settings(
         model=args.model,
