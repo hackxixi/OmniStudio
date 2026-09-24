@@ -10,11 +10,13 @@
  *
  * 用法（ycs2）：JEV_URL=http://127.0.0.1:18120 TAG=4B bun sweep.ts [select,verify,route]
  */
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { CALENDAR, NOW, TASKS, TOOLS } from "../e1-jev-orchestration/tasks2";
 
 const JEV_URL = process.env.JEV_URL ?? "http://127.0.0.1:18120";
-const JEV_KEY = readFileSync(process.env.JEV_KEY_FILE ?? `${process.env.HOME}/jev/openjev.key`, "utf8").trim();
+const KEY_FILE = process.env.JEV_KEY_FILE ?? `${process.env.HOME}/jev/openjev.key`;
+/** 本机 MLX 服务不设密钥；服务器上的 OpenJev 从密钥文件读。 */
+const JEV_KEY = process.env.JEV_KEY ?? (existsSync(KEY_FILE) ? readFileSync(KEY_FILE, "utf8").trim() : "");
 const TAG = process.env.TAG ?? "?";
 const R2 = process.env.R2 ?? "../e1-jev-orchestration/results-r2.jsonl";
 const OUT = process.env.OUT ?? "results-e2.jsonl";
@@ -158,9 +160,20 @@ function catchAtFa(scores: { p: number; y: boolean }[], maxFa: number) {
   return best;
 }
 
+/** VERIFY_N：只抽一个通过 / 失败各半的确定性样本（本机 MLX 上 527 条太慢）。 */
+function verifySample(): Row[] {
+  const n = Number(process.env.VERIFY_N ?? 0);
+  if (!n) return rows;
+  // 固定种子的洗牌，保证每个量化版本考同一批题
+  let seed = 42;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  const shuffled = rows.map((r) => ({ r, k: rand() })).sort((a, b) => a.k - b.k).map((x) => x.r);
+  return [...shuffled.filter((r) => r.pass).slice(0, n / 2), ...shuffled.filter((r) => !r.pass).slice(0, n / 2)];
+}
+
 async function verify() {
   const scores: { p: number; y: boolean }[] = [];
-  for (const r of rows) {
+  for (const r of verifySample()) {
     const ans = await jev(
       {
         messages: [

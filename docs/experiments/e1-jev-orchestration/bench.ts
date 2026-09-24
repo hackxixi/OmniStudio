@@ -12,7 +12,7 @@
  *   HINTS=1   工具侧修正：上下文带两周日历、枚举值写清含义
  *   TAG=4B    写进结果的模型标签
  */
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { Task, ToolSpec } from "./tasks";
 
 type TaskSet = {
@@ -37,7 +37,9 @@ const SMALL_MODEL = process.env.SMALL_MODEL ?? "Qwen/Qwen3.5-4B";
 const MID_URL = process.env.MID_URL ?? "http://127.0.0.1:30000";
 const MID_MODEL = process.env.MID_MODEL ?? "Qwen/Qwen3.6-35B-A3B";
 const JEV_URL = process.env.JEV_URL ?? "http://127.0.0.1:18110";
-const JEV_KEY = readFileSync(process.env.JEV_KEY_FILE ?? `${process.env.HOME}/jev/openjev.key`, "utf8").trim();
+const KEY_FILE = process.env.JEV_KEY_FILE ?? `${process.env.HOME}/jev/openjev.key`;
+/** 本机 MLX 服务不设密钥；服务器上的 OpenJev 从密钥文件读。 */
+const JEV_KEY = process.env.JEV_KEY ?? (existsSync(KEY_FILE) ? readFileSync(KEY_FILE, "utf8").trim() : "");
 const OUT = process.env.OUT ?? "results.jsonl";
 const MAX_STEPS = 5;
 
