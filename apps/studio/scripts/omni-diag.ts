@@ -25,6 +25,7 @@ import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from "fs"
 import { Database } from "bun:sqlite";
 import { homedir, tmpdir } from "os";
 import path from "path";
+import { controlSocketPathFor } from "../src/shared/control-socket";
 
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
@@ -55,7 +56,8 @@ function dataDir(): string {
 const DATA_DIR = dataDir();
 const DB_PATH = process.env.OMNI_DB_PATH ?? path.join(DATA_DIR, "omni-studio.db");
 const LOG_DIR = path.join(DATA_DIR, "logs");
-const SOCKET = process.env.OMNI_CONTROL_SOCKET ?? path.join(DATA_DIR, "omni-control.sock");
+// 与主进程 / CLI 同一套算法：数据目录过长时 socket 落在临时目录。
+const SOCKET = controlSocketPathFor(DATA_DIR, { override: process.env.OMNI_CONTROL_SOCKET });
 
 type Section = { title: string; lines: string[] };
 

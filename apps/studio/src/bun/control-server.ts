@@ -514,11 +514,14 @@ export async function startControlServer(): Promise<void> {
     log.info({ source: "app", event: "control.listening", message: `控制通道已监听：${sockPath}` });
     console.log(`Control server listening at ${sockPath}`);
   } catch (err) {
+    // 失败路径不能只有控制台输出 —— `omi` 会整体失效，而用户只能靠 `omi logs` 事后看这条。
+    // 典型原因：数据目录路径太长，Unix socket 路径超上限（ENAMETOOLONG）。
+    const reason = err instanceof Error ? err.message : String(err);
     logEvent({
       level: "error",
       source: "app",
       event: "control.start.failed",
-      message: err instanceof Error ? err.message : String(err),
+      message: `控制通道启动失败（${sockPath}）：${reason}`,
       detail: { socket: sockPath, error: err },
     });
     console.error("Failed to start control server:", err);
