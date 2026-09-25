@@ -1,6 +1,7 @@
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep } from "path";
 import { readFileSync } from "fs";
+import { controlSocketPathFor } from "../shared/control-socket";
 
 const APP_IDENTIFIER = "omni-studio.kunpengtalk.com";
 const FALLBACK_CHANNEL = "dev";
@@ -53,9 +54,11 @@ export function getDataDir(...parts: string[]): string {
 /**
  * CLI ↔ 应用的控制 socket 路径。`omi` CLI 复用同一条规则定位（见
  * `src/cli/data-dir.ts`），`OMNI_CONTROL_SOCKET` 用于开发环境覆盖。
+ * 路径计算在 `shared/control-socket.ts`：数据目录太长时自动改落临时目录，
+ * 否则 Unix socket 路径超上限、`Bun.serve` 抛 ENAMETOOLONG。
  */
 export function controlSocketPath(): string {
-  return process.env.OMNI_CONTROL_SOCKET ?? join(getDataDir(), "omni-control.sock");
+  return controlSocketPathFor(getDataDir(), { override: process.env.OMNI_CONTROL_SOCKET });
 }
 
 /**
