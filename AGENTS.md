@@ -218,7 +218,16 @@ Views must be configured in `electrobun.config.ts` to be built and copied into t
   `prepareNextTurnWithContext` (the kernel copies the tool list at run start, so mutating
   `agent.state.tools` mid-run does nothing); and the strategy is part of the session cache key. Plan mode is
   always classic. The evidence and the rejected alternatives (model-driven tool search, English embeddings)
-  are in `docs/experiments/e5-tool-disclosure/`.
+  are in `docs/experiments/e5-tool-disclosure/`. Routed also carries the small-model guard rails from the
+  real-app regression (`docs/experiments/e6-real-app/`): `bun/agent-loop-guard.ts` (per-turn: search-loop
+  notices / blocks, no retry or workaround after a generation failure, dev group only for dev requests,
+  no forcing through after an unanswered `ask_user`), argument fixes in `bun/agent-routing.ts` (placeholder
+  args blocked, "横版 / 竖版" fills `aspect_ratio` by mutating the args object in place — the kernel hands
+  `beforeToolCall` the same object it executes with) and **cloud verification** (`bun/agent-verify.ts`,
+  `AGENT_VERIFY_MODE` off / report / escalate): after a turn the request + actions + reply go to the
+  **cloud** JEV (`runSystemOne({ forceCloud })` — routing may use a small local JEV, verification must not),
+  and below `AGENT_VERIFY_THRESHOLD` escalate swaps `agent.streamFunction` + `state.model` to the
+  `AGENT_ESCALATE_PROVIDER_ID` / `_MODEL` cloud model for the rest of that turn only, then swaps back.
 - **Public exposure goes through `bun/tunnel.ts`, never through `GATEWAY_HOST=0.0.0.0`**:
   Settings → Services → Remote Access runs a supervised `cloudflared` child process
   (`bun/cloudflared.ts` downloads the official binary into `<dataDir>/engines/cloudflared/`;
