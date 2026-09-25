@@ -608,13 +608,20 @@ async function callBackend(
  */
 export async function runSystemOne(
   request: SystemOneRequest,
-  opts: { signal?: AbortSignal } = {},
+  opts: {
+    signal?: AbortSignal;
+    /**
+     * 强制走云端（不看 SYSTEMONE_BACKEND）：Agent 的云端验收用 —— 选组可以用本地小 JEV，
+     * 验收要大模型（E2：4B 的验收 AUC 0.72，35B 0.88），两者不能共用一个「当前后端」设置。
+     */
+    forceCloud?: boolean;
+  } = {},
 ): Promise<SystemOneResult> {
   const cfg = systemOneConfig();
-  const backend = await resolveBackend(cfg);
+  const backend = opts.forceCloud ? (cfg.cloudApiKey ? "cloud" : null) : await resolveBackend(cfg);
   if (!backend) {
     const hint =
-      cfg.backend === "cloud"
+      cfg.backend === "cloud" || opts.forceCloud
         ? "未配置云端 JEV Key（JEV 页左栏「判定引擎」→「云端接入」里的「云端 API Key」）"
         : "没有可用的 JEV 后端：本地运行时未安装，本地服务地址为空，云端 Key 也未配置";
     logEvent({
@@ -628,7 +635,7 @@ export async function runSystemOne(
   }
 
   let result = await callBackend(backend, cfg, request, opts.signal);
-  if (!result.ok && worthCloudFallback(cfg, result)) {
+  if (!result.ok && !opts.forceCloud && worthCloudFallback(cfg, result)) {
     logEvent({
       level: "warn",
       source: "systemone",

@@ -247,6 +247,13 @@ export type SettingsKey =
   | "AGENT_VISION_TOOL"
   /** 工具调用方式：classic（经典，全部工具一次给模型）/ routed（精简路由，常驻核心 + 按需工具组）。 */
   | "AGENT_TOOL_STRATEGY"
+  /** 精简路由的云端验收：off / report（只记结论）/ escalate（不过就交给云端模型接着做）。 */
+  | "AGENT_VERIFY_MODE"
+  /** 云端验收阈值（JEV 判定「处理对了」的概率低于它算不通过），默认 0.9。 */
+  | "AGENT_VERIFY_THRESHOLD"
+  /** 升级用的云厂商 id 与模型（「云端模型」里已启用的厂商）。 */
+  | "AGENT_ESCALATE_PROVIDER_ID"
+  | "AGENT_ESCALATE_MODEL"
   /** 回合快照（影子 git 仓库，支持「撤销本轮」）开关。 */
   | "AGENT_SNAPSHOTS"
   /** 影子仓库自动整理的体积阈值（MB，默认 256）。 */
@@ -586,6 +593,11 @@ const DEFAULTS: Record<SettingsKey, string> = {
   AGENT_VISION_TOOL: "auto",
   /** 工具调用方式：classic = 全部工具一次交给模型；routed = 精简路由（本地小模型前缀更短）。 */
   AGENT_TOOL_STRATEGY: "classic",
+  /** 云端验收默认关：它要用云端 JEV 的 Key，而且每轮多一次云端调用，得用户自己打开。 */
+  AGENT_VERIFY_MODE: "off",
+  AGENT_VERIFY_THRESHOLD: "0.9",
+  AGENT_ESCALATE_PROVIDER_ID: "",
+  AGENT_ESCALATE_MODEL: "",
   // 回合快照：影子 git 仓库记下每轮开始前的工作区状态，界面可一键「撤销本轮」。
   AGENT_SNAPSHOTS: "1",
   // 影子仓库维护：占用超过 256MB 或快照条数到顶时自动 git gc（设置页可手动清理）。

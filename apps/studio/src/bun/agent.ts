@@ -28,7 +28,7 @@ import { getSetting, updateSettings } from "./db/settings";
 import { getChatBaseUrl, getHistory, ensureServerReady, titleFromMessage } from "./chat";
 import { getChatModelLabel, getChatRequestModelId, getChatProviderLabel, chatModelSupportsImages } from "./chat-model";
 import { chatContextWindow } from "./chat-context";
-import { CLOUD_MAX_OUTPUT_TOKENS } from "../shared/model-context";
+import { CLOUD_MAX_OUTPUT_TOKENS, resolveCloudContextWindow } from "../shared/model-context";
 import { recordUsage } from "./stats";
 import { recordTokenUsage } from "./usage";
 import {
@@ -51,6 +51,8 @@ import {
   type RoutedToolset,
 } from "./agent-routed-tools";
 import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
+import { escalationPrompt, parseVerifyMode, parseVerifyThreshold, verifyTurn } from "./agent-verify";
+import { resolveCloudProvider } from "./cloud-providers";
 import { fillAspectRatio, pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
@@ -628,6 +630,113 @@ function createStreamFn() {
         maxRetryDelayMs: options?.maxRetryDelayMs ?? 30_000,
       }),
   };
+}
+
+/**
+ * 升级用的云端模型通道（设置 `AGENT_ESCALATE_PROVIDER_ID` + `AGENT_ESCALATE_MODEL`）：
+ * 地址与 Key 来自「云端模型」里的厂商行（与所有云端能力同一个来源）。没配齐返回 null。
+ * 与本地通道分开建一套 provider：升级只换这一轮剩下的请求，结束后换回本地。
+ */
+function createEscalationStreamFn(): { model: Model<"openai-completions">; streamFn: Agent["streamFunction"]; label: string } | null {
+  const provider = resolveCloudProvider(getSetting("AGENT_ESCALATE_PROVIDER_ID"));
+  const modelId = getSetting("AGENT_ESCALATE_MODEL").trim();
+  if (!provider || !modelId || !provider.apiKey) return null;
+  const base = provider.baseUrl.replace(/\/+$/, "");
+  const baseUrl = /\/v1$/i.test(base) ? base : `${base}/v1`;
+  const model: Model<"openai-completions"> = {
+    id: modelId,
+    name: `${provider.name} · ${modelId}`,
+    api: "openai-completions",
+    provider: "omni-escalate",
+    baseUrl,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: resolveCloudContextWindow(modelId),
+    maxTokens: CLOUD_MAX_OUTPUT_TOKENS,
+  };
+  const models = createModels();
+  models.setProvider(
+    createProvider({
+      id: "omni-escalate",
+      name: "OmniStudio escalation",
+      baseUrl,
+      auth: {
+        apiKey: {
+          name: `${provider.name} API key`,
+          resolve: async () => ({ auth: { apiKey: provider.apiKey }, source: "env" as const }),
+        },
+      },
+      models: [model],
+      api: openAICompletionsApi() as never,
+    }),
+  );
+  return {
+    model,
+    label: model.name,
+    streamFn: (m: Model<string>, context: Context, options?: SimpleStreamOptions) =>
+      models.streamSimple(m as Model<"openai-completions">, context, {
+        ...options,
+        maxRetries: options?.maxRetries ?? retryAttempts(),
+        maxRetryDelayMs: options?.maxRetryDelayMs ?? 30_000,
+      }),
+  };
+}
+
+/**
+ * 精简路由策略的云端验收 + 升级（`AGENT_VERIFY_MODE`，见 agent-verify.ts）。
+ * 本轮以失败 / 中断收尾时不验收（那由回合结果分类处理）；验收服务不可用只记一条，不影响本地结果。
+ */
+async function verifyAndMaybeEscalate(session: Session, conversationId: number, request: string, turnStart: number) {
+  const mode = parseVerifyMode(getSetting("AGENT_VERIFY_MODE"));
+  if (mode === "off" || !session.routed) return;
+  const agent = session.agent;
+  const stop = lastAssistantStopReason(agent);
+  if (stop === "error" || stop === "aborted") return;
+  const threshold = parseVerifyThreshold(getSetting("AGENT_VERIFY_THRESHOLD"));
+  // turnStart 处是本轮的用户消息，验收只看它之后的动作与回复。
+  const outcome = await verifyTurn(request, agent.state.messages.slice(turnStart + 1));
+  const messageId = currentMessageId(conversationId);
+  if (!outcome.ok) {
+    recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收没做成（${outcome.error}），保留本地结果。` });
+    logEvent({ level: "warn", source: "agent", event: "agent.verify.failed", message: outcome.error, detail: { conversationId } });
+    return;
+  }
+  const score = `判定 ${outcome.p.toFixed(2)}，阈值 ${threshold}`;
+  if (outcome.p >= threshold) {
+    recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收通过（${score}）。` });
+    return;
+  }
+  const escalation = mode === "escalate" ? createEscalationStreamFn() : null;
+  recordEvent({
+    conversationId,
+    messageId,
+    kind: "status",
+    toolName: "verify",
+    output: escalation
+      ? `云端验收未通过（${score}），交给云端模型 ${escalation.label} 接着处理。`
+      : mode === "escalate"
+        ? `云端验收未通过（${score}）；没配升级用的云端模型（设置 → Agent 能力），保留本地结果。`
+        : `云端验收未通过（${score}）。`,
+  });
+  logEvent({
+    level: "info",
+    source: "agent",
+    event: "agent.verify.rejected",
+    message: `云端验收未通过（${score}）`,
+    detail: { conversationId, escalated: Boolean(escalation) },
+  });
+  if (!escalation) return;
+  const localModel = agent.state.model;
+  const localStreamFn = agent.streamFunction;
+  agent.streamFunction = escalation.streamFn;
+  agent.state.model = escalation.model;
+  try {
+    await agent.prompt(escalationPrompt(outcome.p));
+  } finally {
+    agent.streamFunction = localStreamFn;
+    agent.state.model = localModel;
+  }
 }
 
 /**
@@ -3112,7 +3221,11 @@ export async function runAgentTurn(opts: {
           if (stopped()) return;
         }
       };
+      const turnStart = agent.state.messages.length;
       await runTurnWithRecovery();
+      if (session.routed && !stopRequested && !stopRequests.has(conversationId)) {
+        await verifyAndMaybeEscalate(session, conversationId, content, turnStart);
+      }
     }
     // 模型循环结束：最后一段正文（收尾回答）也落成事件，时间轴到此完整。
     flushStepText();
