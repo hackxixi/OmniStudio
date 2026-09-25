@@ -85,6 +85,12 @@ describe("ask_user 没人应答", () => {
     expect(g.check("load_tools", { group: "dev" })).not.toBeNull();
     expect(g.check("write_file")).toBeNull();
   });
+  test("用户关掉提问或超时也算没人应答", () => {
+    const g = new TurnLoopGuard();
+    const dismissed = "The user did not answer (dismissed or timed out). Continue sensibly and say what you assumed.";
+    expect(g.record("ask_user", dismissed, false)).toContain("没有人能回答");
+    expect(g.check("ask_user")).toContain("不要再追问");
+  });
   test("用户正常回答时不受影响", () => {
     const g = new TurnLoopGuard();
     expect(g.record("ask_user", "用户回答：发给 wang@example.com", false)).toBeNull();

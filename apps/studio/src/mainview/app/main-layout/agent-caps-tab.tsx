@@ -127,19 +127,19 @@ export function AgentCapsTab() {
 
   // 阈值同样用本地态 + 失焦提交（每次按键都写设置会把一串中间值落库）。
   const [thresholdDraft, setThresholdDraft] = useState(
-    String(caps?.verifyThreshold ?? 0.9),
+    String(caps?.verifyThreshold ?? 0.7),
   );
   useEffect(() => {
-    setThresholdDraft(String(caps?.verifyThreshold ?? 0.9));
+    setThresholdDraft(String(caps?.verifyThreshold ?? 0.7));
   }, [caps?.verifyThreshold]);
 
   const commitThreshold = () => {
     const value = Number(thresholdDraft);
     if (!Number.isFinite(value) || value < 0.5 || value > 0.99) {
-      setThresholdDraft(String(caps?.verifyThreshold ?? 0.9));
+      setThresholdDraft(String(caps?.verifyThreshold ?? 0.7));
       return;
     }
-    if (value !== (caps?.verifyThreshold ?? 0.9)) {
+    if (value !== (caps?.verifyThreshold ?? 0.7)) {
       setVerify.mutate({ verifyThreshold: value });
     }
   };

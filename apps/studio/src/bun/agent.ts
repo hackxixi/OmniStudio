@@ -51,7 +51,7 @@ import {
   type RoutedToolset,
 } from "./agent-routed-tools";
 import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
-import { escalationPrompt, parseVerifyMode, parseVerifyThreshold, verifyTurn } from "./agent-verify";
+import { escalationPrompt, lookupsAllEmpty, parseVerifyMode, parseVerifyThreshold, verifyTurn } from "./agent-verify";
 import { resolveCloudProvider } from "./cloud-providers";
 import { fillAspectRatio, pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
@@ -695,7 +695,8 @@ async function verifyAndMaybeEscalate(session: Session, conversationId: number, 
   if (stop === "error" || stop === "aborted") return;
   const threshold = parseVerifyThreshold(getSetting("AGENT_VERIFY_THRESHOLD"));
   // turnStart 处是本轮的用户消息，验收只看它之后的动作与回复。
-  const outcome = await verifyTurn(request, agent.state.messages.slice(turnStart + 1));
+  const turnMessages = agent.state.messages.slice(turnStart + 1);
+  const outcome = await verifyTurn(request, turnMessages);
   const messageId = currentMessageId(conversationId);
   if (!outcome.ok) {
     recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收没做成（${outcome.error}），保留本地结果。` });
@@ -707,7 +708,9 @@ async function verifyAndMaybeEscalate(session: Session, conversationId: number, 
     recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收通过（${score}）。` });
     return;
   }
-  const escalation = mode === "escalate" ? createEscalationStreamFn() : null;
+  // 只做了查找且全都没找到：云端模型用同一批工具也查不到，升级只是多花一次解码。
+  const nothingToFind = mode === "escalate" && lookupsAllEmpty(turnMessages);
+  const escalation = mode === "escalate" && !nothingToFind ? createEscalationStreamFn() : null;
   recordEvent({
     conversationId,
     messageId,
@@ -715,16 +718,18 @@ async function verifyAndMaybeEscalate(session: Session, conversationId: number, 
     toolName: "verify",
     output: escalation
       ? `云端验收未通过（${score}），交给云端模型 ${escalation.label} 接着处理。`
-      : mode === "escalate"
-        ? `云端验收未通过（${score}）；没配升级用的云端模型（设置 → Agent 能力），保留本地结果。`
-        : `云端验收未通过（${score}）。`,
+      : nothingToFind
+        ? `云端验收未通过（${score}），但本轮的查找全都没有结果，换云端模型也查不到，不升级。`
+        : mode === "escalate"
+          ? `云端验收未通过（${score}）；没配升级用的云端模型（设置 → Agent 能力），保留本地结果。`
+          : `云端验收未通过（${score}）。`,
   });
   logEvent({
     level: "info",
     source: "agent",
     event: "agent.verify.rejected",
     message: `云端验收未通过（${score}）`,
-    detail: { conversationId, escalated: Boolean(escalation) },
+    detail: { conversationId, escalated: Boolean(escalation), nothingToFind },
   });
   if (!escalation) return;
   const localModel = agent.state.model;

@@ -228,6 +228,11 @@ Views must be configured in `electrobun.config.ts` to be built and copied into t
   **cloud** JEV (`runSystemOne({ forceCloud })` — routing may use a small local JEV, verification must not),
   and below `AGENT_VERIFY_THRESHOLD` escalate swaps `agent.streamFunction` + `state.model` to the
   `AGENT_ESCALATE_PROVIDER_ID` / `_MODEL` cloud model for the rest of that turn only, then swaps back.
+  Three calibrations from E6 keep escalation from firing on turns the cloud model cannot improve: the
+  default threshold is 0.7 (0.9 escalated 56% of real-app turns), an unanswered `ask_user` is shown to the
+  verifier as "asked, waiting for the answer" (asking *is* the correct outcome for underspecified requests),
+  and a turn whose only tool calls were lookups that all came back empty is reported but never escalated
+  (`lookupsAllEmpty` — the cloud model has the same tools and would find nothing either).
 - **Public exposure goes through `bun/tunnel.ts`, never through `GATEWAY_HOST=0.0.0.0`**:
   Settings → Services → Remote Access runs a supervised `cloudflared` child process
   (`bun/cloudflared.ts` downloads the official binary into `<dataDir>/engines/cloudflared/`;

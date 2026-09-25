@@ -11,6 +11,7 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SYSTEMONE_DEFAULT_MODEL } from "../shared/systemone";
+import { isEmptyResult, isUnansweredAsk, SEARCH_TOOLS } from "./agent-loop-guard";
 import { runSystemOne } from "./systemone";
 
 export type VerifyMode = "off" | "report" | "escalate";
@@ -19,10 +20,16 @@ export function parseVerifyMode(value: unknown): VerifyMode {
   return value === "report" || value === "escalate" ? value : "off";
 }
 
-/** 阈值：设置值 → 0～1 之间的数，非法值回落 0.9（E4 的取值）。 */
+/**
+ * 默认阈值 0.7。E4 桩环境用 0.9 只升级 16%，但 E6 真实 App 里 0.9 升级了 56%，
+ * 多出来的主要是 0.73～0.89 的边界判定（回答本身没错）；0.7 时降到 28%。
+ */
+export const DEFAULT_VERIFY_THRESHOLD = 0.7;
+
+/** 阈值：设置值 → 0～1 之间的数，非法值回落默认值。 */
 export function parseVerifyThreshold(value: unknown): number {
   const n = Number(value);
-  return Number.isFinite(n) && n > 0 && n < 1 ? n : 0.9;
+  return Number.isFinite(n) && n > 0 && n < 1 ? n : DEFAULT_VERIFY_THRESHOLD;
 }
 
 /** E4 验证过的 v2 问法（英文：JEV 骨干的判定说明是英文训练的，照原样用）。 */
@@ -36,6 +43,24 @@ const RESULT_CHARS = 400;
 const REPLY_CHARS = 2000;
 
 type Block = { type: string; text?: string; name?: string; arguments?: unknown };
+type TurnMessage = { role?: string; content?: unknown; toolName?: string; isError?: boolean; details?: { error?: unknown } };
+
+/**
+ * 没人应答的 `ask_user` 在验收里写成「已经问了、等用户回答」。无头运行里它的原始结果是一条报错
+ * （「不可用」），JEV 会把这条失败当成没做对 —— E6 里「给他发邮件」「帮我画张图」因此判 0.18 / 0.27，
+ * 可这两题正确做法恰恰就是反问。
+ */
+const ASKED_AND_WAITING = "(question shown to the user; waiting for their answer)";
+
+/** 工具结果正文：去掉循环守卫追加的「【提示】」块（那是给模型看的，不是工具的结果）。 */
+function resultTextOf(content: unknown): string {
+  if (!Array.isArray(content)) return textOf(content);
+  return textOf((content as Block[]).filter((b) => !(b.type === "text" && b.text?.trim().startsWith("【提示】"))));
+}
+
+function failedResult(m: TurnMessage): boolean {
+  return m.isError === true || Boolean(m.details?.error);
+}
 
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
@@ -53,7 +78,7 @@ function textOf(content: unknown): string {
 export function buildVerifyState(request: string, turnMessages: AgentMessage[]): { context: string; reply: string } {
   const actions: string[] = [];
   let reply = "";
-  for (const m of turnMessages as { role?: string; content?: unknown; toolName?: string }[]) {
+  for (const m of turnMessages as TurnMessage[]) {
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const b of m.content as Block[]) {
         if (b.type === "toolCall") actions.push(`${b.name}(${JSON.stringify(b.arguments ?? {})})`);
@@ -61,12 +86,37 @@ export function buildVerifyState(request: string, turnMessages: AgentMessage[]):
       const text = textOf(m.content).trim();
       if (text) reply = text;
     } else if (m.role === "toolResult" && actions.length) {
-      const result = textOf(m.content).replace(/\s+/g, " ").trim().slice(0, RESULT_CHARS);
+      const raw = resultTextOf(m.content);
+      const result =
+        m.toolName === "ask_user" && isUnansweredAsk(raw, failedResult(m))
+          ? ASKED_AND_WAITING
+          : raw.replace(/\s+/g, " ").trim().slice(0, RESULT_CHARS);
       actions[actions.length - 1] += ` → ${result || "(empty)"}`;
     }
   }
   const list = actions.length ? actions.map((a, i) => `${i + 1}. ${a}`).join("\n") : "(none)";
   return { context: `User request: ${request}\n\nActions taken:\n${list}`, reply: reply.slice(0, REPLY_CHARS) };
+}
+
+/**
+ * 这一轮是不是「只做了查找，而且全都没找到」（知识库为空、网页不存在……）。
+ * 这时验收不通过也不升级：云端模型用的是同一批工具，同样查不到，升级只会多花一次云端解码
+ * （E6：网页不存在 0.25、知识库为空 0.44 / 0.75，升级后都没做出来）。本地如实说「没找到」就是对的结局。
+ */
+export function lookupsAllEmpty(turnMessages: AgentMessage[]): boolean {
+  let lookups = 0;
+  for (const m of turnMessages as TurnMessage[]) {
+    if (m.role === "assistant" && Array.isArray(m.content)) {
+      for (const b of m.content as Block[]) {
+        if (b.type !== "toolCall") continue;
+        if (!b.name || !SEARCH_TOOLS.has(b.name)) return false;
+        lookups += 1;
+      }
+    } else if (m.role === "toolResult") {
+      if (!failedResult(m) && !isEmptyResult(resultTextOf(m.content))) return false;
+    }
+  }
+  return lookups > 0;
 }
 
 export type VerifyOutcome = { ok: true; p: number } | { ok: false; error: string };

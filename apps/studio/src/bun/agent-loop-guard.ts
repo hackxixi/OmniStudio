@@ -48,8 +48,13 @@ const AFTER_UNANSWERED_ASK = new Set(["ask_user", "bash", "apply_patch", "load_t
 export const DEV_INTENT =
   /代码|脚本|命令行?|终端|shell|bash|git|编译|构建|单测|测试用例|报错|bug|debug|调试|安装|依赖|npm|pnpm|bun |pip|python|node|函数|接口|仓库|repo|commit|补丁|patch|部署|日志|进程|端口|编程|程序/i;
 
-/** `ask_user` 没人应答时的返回（无头运行 / 已关闭提问）。 */
-const UNANSWERED = /not available|no answer|无人值守|没有人|无法询问|没人回答/i;
+/** `ask_user` 没人应答时的返回（无头运行 / 已关闭提问 / 用户关掉或超时）。 */
+const UNANSWERED = /not available|no answer|did not answer|无人值守|没有人|无法询问|没人回答/i;
+
+/** 这次 `ask_user` 是否没人应答（工具报错也算：无头运行里它直接返回「不可用」）。 */
+export function isUnansweredAsk(resultText: string, failed: boolean): boolean {
+  return failed || UNANSWERED.test(resultText);
+}
 
 export const SEARCH_NOTICE_EMPTY_STREAK = 2;
 export const SEARCH_NOTICE_TOTAL = 5;
@@ -110,7 +115,7 @@ export class TurnLoopGuard {
 
   /** 调用后记账：返回要追加在工具结果末尾的提示（给模型看的），null = 不追加。 */
   record(toolName: string, resultText: string, failed: boolean): string | null {
-    if (toolName === "ask_user" && (failed || UNANSWERED.test(resultText))) {
+    if (toolName === "ask_user" && isUnansweredAsk(resultText, failed)) {
       this.askUnanswered = true;
       return "【提示】现在没有人能回答。用已有信息尽量回答，说明还缺什么，然后结束这一轮；不要再追问，也不要改用别的工具硬做。";
     }

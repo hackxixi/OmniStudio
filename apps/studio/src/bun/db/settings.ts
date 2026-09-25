@@ -249,7 +249,7 @@ export type SettingsKey =
   | "AGENT_TOOL_STRATEGY"
   /** 精简路由的云端验收：off / report（只记结论）/ escalate（不过就交给云端模型接着做）。 */
   | "AGENT_VERIFY_MODE"
-  /** 云端验收阈值（JEV 判定「处理对了」的概率低于它算不通过），默认 0.9。 */
+  /** 云端验收阈值（JEV 判定「处理对了」的概率低于它算不通过），默认 0.7。 */
   | "AGENT_VERIFY_THRESHOLD"
   /** 升级用的云厂商 id 与模型（「云端模型」里已启用的厂商）。 */
   | "AGENT_ESCALATE_PROVIDER_ID"
@@ -595,7 +595,7 @@ const DEFAULTS: Record<SettingsKey, string> = {
   AGENT_TOOL_STRATEGY: "classic",
   /** 云端验收默认关：它要用云端 JEV 的 Key，而且每轮多一次云端调用，得用户自己打开。 */
   AGENT_VERIFY_MODE: "off",
-  AGENT_VERIFY_THRESHOLD: "0.9",
+  AGENT_VERIFY_THRESHOLD: "0.7",
   AGENT_ESCALATE_PROVIDER_ID: "",
   AGENT_ESCALATE_MODEL: "",
   // 回合快照：影子 git 仓库记下每轮开始前的工作区状态，界面可一键「撤销本轮」。
