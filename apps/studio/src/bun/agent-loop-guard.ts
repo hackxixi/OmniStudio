@@ -12,8 +12,9 @@
  *   连续 3 次没结果、或本轮已搜 8 次 → 直接拦下后续搜索。
  * - 生成类工具失败后：同一个生成工具本轮不再允许调用；bash / load_tools 这类绕路手段也拦下。
  * - dev 组（bash / apply_patch）只给开发类请求：本轮不是开发类请求时，`load_tools(dev)` 被拦下。
- * - `ask_user` 没人应答（无人值守运行）后：本轮不再追问，也不许转向 bash / apply_patch / load_tools 硬做 ——
- *   E6 里模型问三次没人答，就加载 dev 组用 bash 去「翻译」「发邮件」。
+ * - `ask_user` 没人应答（无人值守运行）后：本轮不再追问，也不许转向 bash / apply_patch / load_tools 硬做，
+ *   也不许自己编内容去调生成类工具 —— E6 里模型问三次没人答，就加载 dev 组用 bash 去「翻译」「发邮件」，
+ *   或者问「画什么」没人答就随便画一张。
  *
  * 纯逻辑，无副作用；接线在 agent.ts 的 beforeToolCall / afterToolCall。
  */
@@ -41,8 +42,11 @@ export const GENERATION_TOOLS = new Set(["generate_image", "generate_speech", "g
 /** 生成失败后本轮拦下的绕路工具。 */
 const WORKAROUND_TOOLS = new Set(["bash", "load_tools", "apply_patch"]);
 
-/** 问不到用户之后本轮拦下的工具。 */
-const AFTER_UNANSWERED_ASK = new Set(["ask_user", "bash", "apply_patch", "load_tools"]);
+/**
+ * 问不到用户之后本轮拦下的工具。生成类也在内：问的正是「画什么 / 念什么」，没得到回答就自己编一个去生成，
+ * 是替用户做了只有用户能做的决定（E6 v3「帮我画张图」：ask_user 没人应答 → 直接 generate_image）。
+ */
+const AFTER_UNANSWERED_ASK = new Set(["ask_user", "bash", "apply_patch", "load_tools", ...GENERATION_TOOLS]);
 
 /** 开发类请求的说法：写代码、跑命令、查报错、装依赖、提交代码…… */
 export const DEV_INTENT =

@@ -150,3 +150,19 @@ export function escalationPrompt(p: number): string {
     "已经成功完成的步骤不要重复。如果缺的是只有用户知道的信息，就直接问用户。最后重新给出完整的答复。"
   );
 }
+
+/**
+ * 升级回复里漏出了模型的原始标记：`<think>` / `</think>` 思考块，或没被服务端解析成结构化调用的
+ * `<tool_call>` / `<function=…>` 原文。云端服务没配推理 / 工具调用解析器时就会这样（E6 v3：ycs2 的
+ * SGLang 没带 `--tool-call-parser` / `--reasoning-parser`，升级回复把整段思考和 XML 工具调用当正文给了用户，
+ * 一个工具也没真正调成）。出现这种回复时整段作废、保留本地结果 —— 什么厂商都不该把这些显示给用户。
+ */
+const LEAKED_MARKUP = /<\/?think>|<\/?tool_call>|<function=[^>]*>|<\/function>|<parameter=[^>]*>/i;
+
+export function escalationLeakedMarkup(messages: AgentMessage[]): boolean {
+  for (const m of messages as TurnMessage[]) {
+    if (m.role !== "assistant") continue;
+    if (LEAKED_MARKUP.test(textOf(m.content))) return true;
+  }
+  return false;
+}

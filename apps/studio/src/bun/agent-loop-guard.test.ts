@@ -85,6 +85,12 @@ describe("ask_user 没人应答", () => {
     expect(g.check("load_tools", { group: "dev" })).not.toBeNull();
     expect(g.check("write_file")).toBeNull();
   });
+  test("之后也不许自己编内容去生成（问的就是画什么）", () => {
+    const g = new TurnLoopGuard();
+    g.record("ask_user", "Asking the user is not available in this mode.", true);
+    expect(g.check("generate_image")).toContain("没有人能回答");
+    expect(g.check("generate_speech")).not.toBeNull();
+  });
   test("用户关掉提问或超时也算没人应答", () => {
     const g = new TurnLoopGuard();
     const dismissed = "The user did not answer (dismissed or timed out). Continue sensibly and say what you assumed.";

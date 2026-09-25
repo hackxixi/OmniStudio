@@ -18,7 +18,8 @@
  * REPEAT>1 时每题跑 N 次，结果行带 rep 字段（1..N），汇总交给 summarize.ts。
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { TASKS, score, type Call, type Step, type Task } from "../e5-tool-disclosure/tasks";
 import { READ_ONLY } from "../e5-tool-disclosure/tools";
@@ -79,7 +80,18 @@ const FILES: Record<string, string> = {
   "docs/plan.md": "# 上线计划\n\n- 功能冻结：9 月 30 日\n- 上线日期：10 月 8 日\n- 负责人：张伟\n",
   "finance/budget-2026.xlsx": "placeholder spreadsheet",
 };
+/**
+ * 每题开始前把工作区**清空**再写回预置文件。只覆盖预置文件是不够的：前面题目（或前几轮）写出的文件会留下来，
+ * E6 v3 里 `notes/travel.md` 就是这样残留的（一份模型编的住宿标准），于是「查知识库再写文件」
+ * 那题读到它、把它当成了查到的结果。工作区是专供本实验的临时目录，拒绝清空根目录 / 家目录这类路径。
+ */
 function resetWorkspace() {
+  const root = path.resolve(WORKSPACE);
+  if (root === "/" || root === path.resolve(homedir()) || root.split(path.sep).filter(Boolean).length < 3) {
+    throw new Error(`WORKSPACE 看起来不是实验专用目录，拒绝清空：${root}`);
+  }
+  mkdirSync(root, { recursive: true });
+  for (const entry of readdirSync(root)) rmSync(path.join(root, entry), { recursive: true, force: true });
   for (const [rel, content] of Object.entries(FILES)) {
     mkdirSync(path.dirname(path.join(WORKSPACE, rel)), { recursive: true });
     writeFileSync(path.join(WORKSPACE, rel), content);

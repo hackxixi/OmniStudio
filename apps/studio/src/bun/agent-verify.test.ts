@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { buildVerifyState, escalationPrompt, lookupsAllEmpty, parseVerifyMode, parseVerifyThreshold } from "./agent-verify";
+import { buildVerifyState, escalationLeakedMarkup, escalationPrompt, lookupsAllEmpty, parseVerifyMode, parseVerifyThreshold } from "./agent-verify";
 
 describe("设置解析", () => {
   test("验收模式：未知值一律 off", () => {
@@ -137,5 +137,22 @@ describe("lookupsAllEmpty：只查找且全没找到时不升级", () => {
   });
   test("一个工具都没调 → 否", () => {
     expect(lookupsAllEmpty(turn({ role: "assistant", content: [{ type: "text", text: "75" }] }))).toBe(false);
+  });
+});
+
+describe("escalationLeakedMarkup：升级回复漏出原始标记就作废", () => {
+  const reply = (text: string) => [{ role: "assistant", content: [{ type: "text", text }] }] as unknown as AgentMessage[];
+  test("思考块与未解析的工具调用原文（E6 v3 实例）", () => {
+    expect(escalationLeakedMarkup(reply("让我回顾一下任务……\n</think>\n\n我检查了上一轮"))).toBe(true);
+    expect(escalationLeakedMarkup(reply("<tool_call>\n<function=recall>\n<parameter=query>\n收件人\n</parameter>"))).toBe(true);
+  });
+  test("正常回复、工具结果里的尖括号不算", () => {
+    expect(escalationLeakedMarkup(reply("请告诉我收件人邮箱，我再帮你起草。"))).toBe(false);
+    const withTool = [
+      { role: "assistant", content: [{ type: "toolCall", id: "1", name: "read_file", arguments: {} }] },
+      { role: "toolResult", toolCallId: "1", toolName: "read_file", content: [{ type: "text", text: "<think>html 里的字面量</think>" }] },
+      { role: "assistant", content: [{ type: "text", text: "文件里有一段示例标记。" }] },
+    ] as unknown as AgentMessage[];
+    expect(escalationLeakedMarkup(withTool)).toBe(false);
   });
 });

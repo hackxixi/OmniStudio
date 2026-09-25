@@ -51,7 +51,14 @@ import {
   type RoutedToolset,
 } from "./agent-routed-tools";
 import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
-import { escalationPrompt, lookupsAllEmpty, parseVerifyMode, parseVerifyThreshold, verifyTurn } from "./agent-verify";
+import {
+  escalationLeakedMarkup,
+  escalationPrompt,
+  lookupsAllEmpty,
+  parseVerifyMode,
+  parseVerifyThreshold,
+  verifyTurn,
+} from "./agent-verify";
 import { resolveCloudProvider } from "./cloud-providers";
 import { fillAspectRatio, pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
@@ -687,7 +694,16 @@ function createEscalationStreamFn(): { model: Model<"openai-completions">; strea
  * 精简路由策略的云端验收 + 升级（`AGENT_VERIFY_MODE`，见 agent-verify.ts）。
  * 本轮以失败 / 中断收尾时不验收（那由回合结果分类处理）；验收服务不可用只记一条，不影响本地结果。
  */
-async function verifyAndMaybeEscalate(session: Session, conversationId: number, request: string, turnStart: number) {
+/** 升级前后对流式正文的处理：升级回复作废时，把正文 / 思考 / 待落事件的尾巴回退到升级之前。 */
+type EscalationTextHooks = { mark: () => void; rollback: () => void };
+
+async function verifyAndMaybeEscalate(
+  session: Session,
+  conversationId: number,
+  request: string,
+  turnStart: number,
+  text: EscalationTextHooks,
+) {
   const mode = parseVerifyMode(getSetting("AGENT_VERIFY_MODE"));
   if (mode === "off" || !session.routed) return;
   const agent = session.agent;
@@ -734,6 +750,8 @@ async function verifyAndMaybeEscalate(session: Session, conversationId: number, 
   if (!escalation) return;
   const localModel = agent.state.model;
   const localStreamFn = agent.streamFunction;
+  const before = agent.state.messages.length;
+  text.mark();
   agent.streamFunction = escalation.streamFn;
   agent.state.model = escalation.model;
   try {
@@ -741,6 +759,25 @@ async function verifyAndMaybeEscalate(session: Session, conversationId: number, 
   } finally {
     agent.streamFunction = localStreamFn;
     agent.state.model = localModel;
+  }
+  if (escalationLeakedMarkup(agent.state.messages.slice(before))) {
+    // 升级要求与作废的回复一起摘掉：下一轮的上下文里不该留着半截 XML 和思考过程。
+    agent.state.messages = agent.state.messages.slice(0, before);
+    text.rollback();
+    recordEvent({
+      conversationId,
+      messageId,
+      kind: "status",
+      toolName: "verify",
+      output: `云端模型 ${escalation.label} 的回复里混进了思考过程 / 未解析的工具调用原文，已作废，保留本地结果。请检查该服务是否开启了推理与工具调用解析。`,
+    });
+    logEvent({
+      level: "warn",
+      source: "agent",
+      event: "agent.escalate.malformed",
+      message: "升级回复含未解析的 <think> / <tool_call> 标记，已作废",
+      detail: { conversationId, model: escalation.label },
+    });
   }
 }
 
@@ -3229,7 +3266,21 @@ export async function runAgentTurn(opts: {
       const turnStart = agent.state.messages.length;
       await runTurnWithRecovery();
       if (session.routed && !stopRequested && !stopRequests.has(conversationId)) {
-        await verifyAndMaybeEscalate(session, conversationId, content, turnStart);
+        let mark = { text: "", reasoning: "" };
+        await verifyAndMaybeEscalate(session, conversationId, content, turnStart, {
+          mark: () => {
+            // 本地那一段收尾正文先落成事件：它属于本地结果，升级作废时不能跟着一起丢。
+            flushStepText();
+            mark = { text: fullText, reasoning };
+          },
+          rollback: () => {
+            // 与失败重试的回退同理：已经流到界面的字撤不回来，收尾的 emitDone 会用最终正文整条覆盖。
+            flusher.discard();
+            pendingStepText = "";
+            fullText = mark.text;
+            reasoning = mark.reasoning;
+          },
+        });
       }
     }
     // 模型循环结束：最后一段正文（收尾回答）也落成事件，时间轴到此完整。
