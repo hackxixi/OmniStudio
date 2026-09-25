@@ -22,6 +22,16 @@ OMNI_DATA_DIR=~/.omni-e6 bun run --cwd apps/studio start      # 用独立数据�
 OMNI_DATA_DIR=~/.omni-e6 WORKSPACE=<工作区> TAG=routed bun run.ts
 ```
 
+- 本地 4B 的 Agent 不是 temperature 0，单次运行有抖动：`REPEAT=3` 让每题跑 3 次
+  （结果行带 `rep` 字段 1..3，追加写同一个 jsonl），再用 `bun summarize.ts results-e6.jsonl`
+  按 tag 汇总每题通过次数 / 总次数、整体通过率、耗时与调用次数，输出两张 markdown 表
+  （旧行没有 rep 字段，按 1 次算；summarize 只统计，不重新打分）：
+
+  ```bash
+  OMNI_DATA_DIR=~/.omni-e6 WORKSPACE=<工作区> TAG=routed REPEAT=3 bun run.ts
+  bun summarize.ts results-e6.jsonl
+  ```
+
 ## 回归过程中修掉的两个产品 bug
 
 1. **`omi agent run` 在模型预填充时被掐断**：Bun 连接 10 秒没有数据就断开，本地 4B 读 4～8K token 的提示要几十秒，
