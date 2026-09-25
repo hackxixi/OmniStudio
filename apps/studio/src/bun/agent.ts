@@ -51,7 +51,7 @@ import {
   type RoutedToolset,
 } from "./agent-routed-tools";
 import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
-import { pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
+import { fillAspectRatio, pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
 import { buildSystemOneAgentTools } from "./systemone-tools";
@@ -1158,6 +1158,8 @@ type RoutedState = {
   pendingReload: boolean;
   /** 本轮循环守卫（搜索打转、生成失败后反复重试）：每轮用户消息开始时换新的。 */
   guard: TurnLoopGuard;
+  /** 本轮用户请求原文（参数补全按它推断，比如「横版」→ aspect_ratio 16:9）。 */
+  request: string;
 };
 
 /** 当前应发给模型的工具列表：核心 + 已加载的组 + （还有没加载的组时）load_tools。 */
@@ -2260,7 +2262,7 @@ function withLoopGuard(
  */
 function withToolStrategy<T extends Parameters<typeof partitionRoutedTools>[0]>(session: Session, tools: T): T {
   if (session.toolStrategy !== "routed") return tools;
-  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard() };
+  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard(), request: "" };
   return routedToolList(session.routed) as T;
 }
 
@@ -2283,6 +2285,7 @@ async function routeToolGroups(
     attachments: [...files.map((f) => f.name), ...imagePaths.map((p) => path.basename(p))],
   });
   // dev 组（bash / apply_patch）只给开发类请求：请求里有开发类说法、JEV 给 dev 的概率不低，或 JEV 不可用时放行。
+  routed.request = content;
   routed.guard = new TurnLoopGuard({
     devAllowed: DEV_INTENT.test(content) || pick.via === "fallback" || (pick.probabilities?.dev ?? 0) >= 0.25,
   });
@@ -2468,6 +2471,16 @@ async function getOrCreateSession(
       if (session.routed) {
         const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName, args);
         if (problem) return { block: true, reason: problem };
+        const ratio = fillAspectRatio(toolName, args, session.routed.request);
+        if (ratio) {
+          recordEvent({
+            conversationId,
+            messageId: currentMessageId(conversationId),
+            kind: "status",
+            toolName: "tool_routing",
+            output: `按请求补上画幅：${toolName} aspect_ratio=${ratio}`,
+          });
+        }
       }
       const fingerprint = `${toolName}:${JSON.stringify(args)}`;
       session.recentCalls.push(fingerprint);

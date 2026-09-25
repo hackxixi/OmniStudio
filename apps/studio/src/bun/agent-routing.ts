@@ -124,3 +124,39 @@ export function routedArgProblem(toolName: string, args: Record<string, unknown>
   }
   return null;
 }
+
+/** 生图 / 生视频支持的画幅（与工具参数说明一致）。 */
+const RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
+
+/**
+ * 从请求的说法里推断画幅：明写的比例优先，其次「竖版 / 横版 / 方形」这类说法。推不出返回 null。
+ * E6 里「生成一张横版海报」模型没传 aspect_ratio，默认 1:1 出了方图。
+ */
+export function inferAspectRatio(request: string): string | null {
+  const explicit = request.match(/\b(16|9|4|3|1)\s*[:：比]\s*(9|16|3|4|1)\b/);
+  if (explicit) {
+    const ratio = `${explicit[1]}:${explicit[2]}`;
+    if ((RATIOS as readonly string[]).includes(ratio)) return ratio;
+  }
+  if (/竖版|竖屏|竖图|竖幅|竖着|手机壁纸|手机屏保|portrait|vertical/i.test(request)) return "9:16";
+  if (/横版|横屏|横图|横幅|宽屏|电脑壁纸|桌面壁纸|banner|landscape|horizontal|widescreen/i.test(request)) return "16:9";
+  if (/正方形|方形|方图|头像|square/i.test(request)) return "1:1";
+  return null;
+}
+
+/** 这些工具按请求补画幅。 */
+const ASPECT_TOOLS = new Set(["generate_image", "generate_video"]);
+
+/**
+ * 精简路由策略的参数补全：生图 / 生视频没传画幅（也没给宽高）而请求里说了横版 / 竖版时，**原地**补上 `aspect_ratio`。
+ * 内核把 beforeToolCall 收到的同一个参数对象交给工具执行，原地修改即生效。返回补上的值，没补返回 null。
+ */
+export function fillAspectRatio(toolName: string, args: Record<string, unknown>, request: string): string | null {
+  if (!ASPECT_TOOLS.has(toolName)) return null;
+  const given = typeof args.aspect_ratio === "string" && args.aspect_ratio.trim() !== "";
+  if (given || args.width !== undefined || args.height !== undefined) return null;
+  const ratio = inferAspectRatio(request);
+  if (!ratio) return null;
+  args.aspect_ratio = ratio;
+  return ratio;
+}
