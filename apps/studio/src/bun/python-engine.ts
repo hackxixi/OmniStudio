@@ -4,7 +4,8 @@
  * 应用自己建 venv 装包，而不是让用户去 pip install —— 装进 `<dataDir>/engines/<id>`，
  * 版本可复现、卸载干净、不污染用户的全局 Python（也避免"用户装过但版本对不上"这类
  * 说不清的问题）。做法与既有的媒体引擎（mflux / PaddleOCR）一致：uv 优先（快一个
- * 数量级），没有 uv 回退 `python -m venv` + pip；默认 PyPI 源失败自动换清华镜像重试。
+ * 数量级），没有 uv 回退 `python -m venv` + pip；PyPI 索引按下载源计划依次尝试
+ * （首选探测出来最快的那个，失败换下一个，见 python-sources.ts）。
  *
  * 与那两个模块的区别只有一点：这里把「建环境 → 装包 → 验证 → 写标记」抽成可复用的
  * 一份，日志与阶段由调用方注入（`InstallReporter`），因此引导页四个引擎共用同一条
@@ -12,6 +13,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 
+import type { SourcePlan } from "../shared/net-sources";
 import { logEvent } from "./app-log";
 import { DEFAULT_COMMAND_TIMEOUT_MS, defaultCommandRunner, searchPath, type CommandRunner } from "./command-runner";
 import {
@@ -21,6 +23,8 @@ import {
   pythonEnginePython,
   type PythonEngineId,
 } from "./engine-paths";
+import { getSourcePlan } from "./net-sources";
+import { installEnv, installFromIndexes, resolveUv } from "./python-sources";
 
 /**
  * 安装阶段（界面按它显示进度文案）。二进制安装与 pip 安装共用这一套词汇：
@@ -70,6 +74,8 @@ export type PythonInstallOptions = {
    * 不带这个标志的默认行为仍然是"装过就跳过"——引导页点一次不该把几百 MB 重下一遍。
    */
   upgrade?: boolean;
+  /** 下载源计划（索引顺序、镜像环境变量）；不传则现取（测试注入固定计划）。 */
+  plan?: SourcePlan;
 };
 
 export type PythonInstallResult = {
@@ -143,9 +149,6 @@ export function probeVersion(
 // 安装
 // ---------------------------------------------------------------------------
 
-/** 默认 PyPI 源不通时换清华镜像重试一次（与 mflux / PaddleOCR 同一做法）。 */
-const PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple";
-
 export async function installPythonEngine(options: PythonInstallOptions): Promise<PythonInstallResult> {
   const runner = options.runner ?? defaultCommandRunner;
   const { reporter, id, label } = options;
@@ -193,8 +196,11 @@ export async function installPythonEngine(options: PythonInstallOptions): Promis
   }
 
   const engineDir = pythonEngineDir(id);
-  const uv = (options.findUv ?? (() => Bun.which("uv", { PATH: searchPath() })))();
+  const uv = (options.findUv ?? (() => resolveUv(searchPath())))();
   const venvPython = pythonEnginePython(id);
+  const plan = options.plan ?? (await getSourcePlan());
+  // 子进程环境：镜像变量（uv 取解释器走 UV_PYTHON_INSTALL_MIRROR 等），索引由下面逐次的参数决定。
+  const env = installEnv(plan);
 
   try {
     if (!existsSync(venvPython)) {
@@ -206,7 +212,7 @@ export async function installPythonEngine(options: PythonInstallOptions): Promis
       mkdirSync(engineDir, { recursive: true });
       const venvCmd = uv ? [uv, "venv", "--python", python, engineDir] : [python, "-m", "venv", engineDir];
       reporter.log(`$ ${venvCmd.join(" ")}\n`);
-      const venvCode = await runner.runStreaming(venvCmd, (line) => reporter.log(`${line}\n`));
+      const venvCode = await runner.runStreaming(venvCmd, (line) => reporter.log(`${line}\n`), { env });
       if (venvCode !== 0 || !existsSync(venvPython)) {
         const error =
           "创建虚拟环境失败，请确认 Python 带有 venv 模块（Debian / Ubuntu 需 apt install python3-venv）";
@@ -233,14 +239,16 @@ export async function installPythonEngine(options: PythonInstallOptions): Promis
           ]
         : [pythonEngineBin(id, "pip3"), "install", "--upgrade", ...options.packages, ...indexArgs];
 
-    const first = installWith([]);
-    reporter.log(`$ ${first.join(" ")}\n`);
-    let code = await runner.runStreaming(first, (line) => reporter.log(`${line}\n`));
-    if (code !== 0) {
-      const mirrored = installWith(uv ? ["--index-url", PYPI_MIRROR] : ["-i", PYPI_MIRROR]);
-      reporter.log(`默认 PyPI 源安装失败（退出码 ${code}），改用清华镜像重试…\n$ ${mirrored.join(" ")}\n`);
-      code = await runner.runStreaming(mirrored, (line) => reporter.log(`${line}\n`));
-    }
+    const { code } = await installFromIndexes({
+      plan,
+      what: label,
+      log: (line) => reporter.log(`${line}\n`),
+      run: (indexArgs) => {
+        const cmd = installWith(indexArgs);
+        reporter.log(`$ ${cmd.join(" ")}\n`);
+        return runner.runStreaming(cmd, (line) => reporter.log(`${line}\n`), { env });
+      },
+    });
     if (code !== 0) {
       const error = `安装失败（退出码 ${code}），请检查网络与代理设置；完整输出见上方日志`;
       reporter.log(`${error}\n`);

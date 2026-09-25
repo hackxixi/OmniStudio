@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { isMmprojFile, scanPlainDir } from "./model-scan";
+import { isMmprojFile, scanPlainDir, specialModelFormat } from "./model-scan";
 
 /**
  * model-scan 的 mmproj 排除测试（真测试体）。
@@ -39,6 +39,28 @@ writeFileSync(join(tmp, "repo", "config.json"), "{}");
 writeFileSync(join(tmp, "repo", "model.safetensors"), "x");
 put(join(tmp, "repo"), "mmproj-f16.gguf");
 
+// laya-mlx 判定模型目录（mlx_config.json 自声明 format）
+mkdirSync(join(tmp, "laya"), { recursive: true });
+writeFileSync(
+  join(tmp, "laya", "mlx_config.json"),
+  JSON.stringify({ format: "laya-mlx", repository: "aac6fef/laya-multilingual-mlx" }),
+);
+writeFileSync(join(tmp, "laya", "model.safetensors"), "x");
+
+// 同名格式但 repo 不在 catalog（别的东西 / 用户自己转换的 checkpoint）：
+// 只看自声明的 format，照样标记
+mkdirSync(join(tmp, "notlaya"), { recursive: true });
+writeFileSync(
+  join(tmp, "notlaya", "mlx_config.json"),
+  JSON.stringify({ format: "laya-mlx", repository: "someone/else-mlx" }),
+);
+writeFileSync(join(tmp, "notlaya", "model.safetensors"), "x");
+
+// mlx_config.json 损坏：不标记
+mkdirSync(join(tmp, "badcfg"), { recursive: true });
+writeFileSync(join(tmp, "badcfg", "mlx_config.json"), "{ not json");
+writeFileSync(join(tmp, "badcfg", "model.safetensors"), "x");
+
 const models = scanPlainDir(tmp, "external");
 
 describe("model-scan / mmproj 排除", () => {
@@ -64,5 +86,43 @@ describe("model-scan / mmproj 排除", () => {
     const repoEntry = models.find((m) => m.isDir && m.repo === "repo");
     expect(repoEntry).toBeDefined();
     expect([...(repoEntry?.files ?? [])].sort()).toEqual(["mmproj-f16.gguf", "model.safetensors"]);
+  });
+});
+
+/**
+ * laya-mlx 判定模型的识别：这些目录（worker 下到 HF 缓存的 checkpoint）会被扫描器
+ * 当成普通 safetensors 仓库列进「已安装」，列表 / 后端靠 specialModelFormat 认出
+ * 它们 —— 列表据此隐藏启动入口，后端据此拒绝启动推理服务器（两者共用同一判定）。
+ */
+describe("model-scan / specialModelFormat（laya-mlx）", () => {
+  test("目录里的 mlx_config.json 声明 format=laya-mlx → 标记", () => {
+    expect(specialModelFormat(join(tmp, "laya"))).toBe("laya-mlx");
+  });
+
+  test("同格式但 repo 不在 catalog（别的东西 / 自己转换的）→ 照样标记（只认自声明格式）", () => {
+    expect(specialModelFormat(join(tmp, "notlaya"))).toBe("laya-mlx");
+  });
+
+  test("mlx_config.json 损坏 → 不标记（宁可当普通目录，不把能加载的模型藏掉）", () => {
+    expect(specialModelFormat(join(tmp, "badcfg"))).toBeNull();
+  });
+
+  test("普通仓库 / 无 mlx_config.json 的目录 → 不标记", () => {
+    expect(specialModelFormat(join(tmp, "repo"))).toBeNull();
+    expect(specialModelFormat(join(tmp, "flat"))).toBeNull();
+  });
+
+  test("扫描结果：laya 目录的文件条目带 special 标记，非 laya 的目录不带", () => {
+    // laya 目录（mlx_config.json + model.safetensors，无 config.json）不是标准仓库布局，
+    // 扫描器按文件条目列出；special 标记来自目录里的 mlx_config.json。
+    const laya = models.find((m) => m.repo === "laya");
+    expect(laya?.special).toBe("laya-mlx");
+    for (const m of models) {
+      if (m.repo === "repo" || m.repo === "badcfg" || m.repo === "flat" || m.repo === "nested") {
+        expect(m.special).toBeUndefined();
+      }
+    }
+    const notLaya = models.find((m) => m.repo === "notlaya");
+    expect(notLaya?.special).toBe("laya-mlx");
   });
 });

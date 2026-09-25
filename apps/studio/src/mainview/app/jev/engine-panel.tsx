@@ -679,7 +679,9 @@ function DiagnoseButton({
       label={t("jev.local.diagnose")}
       error={error}
       context={[
-        `平台：${navigator.platform || "macOS"}`,
+        // 平台行：按钮会从 getAboutInfo 里拿主进程的真实 platform（darwin / linux / win32）
+        // 补一条，这里不再自己拼 navigator.platform（Electrobun 的 webview 里它是空的，
+        // 之前拼出来的要么是空要么是误判成 "macOS"）。
         `本地运行时：${status.localRuntimeInstalled ? `已安装 ${status.localRuntimeVersion}` : "未安装"}`,
         `平台支持：${status.localRuntimeSupported ? "是" : "否"}`,
         `当前阶段：${status.localRuntimePhase}${status.localRuntimePhaseMessage ? ` (${status.localRuntimePhaseMessage})` : ""}`,

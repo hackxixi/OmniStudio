@@ -40,6 +40,7 @@ import {
   type AppLogSource,
 } from "../app-log";
 import { LOG_THROTTLE_MS, PROGRESS_THROTTLE_MS, throttleBatch, throttleLatest } from "../throttle";
+import { parseToolStrategy, type AgentToolStrategy } from "../../shared/agent-tool-strategy";
 import * as ServerManager from "../server-manager";
 import type { ServerStatus } from "../server-manager";
 import * as Served from "../model-servers";
@@ -176,6 +177,8 @@ import * as Hooks from "../agent-hooks";
 import * as CloudProviders from "../cloud-providers";
 import * as Proxy from "../proxy";
 import type { ProxyStatus, ProxyTestResult } from "../proxy";
+import * as NetSources from "../net-sources";
+import type { SourcePlan } from "../../shared/net-sources";
 import type {
   CloudModelEntry,
   CloudProviderInfo,
@@ -195,6 +198,8 @@ import * as ModelStore from "../model-store";
 import type { InstalledModel } from "../model-store";
 import { updateModelCategory } from "../model-category";
 import { getServerStats, type ServerStats } from "../stats";
+import { getResourceUsage, type GetResourceUsageOptions } from "../hardware";
+import type { ResourceUsageInfo } from "../../shared/hardware";
 import { getUsageStats } from "../usage";
 import type { UsageStats } from "../../shared/usage";
 import {
@@ -211,13 +216,16 @@ import {
 } from "../benchmark";
 import { listEvalSuites, type EvalSuiteInfo } from "../eval";
 import { downloadManager, type DownloadTask } from "../download-manager";
+import type { LaunchPlan } from "../launch-plan";
+import { launchPlanPreviewForRpc } from "./launch-plan-preview";
 import {
-  buildLaunchPlanKeyFromSettings,
-  refreshLaunchPlan,
-  type LaunchPlan,
-} from "../launch-plan";
-import { effectiveFlashAttnForPlan } from "../runtimes/llama";
-import { readGgufMeta, type GgufReadFailure } from "../gguf-meta";
+  clearModelParamsForRpc,
+  getModelParamsForRpc,
+  setModelParamsForRpc,
+  type GetModelParamsResult,
+} from "./model-params-rpc";
+import { listModelParams, type ModelParamsEntry } from "../db/model-params";
+import type { ModelParams } from "../../shared/model-params";
 import * as Voice from "../voice";
 import type { VoiceRecordRow, VoiceRecordKind, VoiceClone } from "../voice";
 import * as Asr from "../asr";
@@ -493,6 +501,14 @@ export type AppRPC = {
         params: Proxy.ProxyTestOverride | undefined;
         response: ProxyTestResult;
       };
+      /**
+       * 下载源（设置 → 通用）：当前路由结论 —— 国内加速还是官方直连、各类下载先走哪个源。
+       * refresh = 忽略缓存重新探测（「重新检测」按钮）。
+       */
+      getDownloadSources: {
+        params: { refresh?: boolean } | undefined;
+        response: SourcePlan;
+      };
       checkConnection: {
         params: { baseUrl?: string; apiKey?: string } | undefined;
         response: { connected: boolean; error?: string };
@@ -624,6 +640,16 @@ export type AppRPC = {
       getServerStats: {
         params: undefined;
         response: ServerStats;
+      };
+      /**
+       * 顶栏状态胶囊的机器余量（仅本地模式轮询，5 秒一次）：内存 / 显存总量与剩余。
+       * `vram` 为 null = 没有独立显存（Apple Silicon 是统一内存，`unifiedMemory: true`，
+       * 胶囊只展示内存一段）；`freeBytes` 为 null = 总量能读但空闲读不出（条不画，不算错）。
+       * 主进程缓存 2 秒，轮询不会每次都 spawn vm_stat / nvidia-smi。
+       */
+      getResourceUsage: {
+        params: { refresh?: boolean } | undefined;
+        response: ResourceUsageInfo;
       };
       /**
        * 用量统计（设置 → 数据 → 使用统计）。`rangeDays` 只影响趋势与分组表，
@@ -1343,10 +1369,12 @@ export type AppRPC = {
           /** 当前模型看起来能不能收图片（auto 档的实际判定结果）。 */
           visionAvailable: boolean;
           modelName: string;
+          /** 工具调用方式：classic（全部工具一次给模型）/ routed（精简路由）。 */
+          toolStrategy: AgentToolStrategy;
         };
       };
       setAgentCapabilities: {
-        params: { visionTool?: "auto" | "on" | "off" };
+        params: { visionTool?: "auto" | "on" | "off"; toolStrategy?: AgentToolStrategy };
         response: { ok: boolean };
       };
       getAgentInstructions: {
@@ -1893,6 +1921,29 @@ export type AppRPC = {
         params: { path: string };
         response: { ok: true; plan: LaunchPlan } | { ok: false; error: string; reason: string };
       };
+      /**
+       * 按模型参数（覆盖全局设置，形状见 shared/model-params.ts）。`model` = 模型 target
+       * （本地文件 / 仓库目录 / HF repo id），服务端按注册表同一规则归一。
+       * 返回保存的参数 + 最终采样值（逐项来源）+ 按现在参数的启动命令 + 是否需重启生效。
+       */
+      getModelParams: {
+        params: { model: string };
+        response: GetModelParamsResult;
+      };
+      /** 整份替换（不是合并）；校验后为空 = 删除。改动不自动重启跑着的实例（看 needsRestart）。 */
+      setModelParams: {
+        params: { model: string; params: ModelParams };
+        response: { ok: boolean; params: ModelParams | null; needsRestart: boolean; error?: string };
+      };
+      clearModelParams: {
+        params: { model: string };
+        response: { ok: boolean; needsRestart: boolean };
+      };
+      /** 所有存过按模型参数的模型（最近修改在前），模型列表上标「已自定义」用。 */
+      listModelParams: {
+        params: undefined;
+        response: { entries: ModelParamsEntry[] };
+      };
       toggleFavoriteModel: {
         params: { path: string };
         response: { ok: boolean };
@@ -1954,6 +2005,11 @@ export type AppRPC = {
           sessionStartedAt: number;
           basePath: string;
           dataDir: string;
+          /** 主进程（也就是应用）跑在哪个 OS 上 —— webview 里 navigator.platform 是空的，
+           *  只有主进程知道自己是 darwin / linux / win32（诊断提示词的环境行用它）。 */
+          platform: string;
+          /** 主进程的 CPU 架构（arm64 / x64）：MLX 只在 Apple Silicon 上跑，诊断时要分得清。 */
+          arch: string;
         };
       };
       // Benchmark（速度扫描 + 能力评测：异步任务 + 历史记录）
@@ -3367,6 +3423,8 @@ const rpcRequests: NonNullable<
 
   testProxy: async (params) => Proxy.testProxyConnection(params),
 
+  getDownloadSources: async (params) => NetSources.getSourcePlan({ refresh: params?.refresh === true }),
+
   checkConnection: async (params) => {
     const baseUrl = (params?.baseUrl ?? getSetting("VLLM_API_BASE") ?? "").trim();
     const apiKey = params?.apiKey ?? getSetting("VLLM_API_KEY");
@@ -3481,6 +3539,8 @@ const rpcRequests: NonNullable<
     // 而逐模型显存要按实例的 pid 去归属。
     return getServerStats(Served.getServedModels().models);
   },
+
+  getResourceUsage: async (params?: GetResourceUsageOptions) => getResourceUsage(params ?? {}),
 
   getUsageStats: async ({ rangeDays } = {}) => {
     return getUsageStats(rangeDays);
@@ -4484,9 +4544,13 @@ const rpcRequests: NonNullable<
     visionTool: (getSetting("AGENT_VISION_TOOL") as "auto" | "on" | "off") || "auto",
     visionAvailable: chatModelSupportsImages(),
     modelName: getChatModelLabel(),
+    toolStrategy: parseToolStrategy(getSetting("AGENT_TOOL_STRATEGY")),
   }),
-  setAgentCapabilities: async ({ visionTool }) => {
+  setAgentCapabilities: async ({ visionTool, toolStrategy }) => {
     if (visionTool) updateSettings({ AGENT_VISION_TOOL: visionTool });
+    if (toolStrategy !== undefined) {
+      updateSettings({ AGENT_TOOL_STRATEGY: parseToolStrategy(toolStrategy) });
+    }
     return { ok: true };
   },
   getAgentInstructions: async (params) => {
@@ -4884,14 +4948,15 @@ const rpcRequests: NonNullable<
   // 模型市场
   searchMarketModels: async ({ query, page, source, format }) => {
     const p = page ?? 1;
-    return source === "huggingface"
+    // 没指定平台时跟下载源路由走（国内默认魔搭、海外默认 Hugging Face），不再写死魔搭
+    return (source ?? NetSources.peekSourcePlan().modelSource) === "huggingface"
       ? await HuggingFace.searchModels(query, p, 20, format)
       : await ModelScope.searchModels(query, p, 20, format);
   },
 
   listModelFiles: async ({ repo, source }) => {
     const files =
-      source === "huggingface"
+      (source ?? NetSources.peekSourcePlan().modelSource) === "huggingface"
         ? await HuggingFace.listRepoFiles(repo)
         : await ModelScope.listRepoFiles(repo);
     return { files };
@@ -4925,35 +4990,14 @@ const rpcRequests: NonNullable<
     return { models: ModelStore.listInstalledModels() };
   },
 
-  getLaunchPlanPreview: async ({ path }) => {
-    const modelPath = path.trim();
-    if (modelPath === "") {
-      return { ok: false as const, error: "no model path", reason: "not-found" };
-    }
-    // 与 llama.ts 启动时完全同源的 key：同一函数、同一设置读法、同一个
-    // 「设置 + 上次实测」的 FA 折算（预览端没有 Runtime 实例，实测值读设置里回写的
-    // SERVER_FLASH_ATTN_EFFECTIVE —— 启动过之后两者必然相等）。
-    const key = buildLaunchPlanKeyFromSettings(
-      modelPath,
-      (k) => getSetting(k as SettingsKey),
-      effectiveFlashAttnForPlan(
-        getSetting("SERVER_FLASH_ATTN") as "" | "off" | "on",
-        getSetting("SERVER_FLASH_ATTN_EFFECTIVE") as "" | "off" | "on" | null | undefined,
-      ),
-    );
-    const plan = await refreshLaunchPlan(key);
-    if (plan !== null) return { ok: true as const, plan };
+  // 实现在 ./launch-plan-preview（可测）：路径先过 llamaLoadablePath，与真正启动同源。
+  getLaunchPlanPreview: async ({ path }) => launchPlanPreviewForRpc(path),
 
-    // refreshLaunchPlan 对「读不到 GGUF」静默返回 null，这里补一次读取只为拿到
-    // 失败原因码（该读取自身有 mtime 缓存，成本可忽略）。
-    const read = await readGgufMeta(modelPath);
-    if (read.ok) {
-      // GGUF 读得到但计划算不出来：元数据不足以估算 KV cache。
-      return { ok: false as const, error: read.data.filePath, reason: "no-metadata" };
-    }
-    const reason: GgufReadFailure = read.reason;
-    return { ok: false as const, error: read.error, reason };
-  },
+  // 实现在 ./model-params-rpc（可测）：key 归一、采样解析、命令预览、重启判定都在那里。
+  getModelParams: async ({ model }) => getModelParamsForRpc(model),
+  setModelParams: async ({ model, params }) => setModelParamsForRpc(model, params),
+  clearModelParams: async ({ model }) => clearModelParamsForRpc(model),
+  listModelParams: async () => ({ entries: listModelParams() }),
 
   toggleFavoriteModel: async ({ path }) => {
     ModelStore.toggleFavorite(path);
@@ -5016,6 +5060,11 @@ const rpcRequests: NonNullable<
       sessionStartedAt,
       basePath: ModelStore.getModelsBaseDirForRuntime(),
       dataDir: getUserDataDir(),
+      // webview 侧 navigator.platform 是空的（Electrobun 的 webview 不暴露平台字符串），
+      // 只有主进程知道自己是 darwin / linux / win32。诊断提示词的环境行用它，
+      // Agent 诊断时才能把"我在哪台机器上"说清楚。
+      platform: process.platform,
+      arch: process.arch,
     };
   },
 

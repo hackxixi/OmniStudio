@@ -31,16 +31,29 @@ export function fileKind(fileName: string): ModelFileKind {
   return "other";
 }
 
-/** Recommended engine for a weight format, when the format makes it unambiguous. */
-export function engineForModelKind(kind: ModelFileKind): InferenceEngine | null {
+/**
+ * Recommended engine for a weight format, when the format makes it unambiguous.
+ *
+ * `isMac` 的缺省写法与 `availableEngines` 一致（shared 代码也在 webview 里跑，
+ * 那边 `process` 是 bun 注入的，platform 可用）。
+ *
+ * safetensors 的推荐引擎按平台分：macOS 上没有可用的 vLLM / SGLang（官方只发
+ * Linux 的 CUDA 轮子，见 `ENGINE_SPECS` 与 `engineInstallSupport`），推荐 MLX；
+ * 其它平台推荐 vLLM。不分平台的话，mac 上加载任何 safetensors 目录都会先报
+ * 「vLLM 未安装」（真机：laya-multilingual-mlx 的 HF 缓存目录就是这个现场）。
+ */
+export function engineForModelKind(
+  kind: ModelFileKind,
+  isMac = process.platform === "darwin",
+): InferenceEngine | null {
   if (kind === "gguf") return "llama.cpp";
-  if (kind === "safetensors") return "vllm";
+  if (kind === "safetensors") return isMac ? "mlx" : "vllm";
   return null;
 }
 
 /** Recommended engine for a model file. */
-export function engineForModelFile(fileName: string): InferenceEngine | null {
-  return engineForModelKind(fileKind(fileName));
+export function engineForModelFile(fileName: string, isMac?: boolean): InferenceEngine | null {
+  return engineForModelKind(fileKind(fileName), isMac);
 }
 
 /**
@@ -63,9 +76,13 @@ export function resolveEngineForModel(
 export function resolveEngineForKind(
   kind: ModelFileKind,
   currentEngine: InferenceEngine,
+  isMac?: boolean,
 ): InferenceEngine {
   if (engineSupports(currentEngine, kind)) return currentEngine;
-  return engineForModelKind(kind) ?? currentEngine;
+  // mac 上的当前引擎不可能不支持 safetensors（vllm / sglang 在 mac 上不在
+  // `availableEngines` 里），走到这里说明当前引擎是 llama.cpp 或未知值，
+  // 交给平台感知的推荐（mac → mlx）。
+  return engineForModelKind(kind, isMac) ?? currentEngine;
 }
 
 /** 模型来源平台 —— 检索走哪个站点、下载走哪条链路、UI 上打的哪个标都由它决定。 */
@@ -86,7 +103,8 @@ export const MODEL_SOURCE_META: Record<ModelSource, ModelSourceMeta> = {
   },
   huggingface: {
     label: "Hugging Face",
-    host: "hf-mirror.com",
+    // 这里只是徽标 tooltip 的平台域名；实际走官方还是 hf-mirror 由下载源路由决定（net-sources）
+    host: "huggingface.co",
   },
 };
 

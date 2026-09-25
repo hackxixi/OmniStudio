@@ -39,6 +39,10 @@ export function buildDiagnosisPrompt(p: {
     `报错：${p.error}`,
     ...(p.context ?? []),
     tail.length > 0 ? `\n日志（末尾 ${tail.length} 行）：\n${tail.join("\n")}` : "",
+    // 行动建议：把"找东西"的步数省掉。真机现场里最常见的浪费是 Agent 先花十几步
+    // glob/grep 去找日志文件和数据库在哪（还撞上工作区权限被拒、只能改用 bash 绕）。
+    // 提示词里把路径直接给它（见 agent-diagnose-button 的环境行），再明确"先读、别搜"。
+    "先读上面给出的日志与报错，工作区外的文件用 bash（cat / grep / sed）读取；判断清楚后直接给出结论与修复步骤，不要大范围搜索源码。",
   ]
     .filter((line) => line !== "")
     .join("\n");

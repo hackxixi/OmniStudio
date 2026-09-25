@@ -1,5 +1,7 @@
 import { Updater } from "electrobun";
 import { getSetting } from "./db/settings";
+import { fetchGithubJson } from "./github-api";
+import { getSourcePlan } from "./net-sources";
 import {
   RELEASE_REPO,
   RELEASES_URL,
@@ -47,14 +49,16 @@ async function doCheck(): Promise<ReleaseCheckResult> {
   }
 
   try {
-    const res = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=30`, {
-      headers: { Accept: "application/vnd.github+json", "User-Agent": "omni-studio" },
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) {
-      throw new Error(`GitHub API 返回 HTTP ${res.status}`);
-    }
-    const releases = (await res.json()) as GitHubRelease[];
+    // 按下载源计划的链路顺序：海外直连在前（与原来一致），国内先走能代理 API 的镜像。
+    const releases = await fetchGithubJson<GitHubRelease[]>(
+      `https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=30`,
+      {
+        plan: await getSourcePlan(),
+        timeoutMs: 15_000,
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "omni-studio" },
+        validate: Array.isArray,
+      },
+    );
     // stable 通道跳过 prerelease / 带连字符的 tag（如 v0.0.6-canary.1），beta 通道取最新一条。
     const pick = releases.find(
       (r) => channel === "beta" || (!r.prerelease && !(r.tag_name ?? "").includes("-")),

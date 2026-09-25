@@ -148,6 +148,37 @@ await mockModulePartial<typeof import("./download-manager")>("./download-manager
   downloadManager: { list: () => DOWNLOADS } as never,
 });
 
+/**
+ * model-scan 桩：`resolveRuntimeTarget` / `dirModelKind` / `modelNameForPath` 是
+ * model-servers 的 target 解析链；`specialModelFormat` 是 laya-mlx 拒绝的判据
+ * （桩按目录里的 mlx_config.json 判，与真实现同一套规则）。
+ */
+await mockModulePartial<typeof import("./model-scan")>("./model-scan", {
+  resolveRuntimeTarget: (p: string) => p,
+  dirModelKind: (dir: string) => {
+    // 有 model.safetensors 就是 safetensors（与真实现同一简化）
+    try {
+      const { readdirSync } = require("fs") as typeof import("fs");
+      return readdirSync(dir).some((n) => n.endsWith(".safetensors")) ? "safetensors" : "gguf";
+    } catch {
+      return "other";
+    }
+  },
+  modelNameForPath: (p: string) => p.split(/[\\/]/).pop() ?? p,
+  specialModelFormat: (dir: string): "laya-mlx" | null => {
+    try {
+      const { existsSync, readFileSync } = require("fs") as typeof import("fs");
+      const cfgPath = join(dir, "mlx_config.json");
+      if (!existsSync(cfgPath)) return null;
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+      // 与真实现一致：只认自声明的 format 字段，不校验 repo 名单
+      return cfg?.format === "laya-mlx" ? "laya-mlx" : null;
+    } catch {
+      return null;
+    }
+  },
+});
+
 const Registry = await import("./model-servers");
 
 const tmpDir = mkdtempSync(join(tmpdir(), "model-servers-test-"));
@@ -158,6 +189,16 @@ writeFileSync(modelB, "gguf");
 const safetensorsDir = join(tmpDir, "repo");
 mkdirSyncSafe(safetensorsDir, `{"model_type":"qwen3"}`);
 writeFileSync(join(safetensorsDir, "model.safetensors"), "weights");
+// laya-mlx 判定模型目录（mlx_config.json 自声明 format）
+const layaDir = join(tmpDir, "laya");
+mkdirSyncSafe(layaDir, `{}`);
+writeFileSync(join(layaDir, "model.safetensors"), "weights");
+writeFileSync(
+  join(layaDir, "mlx_config.json"),
+  JSON.stringify({ format: "laya-mlx", repository: "aac6fef/laya-multilingual-mlx" }),
+);
+// 平面目录里 laya 被列成文件条目时的现场：runtimeTarget 指向 model.safetensors 文件
+const layaFile = join(layaDir, "model.safetensors");
 
 function mkdirSyncSafe(dir: string, configJson: string) {
   const { mkdirSync } = require("fs") as typeof import("fs");
@@ -217,12 +258,36 @@ describe("startServedModel", () => {
     expect(Registry.listServedModels().length).toBe(1);
   });
 
-  test("目录仓库（safetensors）自动挑能加载它的引擎", async () => {
+  test("目录仓库（safetensors）自动挑能加载它的引擎（平台感知：mac → mlx）", async () => {
     const res = await Registry.startServedModel({ model: safetensorsDir });
     expect(res.ok).toBe(true);
-    expect(res.model?.engine).toBe("vllm");
+    // mac 上没有可用的 vLLM / SGLang，safetensors 推荐 MLX；其它平台推荐 vLLM。
+    const expectedEngine = process.platform === "darwin" ? "mlx" : "vllm";
+    expect(res.model?.engine).toBe(expectedEngine);
     expect(res.model?.isDir).toBe(true);
-    expect(res.model?.port).toBe(18401);
+  });
+
+  test("laya-mlx 判定模型目录：在选引擎之前拒绝启动，给出指向 JEV 页的指引", async () => {
+    const res = await Registry.startServedModel({ model: layaDir });
+    expect(res.ok).toBe(false);
+    // 错误文案必须说清楚「不是聊天模型」和「去 JEV 页」，不能只是「启动失败」。
+    expect(res.error).toContain("JEV");
+    expect(res.error).toContain("laya-mlx");
+    // 没选引擎、没起进程、没注册条目。
+    expect(created.length).toBe(0);
+    expect(Registry.listServedModels()).toEqual([]);
+  });
+
+  test("laya-mlx 的文件目标（平面目录里列成 model.safetensors）同样拒绝", async () => {
+    const res = await Registry.startServedModel({ model: layaFile });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("laya-mlx");
+    expect(created.length).toBe(0);
+  });
+
+  test("普通 safetensors 目录（无 mlx_config.json）不受 laya 拒绝影响", async () => {
+    const res = await Registry.startServedModel({ model: safetensorsDir });
+    expect(res.ok).toBe(true);
   });
 
   test("不存在的模型名直接报错，不起进程", async () => {
@@ -350,7 +415,9 @@ describe("展示名（label）", () => {
 describe("servedIdForTarget", () => {
   test("本地文件归一化后按引擎 + 目标生成 id", () => {
     expect(Registry.servedIdForTarget(modelA)).toBe(`llama.cpp:${modelA}`);
-    expect(Registry.servedIdForTarget(safetensorsDir)).toBe(`vllm:${safetensorsDir}`);
+    // 平台感知：mac 上 safetensors 目录推荐 mlx，其它平台推荐 vllm。
+    const expectedEngine = process.platform === "darwin" ? "mlx" : "vllm";
+    expect(Registry.servedIdForTarget(safetensorsDir)).toBe(`${expectedEngine}:${safetensorsDir}`);
     expect(Registry.servedIdForTarget("")).toBeNull();
   });
 });

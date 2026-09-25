@@ -258,6 +258,10 @@ Tunnel.cleanupStaleTunnel();
 Tunnel.initTunnelGatewayBinding();
 void Tunnel.reconcileTunnel("startup");
 
+// 下载源预热：后台探测一次各源的可达性与延迟（约 1~3 秒，结果缓存 10 分钟）。不预热的话，
+// 第一次下载 / 启动引擎时拿到的是「按地区猜」的计划 —— 国内开着代理的用户会被猜去走镜像。
+void import("./net-sources").then((m) => m.getSourcePlan()).catch(() => {});
+
 // 记忆库维护（启动后台跑一次）：补内容哈希、归档过期/长期未用的低价值记忆、补向量。
 // 知识库维护：恢复上次进程遗留的摄取作业、对账分块计数、修剪审计流水。
 // 都不阻塞窗口显示，也不影响首屏；失败只记日志。

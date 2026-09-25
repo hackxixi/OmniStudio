@@ -26,7 +26,7 @@ export type TFn = (key: string, params?: Record<string, string>) => string;
  *
  * **显式分支、字面量 key**：这里不用模板字符串拼 key（`t(\`models.plan.reason.${code}\`)`
  * 会绕过 i18n 测试的静态扫描，以后少一条文案谁都发现不了）。加新 code 时必须在这里
- * 加一个 case，`launch-preview.test.ts` 会对全部 16 个 code 各断言一条非空、不等于 key
+ * 加一个 case，`launch-preview.test.ts` 会对全部 code 各断言一条非空、不等于 key
  * 的文案。
  */
 export function reasonText(t: TFn, r: PlanReason): string {
@@ -63,6 +63,10 @@ export function reasonText(t: TFn, r: PlanReason): string {
       return t("models.plan.reason.gpuPartialOffload");
     case "gpu.none":
       return t("models.plan.reason.gpuNone");
+    case "gpu.moe-cpu-offload":
+      return t("models.plan.reason.gpuMoeCpuOffload", {
+        n: String(r.detail?.cpuMoeLayers ?? "?"),
+      });
   }
 }
 
@@ -70,6 +74,9 @@ export function reasonText(t: TFn, r: PlanReason): string {
 function gpuLayersText(t: TFn, plan: LaunchPlan): string {
   const blockCount: number = (plan.reasons.find((r) => r.code === "gpu.partial-offload")?.detail
     ?.blockCount as number | undefined) ?? 0;
+  if (plan.moeOffload) {
+    return t("models.plan.gpuMoeOffload", { n: String(plan.moeOffload.cpuMoeLayers) });
+  }
   if (plan.gpuLayers === null) return t("models.plan.gpuAll");
   if (plan.gpuLayers === 0) return t("models.plan.gpuZero");
   return blockCount > 0 ? t("models.plan.gpuLayersSome", { n: String(plan.gpuLayers), total: String(blockCount) })

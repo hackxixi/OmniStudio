@@ -1,3 +1,5 @@
+import type { DegradedLaunch } from "../../shared/launch-planner";
+
 export type ServerStatus = "stopped" | "starting" | "downloading" | "running" | "error";
 
 export type LogListener = (line: string) => void;
@@ -41,6 +43,18 @@ export interface Runtime {
    * Used to let users copy the command and run it in their own terminal.
    */
   buildCommandLine(modelOverride?: string): string;
+
+  /**
+   * 正在跑的实例若按现在的设置 / 按模型参数重起，argv 是否会变（界面提示「需重启生效」）。
+   * 没在跑 → false。可选：没实现的引擎当作「不知道」（调用方按 false 处理）。
+   */
+  needsRestart?(): boolean;
+
+  /**
+   * 本次运行是不是显存不足降级起来的、临时调小了什么（没降级 = null）。
+   * 可选：只有 llama.cpp 实现了降级重试，其余引擎当作「没降级」。
+   */
+  getDegradedLaunch?(): DegradedLaunch | null;
 
   start(): Promise<StartResult>;
   stop(): Promise<void>;

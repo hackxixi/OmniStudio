@@ -6,7 +6,16 @@ import { modelNameForPath } from "../model-scan";
 import { slugModelFileName } from "../model-store";
 import { markServerStarted } from "../stats";
 import { extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
+import { getModelParams } from "../db/model-params";
+import {
+  cachedVllmHelpSupport,
+  parseVllmHelp,
+  resolveSamplingOrNull,
+  setVllmHelpSupport,
+  vllmSamplingArgs,
+} from "./engine-sampling";
+import { shellJoin, splitShellArgs } from "./shell-args";
 import type {
   BinaryCheckResult,
   LogListener,
@@ -156,16 +165,60 @@ export class VllmRuntime implements Runtime {
 
     const args = this.buildArgs(model, servedName);
     const vllmPath = Bun.which("vllm");
-    if (vllmPath) return [vllmPath, ...args].join(" ");
+    if (vllmPath) return shellJoin([vllmPath, ...args]);
     const python = Bun.which("python3") ?? Bun.which("python");
-    if (python) return [python, "-m", "vllm.entrypoints.openai.api_server", ...args.slice(1)].join(" ");
-    return ["vllm", ...args].join(" ");
+    if (python) return shellJoin([python, "-m", "vllm.entrypoints.openai.api_server", ...args.slice(1)]);
+    return shellJoin(["vllm", ...args]);
+  }
+
+  /**
+   * 采样开关探测缓存的 key：启动时实际用的那份可执行文件（没启动过 = null → 一个采样参数都不发，
+   * 所以没启动过时复制的命令里没有它们；启动过一次后预览与实际一致）。
+   */
+  private helpKey: string | null = null;
+  /** 本次运行实际发出去的 argv（没启动过 = null），needsRestart 的比对基准。 */
+  private launchedArgs: string[] | null = null;
+
+  needsRestart(): boolean {
+    if (this.launchedArgs === null || this.serverStatus !== "running") return false;
+    const { model, servedName } = this.resolveModel();
+    return shellJoin(this.buildArgs(model, servedName)) !== shellJoin(this.launchedArgs);
+  }
+
+  /**
+   * 探测 --override-generation-config / --default-chat-template-kwargs。vLLM 新版 `serve --help`
+   * 只列参数组，要 `--help=all` 才有全量；老版不认 `=all`，再退回 `--help`。python 形态直接问
+   * api_server（它的 parser 一次列全）。vLLM 导入很重，给足超时；成功才落缓存。
+   */
+  private async probeHelp(binaryPath: string, isPython: boolean): Promise<void> {
+    const key = `${isPython ? "py" : "cli"}:${binaryPath}`;
+    this.helpKey = key;
+    if (cachedVllmHelpSupport(key) !== null) return;
+    const cmds = isPython
+      ? [[binaryPath, "-m", "vllm.entrypoints.openai.api_server", "--help"]]
+      : [
+          [binaryPath, "serve", "--help=all"],
+          [binaryPath, "serve", "--help"],
+        ];
+    for (const cmd of cmds) {
+      const help = await readHelpText(cmd, 60_000);
+      if (help === null) continue;
+      const support = parseVllmHelp(help);
+      // 第一条没认出来可能只是「不认 =all、打了用法错误」，继续试下一条；最后一条的结论照单全收。
+      if (support.overrideGenerationConfig || cmd === cmds[cmds.length - 1]) {
+        setVllmHelpSupport(key, support);
+        return;
+      }
+    }
   }
 
   private buildArgs(model: string, servedName?: string): string[] {
     const port = this.overrides.port ?? getServerPort(this.id);
     const host = getSetting("SERVER_HOST") || "127.0.0.1";
-    const maxModelLen = getSetting("VLLM_MAX_MODEL_LEN") || "8192";
+    // 按模型参数（key = 模型 target）：ctxSize → --max-model-len，追加参数，采样 / 思考默认值。
+    const mp = getModelParams(model);
+    const maxModelLen =
+      mp?.ctxSize !== undefined ? String(mp.ctxSize) : getSetting("VLLM_MAX_MODEL_LEN") || "8192";
     const tensorParallel = getSetting("VLLM_TENSOR_PARALLEL_SIZE") || "1";
     const gpuMemUtil = getSetting("VLLM_GPU_MEMORY_UTILIZATION") || "0.9";
     const enforceEager = getSetting("VLLM_ENFORCE_EAGER") === "1";
@@ -191,8 +244,13 @@ export class VllmRuntime implements Runtime {
     if (servedName) args.push("--served-model-name", servedName);
     if (enforceEager) args.push("--enforce-eager");
 
-    const extra = getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]);
-    if (extra.trim()) args.push(...extra.trim().split(/\s+/));
+    args.push(
+      ...vllmSamplingArgs(resolveSamplingOrNull(model, mp), mp?.thinking, cachedVllmHelpSupport(this.helpKey)),
+    );
+
+    // 追加参数放最后：全局在前、按模型在后（argparse 同名参数后者生效）；按 shell 引号规则切分。
+    args.push(...splitShellArgs(getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]) || ""));
+    if (mp?.extraArgs) args.push(...splitShellArgs(mp.extraArgs));
 
     return args;
   }
@@ -212,24 +270,33 @@ export class VllmRuntime implements Runtime {
       return { ok: false, error: "vLLM 未安装。可在引导页 / 设置里点「一键安装」（仅 Linux），或手动执行 pip install vllm" };
     }
 
-    const args = this.buildArgs(model, servedName);
-    this.lastError = "";
-    this.setStatus("starting");
-
     // venv / 系统 python 走 `-m vllm.entrypoints…`，`vllm` CLI 直接执行。
     const isPython =
       binary.mode === "python" ||
       binary.path?.endsWith("python3") ||
       binary.path?.endsWith("python") ||
       binary.path?.endsWith("python.exe");
+
+    await this.probeHelp(binary.path!, Boolean(isPython));
+    const args = this.buildArgs(model, servedName);
+    this.launchedArgs = args;
+    this.lastError = "";
+    this.setStatus("starting");
     const cmd = isPython
       ? [binary.path!, "-m", "vllm.entrypoints.openai.api_server", ...args.slice(1)]
       : [binary.path!, ...args];
 
-    this.appendLog(`$ ${cmd.join(" ")}\n`);
+    this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
     try {
-      this.serverProcess = spawnServerProcess(cmd, undefined, "vllm");
+      // 模型是仓库 id 时 vLLM 自己拉权重：HF 端点按下载源路由给；国内且仓库原样在 ModelScope、
+      // python 装了 modelscope 时改走 VLLM_USE_MODELSCOPE（见 downloadSourceEnv）。
+      const env = await downloadSourceEnv({
+        model,
+        python: isPython ? binary.path : null,
+        modelScopeVar: "VLLM_USE_MODELSCOPE",
+      });
+      this.serverProcess = spawnServerProcess(cmd, env, "vllm");
       pumpServerOutput(this.serverProcess, this.appendLog.bind(this));
 
       const self = this;

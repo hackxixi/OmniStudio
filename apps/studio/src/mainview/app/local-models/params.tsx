@@ -15,7 +15,15 @@ import type { LaunchPlan } from "@/shared/launch-planner";
 // 启动参数
 // ---------------------------------------------------------------------------
 
-type ParamFieldBase = { key: string; labelKey: string };
+type ParamFieldBase = {
+  key: string;
+  labelKey: string;
+  /**
+   * 分组：`sampling` = 全局采样，单独成一组并注明「只是未识别模型的兜底」——
+   * 认得出的模型走模型自带值 / 家族推荐表（shared/sampling-presets.ts），按模型还能单独改。
+   */
+  group?: "sampling";
+};
 type ParamNumberField = ParamFieldBase & {
   step?: string;
   /**
@@ -46,9 +54,10 @@ export const PARAM_FIELDS: Record<InferenceEngine, ParamField[]> = {
       key: "SERVER_AUTO_TUNE",
       labelKey: "models.params.autoTune",
       hintKey: "models.params.autoTuneHint",
+      // 自动在前：默认就是开（DEFAULTS.SERVER_AUTO_TUNE = "1"），设置还没拉到时下拉回落的也是它
       options: [
-        { value: "0", label: "manual", labelKey: "models.params.autoTune.manual" },
         { value: "1", label: "auto", labelKey: "models.params.autoTune.auto" },
+        { value: "0", label: "manual", labelKey: "models.params.autoTune.manual" },
       ],
     },
     {
@@ -73,10 +82,12 @@ export const PARAM_FIELDS: Record<InferenceEngine, ParamField[]> = {
       labelKey: "models.params.ubatch",
       disabledWhen: autoTunedField,
     },
-    { key: "SERVER_TEMP", labelKey: "models.params.temp", step: "0.1" },
-    { key: "SERVER_TOP_P", labelKey: "models.params.topP", step: "0.05" },
-    { key: "SERVER_TOP_K", labelKey: "models.params.topK" },
-    { key: "SERVER_REPEAT_PENALTY", labelKey: "models.params.repeatPenalty", step: "0.01" },
+    { key: "SERVER_TEMP", labelKey: "models.params.temp", step: "0.1", group: "sampling" },
+    { key: "SERVER_TOP_P", labelKey: "models.params.topP", step: "0.05", group: "sampling" },
+    { key: "SERVER_TOP_K", labelKey: "models.params.topK", group: "sampling" },
+    { key: "SERVER_MIN_P", labelKey: "models.params.minP", step: "0.01", group: "sampling" },
+    { key: "SERVER_PRESENCE_PENALTY", labelKey: "models.params.presencePenalty", step: "0.1", group: "sampling" },
+    { key: "SERVER_REPEAT_PENALTY", labelKey: "models.params.repeatPenalty", step: "0.01", group: "sampling" },
     { key: "SERVER_GPU_LAYERS", labelKey: "models.params.gpuLayers" },
     {
       key: "SERVER_CACHE_TYPE_K",
@@ -234,7 +245,9 @@ export function ServerParamsPanel({ engine }: { engine: InferenceEngine }) {
     queryFn: () => rpcClient.getSettings(undefined),
   });
   const settings = data?.settings ?? {};
-  const fields = PARAM_FIELDS[engine];
+  const allFields = PARAM_FIELDS[engine];
+  const fields = allFields.filter((f) => f.group !== "sampling");
+  const samplingFields = allFields.filter((f) => f.group === "sampling");
 
   // 自动启动参数开启 + llama.cpp + 已有选中模型时，参数面板上方展示一张计划预览卡。
   // 模型路径取「当前聊天模型」设置（LOCAL_MODEL_PATH），与启动条同源。
@@ -342,6 +355,26 @@ export function ServerParamsPanel({ engine }: { engine: InferenceEngine }) {
               );
             })}
           </div>
+
+          {samplingFields.length > 0 && (
+            <div className="flex flex-col gap-2 border-t pt-3">
+              <span className="text-[11px] text-muted-foreground">{t("models.params.samplingGroup")}</span>
+              <p className="text-[10px] leading-relaxed text-muted-foreground/70">
+                {t("models.params.samplingGroupHint")}
+              </p>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+                {samplingFields.map((f) => (
+                  <ParamInput
+                    key={f.key}
+                    label={t(f.labelKey)}
+                    value={settings[f.key] ?? ""}
+                    step={"step" in f ? f.step : undefined}
+                    onCommit={(v) => commit({ [f.key]: v })}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-col gap-2 border-t pt-3">
             <span className="text-[11px] text-muted-foreground">{t("models.params.pipeline")}</span>

@@ -16,6 +16,9 @@ import { logEvent } from "./app-log";
 import { tmpdir } from "os";
 import { join } from "path";
 import { getDataDir } from "./paths";
+import type { SourcePlan } from "../shared/net-sources";
+import { githubCandidates, reportSourceFailure } from "./net-sources";
+import { hfEndpointsOf, sourcePlanWithin } from "./model-source-map";
 
 export type EvalSuiteId =
   | "mmlu"
@@ -47,20 +50,32 @@ export type EvalSuiteInfo = {
   kind: "knowledge" | "math" | "code" | "writing" | "long-context";
 };
 
-/** 社区维护的 HuggingFace 数据集 JSONL 打包镜像（通用源）。 */
-const DATA_MIRRORS = [
-  "https://cdn.jsdelivr.net/gh/jundot/omlx@main/omlx/eval/data/",
-  "https://raw.githubusercontent.com/jundot/omlx/main/omlx/eval/data/",
-];
-/** IFEval 官方数据文件走 HF 原站 + 国内镜像。 */
-const HF_IFEVAL_MIRRORS = [
-  "https://huggingface.co/datasets/google/IFEval/resolve/main/",
-  "https://hf-mirror.com/datasets/google/IFEval/resolve/main/",
-];
+/** 社区维护的 HuggingFace 数据集 JSONL 打包镜像（通用源）：jsDelivr CDN + GitHub raw。 */
+const JSDELIVR_DATA_BASE = "https://cdn.jsdelivr.net/gh/jundot/omlx@main/omlx/eval/data/";
+const GITHUB_RAW_DATA_BASE = "https://raw.githubusercontent.com/jundot/omlx/main/omlx/eval/data/";
+/** IFEval 官方数据文件：HF 数据集路径，端点由下载源路由给（镜像 / 官方）。 */
+const HF_IFEVAL_PATH = "/datasets/google/IFEval/resolve/main/";
+
+/** 题库源分组：通用镜像（jsDelivr + GitHub）或 HF 数据集。 */
+type MirrorGroup = "data" | "hf-ifeval";
+
+/**
+ * 某组源的候选前缀，按下载源路由排序（每个前缀后面直接拼文件名）：
+ *   data：jsDelivr（国内外都能用）打头，GitHub raw 走 githubCandidates（加速前缀 / 直连）；
+ *   hf-ifeval：按 plan.hfEndpoints（国内镜像优先或官方优先，官方永远兜底）。
+ */
+export function evalMirrors(group: MirrorGroup, plan: SourcePlan): string[] {
+  if (group === "hf-ifeval") return hfEndpointsOf(plan).map((e) => `${e}${HF_IFEVAL_PATH}`);
+  return [...new Set([JSDELIVR_DATA_BASE, ...githubCandidates(GITHUB_RAW_DATA_BASE, plan)])];
+}
+
+/** 连接 / 首包超时，以及读流时两段数据之间的最长间隔（卡死就换下一个源）。 */
+const EVAL_CONNECT_TIMEOUT_MS = 15_000;
+const EVAL_IDLE_TIMEOUT_MS = 30_000;
 
 // 各文件的期望字节数，下载完成后逐一核对，防止截断文件混进题库。
-// mirrors 缺省用 DATA_MIRRORS。
-const SUITE_FILES: Record<EvalSuiteId, { name: string; sizeBytes: number; mirrors?: string[] }[]> = {
+// mirrors 缺省用通用镜像组（data）。
+const SUITE_FILES: Record<EvalSuiteId, { name: string; sizeBytes: number; mirrors?: MirrorGroup }[]> = {
   mmlu: [
     { name: "mmlu_test.jsonl", sizeBytes: 7_510_640 },
     { name: "mmlu_dev.jsonl", sizeBytes: 136_428 },
@@ -73,7 +88,7 @@ const SUITE_FILES: Record<EvalSuiteId, { name: string; sizeBytes: number; mirror
   mmlu_pro: [{ name: "mmlu_pro_test.jsonl", sizeBytes: 9_574_914 }],
   humaneval: [{ name: "humaneval.jsonl", sizeBytes: 179_055 }],
   mbpp: [{ name: "mbpp.jsonl", sizeBytes: 175_257 }],
-  ifeval: [{ name: "ifeval_input_data.jsonl", sizeBytes: 207_111, mirrors: HF_IFEVAL_MIRRORS }],
+  ifeval: [{ name: "ifeval_input_data.jsonl", sizeBytes: 207_111, mirrors: "hf-ifeval" }],
   // 长文多针检索在本地合成，无题库文件。
   longctx: [],
 };
@@ -137,20 +152,35 @@ export async function ensureEvalData(
   signal?: AbortSignal,
 ): Promise<void> {
   mkdirSync(getDataDir("eval-data"), { recursive: true });
-  for (const { name, sizeBytes, mirrors } of SUITE_FILES[suite]) {
-    if (isFileReady(name, sizeBytes)) continue;
+  const missing = SUITE_FILES[suite].filter(({ name, sizeBytes }) => !isFileReady(name, sizeBytes));
+  if (missing.length === 0) return;
+  const plan = await sourcePlanWithin();
+  for (const { name, sizeBytes, mirrors } of missing) {
     let lastError: unknown = null;
-    for (const mirror of mirrors ?? DATA_MIRRORS) {
+    for (const mirror of evalMirrors(mirrors ?? "data", plan)) {
+      const url = mirror + name;
+      // 每个源一个本地 AbortController：外部取消 + 连接超时 + 读流空闲超时都走它，
+      // 卡住的源最多耽误 EVAL_IDLE_TIMEOUT_MS 就换下一个（之前没有超时，能挂一整晚）。
+      const ac = new AbortController();
+      const onAbort = () => ac.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      let timer = setTimeout(() => ac.abort(), EVAL_CONNECT_TIMEOUT_MS);
+      const bump = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => ac.abort(), EVAL_IDLE_TIMEOUT_MS);
+      };
       try {
-        const res = await fetch(mirror + name, { signal });
+        const res = await fetch(url, { signal: ac.signal });
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         const tmp = dataFilePath(`${name}.tmp`);
         const reader = res.body.getReader();
         const chunks: Uint8Array[] = [];
         let received = 0;
+        bump();
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          bump();
           chunks.push(value);
           received += value.byteLength;
           onProgress(received, sizeBytes);
@@ -162,7 +192,13 @@ export async function ensureEvalData(
         break;
       } catch (e) {
         if (signal?.aborted) throw e;
-        lastError = e;
+        lastError = ac.signal.aborted ? new Error(`连接超时（${new URL(url).host}）`) : e;
+        // 404 / 大小不符是这份文件的事，连不上 / 超时 / 5xx 才报给路由降级。
+        const msg = lastError instanceof Error ? lastError.message : String(lastError);
+        if (!/HTTP 4\d\d|size mismatch/.test(msg)) reportSourceFailure(url);
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
       }
     }
     if (lastError) {

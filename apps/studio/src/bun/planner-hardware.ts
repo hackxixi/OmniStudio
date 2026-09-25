@@ -22,7 +22,8 @@ export type PlannerGpuStatsOptions = {
 };
 
 export type PlannerHardwareSnapshotOptions = {
-  /** 透传给 `getHardwareInfo`：芯片 / 内存在运行期不变，默认走进程内缓存。 */
+  /** 透传给 `getHardwareInfo`：芯片 / 总内存 / 显卡在运行期不变，默认走进程内缓存
+   *  （空闲内存不在缓存里，每次快照都现读，见下方 systemFreeBytes）。 */
   refresh?: boolean;
   /** 注入 gpu-stats（测试用）。不传时走 `getGpuStats` 的默认路径（2s 缓存 + 去重）。 */
   gpuStats?: PlannerGpuStatsOptions;
@@ -85,6 +86,8 @@ export async function plannerHardwareSnapshot(
     hasGpu,
     vramFreeBytes,
     vramTotalBytes,
+    // getHardwareInfo 只缓存静态画像，freeMemoryBytes 每次调用现读 freemem()：
+    // CPU-only 预算与显存溢出到内存的余量都按「此刻」空闲算，而不是 App 启动那一刻。
     systemFreeBytes: hw.freeMemoryBytes,
     systemTotalBytes: hw.totalMemoryBytes,
     unifiedMemory,

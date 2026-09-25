@@ -3,6 +3,9 @@ import path from "path";
 import { getSetting, updateSettings } from "./db/settings";
 import { getModelsBaseDirForRuntime } from "./model-store";
 import { listEdgeVoices } from "./edge-tts";
+import type { SourcePlan } from "../shared/net-sources";
+import { reportSourceFailure } from "./net-sources";
+import { hfEndpointsOf, modelScopeGitUrl, resolveModelScopeRepo, sourcePlanWithin } from "./model-source-map";
 
 export type TTSModelSource = "edge" | "vllm";
 
@@ -220,7 +223,45 @@ export function isTTSModelEnabled(id: string): boolean {
 }
 
 /**
- * 自动下载模型到本地（git clone，优先国内镜像 hf-mirror，失败再走官方）。
+ * git clone 的候选地址，按下载源路由排序：
+ *   国内（modelSource = modelscope）：ModelScope（等价仓库，见 model-source-map）→ HF 各端点；
+ *   海外：HF 各端点（官方优先）→ ModelScope 兜底。
+ * `msRepo` 为 null 表示 ModelScope 上确认没有（或查不到），不放进候选。
+ */
+export function ttsCloneUrls(repo: string, plan: SourcePlan, msRepo: string | null): string[] {
+  const hf = hfEndpointsOf(plan).map((e) => `${e}/${repo}`);
+  const ms = msRepo ? [modelScopeGitUrl(msRepo)] : [];
+  return plan.modelSource === "modelscope" ? [...ms, ...hf] : [...hf, ...ms];
+}
+
+/**
+ * git clone 的超时设置：不设总时长（几 GB 的模型慢网也得下得完），而是「卡死检测」——
+ * 60 秒内平均速度低于 1KB/s 就断开换下一个源；GIT_TERMINAL_PROMPT=0 让需要登录的
+ * 仓库（HF gated）直接失败，而不是挂在一个永远等不到输入的密码提示上。
+ * 另加一个很宽的总上限兜底（2 小时），防止某个源一直「半死不活」地吊着。
+ */
+const CLONE_STALL_SECONDS = 60;
+const CLONE_HARD_LIMIT_MS = 2 * 60 * 60 * 1000;
+
+export function ttsCloneCommand(url: string, dest: string): string[] {
+  return [
+    "git",
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    `http.lowSpeedTime=${CLONE_STALL_SECONDS}`,
+    "-c",
+    `lfs.activitytimeout=${CLONE_STALL_SECONDS}`,
+    "clone",
+    "--depth",
+    "1",
+    url,
+    dest,
+  ];
+}
+
+/**
+ * 自动下载模型到本地（git clone，源顺序跟随下载源路由，失败换下一个源）。
  * 进度通过 rpc 的 modelDownloadProgress 事件推送。
  */
 export async function downloadTTSModel(
@@ -237,11 +278,11 @@ export async function downloadTTSModel(
   mkdirSync(getTTSModelsDir(), { recursive: true });
 
   const repo = entry.hfRepo;
-  const mirrors = [
-    `https://hf-mirror.com/${repo}`,
-    `https://huggingface.co/${repo}`,
-    `https://www.modelscope.cn/models/${repo}`,
-  ];
+  const plan = await sourcePlanWithin();
+  const lookup = await resolveModelScopeRepo(repo);
+  // 查不了（断网 / 超时）时仍按同名放进候选：clone 失败会自己换下一个。
+  const msRepo = lookup.status === "found" ? lookup.repo : lookup.status === "unknown" ? repo : null;
+  const mirrors = ttsCloneUrls(repo, plan, msRepo);
   const label = repo.split("/").pop() || repo;
 
   for (const mirror of mirrors) {
@@ -250,15 +291,28 @@ export async function downloadTTSModel(
       fileName: label,
       progress: { received: 0, total: null, percent: null },
     });
-    const git = Bun.spawn(["git", "clone", "--depth", "1", mirror, dest], {
-      stdout: "pipe",
+    const git = Bun.spawn(ttsCloneCommand(mirror, dest), {
+      stdout: "ignore",
       stderr: "pipe",
-      env: { ...process.env },
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     });
-    git.exited.then(() => {});
+    const timer = setTimeout(() => {
+      try {
+        git.kill();
+      } catch {
+        // 已经退出
+      }
+    }, CLONE_HARD_LIMIT_MS);
+    // stderr 要边跑边读：不读的话管道写满会把 git 卡住。
+    const stderr = await new Response(git.stderr).text().catch(() => "");
     const code = await git.exited;
+    clearTimeout(timer);
     if (code === 0) break;
-    // 失败时清掉残留目录再试下一个镜像。
+    // 失败时清掉残留目录再试下一个源。连不上的源报给路由降级；仓库侧的错误
+    // （不存在 / 要登录）不是源的锅，不报。
+    if (!/not found|404|401|403|authentication|could not read username/i.test(stderr)) {
+      reportSourceFailure(mirror);
+    }
     if (existsSync(dest)) Bun.spawnSync(["rm", "-rf", dest]);
   }
 

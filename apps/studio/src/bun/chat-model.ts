@@ -293,6 +293,8 @@ export async function listChatModels(): Promise<{ models: ChatModelOption[] }> {
       isActive: served
         ? mode === "local" && served.id === activeServedId
         : mode === "local" && !activeServedId && m.isActive,
+      // 缺省 `isMac` = 当前平台：mac 上的当前引擎不可能不支持 safetensors，
+      // 走到这里说明是 llama.cpp，推荐 mlx 而不是 mac 上装不了的 vllm。
       engine: served?.engine ?? resolveEngineForKind(kind, engine),
       isDir: m.isDir,
       category,

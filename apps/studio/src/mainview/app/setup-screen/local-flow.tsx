@@ -22,7 +22,8 @@ import { Input } from "@ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@ui/select";
 import { useServerStore } from "@stores/server";
 import { useModelDownloadStore } from "@stores/model-download";
-import { matchQuant, safeRepoId, type InferenceEngine } from "@/shared/modelscope";
+import { MODEL_SOURCE_META, matchQuant, safeRepoId, type InferenceEngine, type ModelSource } from "@/shared/modelscope";
+import { hfHostOf, useDownloadSourcePlanQuery } from "../model-library/use-download-sources";
 import {
   DEFAULT_CONTEXT_TOKENS,
   fitModelsForMachine,
@@ -275,6 +276,17 @@ export function LocalFlow({
   });
   const installedModels = installedQuery.data?.models ?? [];
 
+  // 下载平台跟随下载源路由（国内 ModelScope / 海外 Hugging Face）。模型表里是 HF 仓库 id；
+  // 平台上没有时主进程会找 ModelScope 等价仓库或回退 HF 镜像（bun/model-source-map.ts）。
+  // 路由还没拿到时先不生成计划，免得先按 ModelScope 列一遍、再按 HF 列一遍。
+  const sourcesQuery = useDownloadSourcePlanQuery();
+  const sourcesSettled = !sourcesQuery.isPending;
+  const downloadSource: ModelSource = sourcesQuery.data?.modelSource ?? "modelscope";
+  const downloadHost =
+    downloadSource === "huggingface"
+      ? (hfHostOf(sourcesQuery.data) ?? MODEL_SOURCE_META.huggingface.host)
+      : MODEL_SOURCE_META.modelscope.host;
+
   const [plan, setPlan] = useState<DownloadPlan | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planNonce, setPlanNonce] = useState(0);
@@ -293,7 +305,7 @@ export function LocalFlow({
   // 解析下载计划：llama.cpp 选匹配量化的单个 GGUF；vLLM/SGLang 下载整个仓库。
   // MLX 不生成文件下载计划——模型由 mlx-lm 首次启动时自动下载（HF 缓存，走镜像）。
   useEffect(() => {
-    if (step !== "start" || !env || isCustom || engine === "mlx") return;
+    if (step !== "start" || !env || isCustom || engine === "mlx" || !sourcesSettled) return;
     let cancelled = false;
     const model = SETUP_MODELS.find((m) => m.id === modelId);
     if (!model) return;
@@ -301,7 +313,7 @@ export function LocalFlow({
     setPlanLoading(true);
     (async () => {
       try {
-        const { files } = await rpcClient.listModelFiles({ repo, source: "modelscope" });
+        const { files } = await rpcClient.listModelFiles({ repo, source: downloadSource });
         if (cancelled) return;
         const picked =
           engine === "llama.cpp"
@@ -323,7 +335,7 @@ export function LocalFlow({
     return () => {
       cancelled = true;
     };
-  }, [step, env, isCustom, engine, modelId, activeQuant, planNonce]);
+  }, [step, env, isCustom, engine, modelId, activeQuant, planNonce, sourcesSettled, downloadSource]);
 
   const planRepoDir = plan ? safeRepoId(plan.repo) : "";
   const downloaded =
@@ -350,14 +362,14 @@ export function LocalFlow({
 
   const handleDownload = async () => {
     if (!plan) return;
-    // 下载必须和上面列文件用同一个平台（ModelScope）：
-    // 两边仓库的文件名不一定一致，混用会出现"列表里有、下载 404"。
+    // 下载必须和上面列文件用同一个平台：两边仓库的文件名不一定一致，
+    // 混用会出现"列表里有、下载 404"（主进程两边的回退顺序也一致）。
     for (const f of plan.files) {
       await rpcClient.startModelDownload({
         repo: plan.repo,
         fileName: f.name,
         category: "chat",
-        source: "modelscope",
+        source: downloadSource,
       });
     }
   };
@@ -859,7 +871,9 @@ export function LocalFlow({
                     </p>
                   )}
                   <p className="mt-0.5 text-[11px] text-muted-foreground/70">
-                    文件与下载均来自 ModelScope（modelscope.cn）
+                    优先从 {MODEL_SOURCE_META[downloadSource].label}（{downloadHost}）下载，
+                    该平台没有此模型时自动改用{" "}
+                    {MODEL_SOURCE_META[downloadSource === "modelscope" ? "huggingface" : "modelscope"].label}
                   </p>
                 </div>
               </div>

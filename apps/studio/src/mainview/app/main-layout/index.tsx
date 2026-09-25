@@ -148,7 +148,7 @@ export function MainLayout() {
               OmniStudio
             </button>
           )}
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex min-w-0 items-center gap-2">
             <StatusPill />
             <NotificationBell />
             <DownloadsButton />

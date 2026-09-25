@@ -7,8 +7,9 @@ ModelConfig + WeightDefinition 解析出模型对应的 HuggingFace 仓库与文
 
 策略：**本地优先**。模型权重是否就绪、能否复用，一律先看本地 HF 缓存
 （~/.cache/huggingface/hub），完全离线也能给出正确结论、秒级返回；
-只有确认本地缺文件时才联网拿远端文件清单 / 下载。下载走国内镜像
-hf-mirror.com（失败自动回退官方 huggingface.co），并按文件断点续传
+只有确认本地缺文件时才联网拿远端文件清单 / 下载。端点顺序由主进程经环境变量
+OMNI_HF_ENDPOINTS 传入（没传则镜像 hf-mirror.com 优先、官方 huggingface.co 兜底），
+逐个回退，并按文件断点续传
 （huggingface_hub 原生支持，中断后遗留的 .incomplete 会被继续下载，
 孤儿 .incomplete 会被先清理）。
 
@@ -32,7 +33,28 @@ import sys
 # 国内访问 huggingface.co 不稳定，默认走镜像；下载单个文件失败会自动回退官方。
 HF_MIRROR = "https://hf-mirror.com"
 HF_OFFICIAL = "https://huggingface.co"
-os.environ.setdefault("HF_ENDPOINT", HF_MIRROR)
+
+
+def _endpoints_from_env():
+    """主进程按下载源路由（bun/net-sources.ts）排好的 HF 端点，逗号分隔、按优先级。
+
+    OMNI_HF_ENDPOINTS 没给（老主进程 / 手动运行）就按老顺序：镜像优先、官方兜底。
+    列表里永远补上官方与镜像，任何一个端点挂了都还有下一个可换。
+    """
+    raw = os.environ.get("OMNI_HF_ENDPOINTS", "")
+    out = []
+    for e in raw.split(","):
+        e = e.strip().rstrip("/")
+        if e and e not in out:
+            out.append(e)
+    for e in (HF_MIRROR, HF_OFFICIAL):
+        if e not in out:
+            out.append(e)
+    return out
+
+
+HF_ENDPOINTS = _endpoints_from_env()
+os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINTS[0])
 
 _HF_CACHE = os.path.join(
     os.path.expanduser("~"), ".cache", "huggingface", "hub", "models--%s"
@@ -162,7 +184,7 @@ def _remote_targets(repo, defs, timeout=10):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             return ex.submit(_list, endpoint).result(timeout=timeout)
 
-    for endpoint in (HF_MIRROR, HF_OFFICIAL):
+    for endpoint in HF_ENDPOINTS:
         try:
             merged.update(_run(endpoint))
         except Exception:
@@ -282,16 +304,21 @@ def run_check(name):
 
 
 def _download_file(repo, path):
-    """单个文件下载：镜像优先，失败自动回退官方（huggingface_hub 原生断点续传）。"""
+    """单个文件下载：按 HF_ENDPOINTS 顺序逐个试（huggingface_hub 原生断点续传）。
+
+    全部失败时抛**第一个**端点的错误 —— 它是首选源，报它的错最有排查价值。
+    """
     from huggingface_hub import hf_hub_download
 
-    try:
-        hf_hub_download(repo_id=repo, filename=path, endpoint=HF_MIRROR)
-    except Exception as mirror_err:
+    first_err = None
+    for endpoint in HF_ENDPOINTS:
         try:
-            hf_hub_download(repo_id=repo, filename=path, endpoint=HF_OFFICIAL)
-        except Exception:
-            raise mirror_err
+            hf_hub_download(repo_id=repo, filename=path, endpoint=endpoint)
+            return
+        except Exception as e:  # noqa: BLE001
+            if first_err is None:
+                first_err = e
+    raise first_err
 
 
 def run_download(name):

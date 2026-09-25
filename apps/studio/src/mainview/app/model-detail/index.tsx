@@ -9,6 +9,8 @@ import { Spinner } from "@ui/spinner";
 import { ScrollArea } from "@ui/scroll-area";
 import { useRouter } from "@stores/router";
 import { useModelDetailStore } from "@stores/model-detail";
+import { useMarketStore } from "@stores/market";
+import { hfHostOf, useMarketSourceFromPlan } from "../model-library/use-download-sources";
 import { useT } from "@stores/ui-lang";
 import { MODEL_SOURCES, MODEL_SOURCE_META, classifyModel, fileBaseName, matchQuant, safeRepoId, type MarketFile, type ModelCategory, type ModelSource } from "../../../shared/modelscope";
 import { ModelFileKind } from "../../../shared/modelscope";
@@ -50,7 +52,13 @@ export function ModelDetailScreen({ onBack }: { onBack?: () => void } = {}) {
   // 列文件与下载必须用同一个 source，否则会出现"列的是 A 站的文件、下的是 B 站的字节"
   // （同一仓库在两个平台的文件名/目录结构并不一致）。默认取该模型被发现时所在的平台，
   // 用户可以在文件区手动切到另一个平台。
-  const originSource: ModelSource = source?.kind === "search" ? source.model.source : "modelscope";
+  // 推荐清单（preset）没有「被发现的平台」：跟随市场的平台（下载源路由默认 / 用户选过的）。
+  // 仓库不在该平台上时主进程会自己回退到另一个平台（见 bun/modelscope.ts listRepoFiles）。
+  const sourcePlan = useMarketSourceFromPlan();
+  const marketSource = useMarketStore((s) => s.source);
+  const originSource: ModelSource = source?.kind === "search" ? source.model.source : marketSource;
+  const hostOf = (s: ModelSource) =>
+    s === "huggingface" ? (hfHostOf(sourcePlan) ?? MODEL_SOURCE_META[s].host) : MODEL_SOURCE_META[s].host;
   const [sourceOverride, setSourceOverride] = useState<ModelSource | null>(null);
   const modelSource: ModelSource = sourceOverride ?? originSource;
 
@@ -284,7 +292,7 @@ export function ModelDetailScreen({ onBack }: { onBack?: () => void } = {}) {
             <span className="text-[11px] text-muted-foreground/70">
               {t("market.allFrom", {
                 source: MODEL_SOURCE_META[modelSource].label,
-                host: MODEL_SOURCE_META[modelSource].host,
+                host: hostOf(modelSource),
               })}
             </span>
             {/* 类别改键：仅市场下载（应用下载目录）的模型支持 —— 已下载为 chat 的嵌入
@@ -353,7 +361,7 @@ export function ModelDetailScreen({ onBack }: { onBack?: () => void } = {}) {
                         key={s}
                         type="button"
                         onClick={() => setSourceOverride(s)}
-                        title={meta.host}
+                        title={hostOf(s)}
                         className={cn(
                           "flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] transition-colors",
                           active
@@ -368,7 +376,7 @@ export function ModelDetailScreen({ onBack }: { onBack?: () => void } = {}) {
                             active ? "text-primary-foreground/70" : "text-muted-foreground/60",
                           )}
                         >
-                          {meta.host}
+                          {hostOf(s)}
                         </span>
                       </button>
                     );

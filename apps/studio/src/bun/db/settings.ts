@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import type { InferenceEngine } from "../../shared/modelscope";
 import { ENGINE_IDS, ENGINE_SPECS, EMBEDDING_PORT_BASE } from "../../shared/engines";
 import { db } from "./index";
@@ -9,6 +9,7 @@ import { DEFAULT_INFERENCE_PORT } from "../../shared/server-info";
 import { VOICE_CALL_OMNI_DEFAULT_MODEL } from "../../shared/voice-call-omni";
 import { encryptSecret, isEncryptedSecret, tryDecryptSecret } from "../secrets";
 import { logEvent } from "../app-log";
+import { DOWNLOAD_REGION_VALUES } from "../../shared/net-sources";
 
 export type SettingsKey =
   | "SETUP_COMPLETE"
@@ -51,13 +52,15 @@ export type SettingsKey =
   | "SERVER_TOP_P"
   | "SERVER_TOP_K"
   | "SERVER_REPEAT_PENALTY"
+  | "SERVER_MIN_P"
+  | "SERVER_PRESENCE_PENALTY"
   | "SERVER_IDLE_UNLOAD_MINUTES"
   | "SERVER_FALLBACK_MODELS"
   | "SERVER_GPU_LAYERS"
   | "SERVER_CACHE_TYPE_K"
   | "SERVER_CACHE_TYPE_V"
-  // llama.cpp 自动启动参数（T4）：总开关，默认关（行为与关闭前逐字节一致，见
-  // bun/runtimes/llama.ts 的 buildArgs / launch-plan.ts）。
+  // llama.cpp 自动启动参数（T4）：总开关，默认开（"0" = 手动，启动参数与未引入自动推算时
+  // 逐字节一致，见 bun/runtimes/llama.ts 的 buildArgs / launch-plan.ts）。
   | "SERVER_AUTO_TUNE"
   /** 自动推算时上下文的下限（token），低于这个值不如不跑。 */
   | "SERVER_AUTO_TUNE_MIN_CTX"
@@ -89,6 +92,12 @@ export type SettingsKey =
   | "PROXY_URL"
   /** 「允许访问本地网络地址」：开（默认）= 局域网直连，关 = 连局域网也走代理。 */
   | "PROXY_ALLOW_LOCAL_NETWORK"
+  // 下载源（设置 → 通用，见 bun/net-sources.ts）：auto = 探测决定走国内加速还是官方直连，
+  // cn / global = 强制。下面三个是高级覆盖：填了就排在对应列表最前（空串 = 不覆盖）。
+  | "DOWNLOAD_REGION"
+  | "DOWNLOAD_HF_ENDPOINT"
+  | "DOWNLOAD_PYPI_INDEX"
+  | "DOWNLOAD_GITHUB_MIRROR"
   | "MAX_VLLM_RETRIES"
   | "MAX_VLLM_FAILURE_RETRIES"
   | "PAGE_CONCURRENCY"
@@ -236,6 +245,8 @@ export type SettingsKey =
   | "AGENT_GOAL_TOKEN_BUDGET"
   /** 看图工具（view_image）开关：auto / on / off。 */
   | "AGENT_VISION_TOOL"
+  /** 工具调用方式：classic（经典，全部工具一次给模型）/ routed（精简路由，常驻核心 + 按需工具组）。 */
+  | "AGENT_TOOL_STRATEGY"
   /** 回合快照（影子 git 仓库，支持「撤销本轮」）开关。 */
   | "AGENT_SNAPSHOTS"
   /** 影子仓库自动整理的体积阈值（MB，默认 256）。 */
@@ -369,10 +380,18 @@ const DEFAULTS: Record<SettingsKey, string> = {
   SERVER_BATCH_SIZE: "256",
   SERVER_UBATCH_SIZE: "64",
   SERVER_PARALLEL: "1",
-  SERVER_TEMP: "0.2",
+  // 全局采样只是最后一级兜底（优先级见 shared/model-params.ts）：认得出的模型走
+  // 模型自带值 / 家族推荐表（bun/model-sampling.ts），这里给通用对话的中性值。
+  // 以前是 OCR 口味的 0.2 / 1.12，推理模型在它下面会复读、思考链被压短；OCR 档案的
+  // 原值已挪进 shared/sampling-presets.ts。DEFAULTS 只是读侧回落、不落库，
+  // 用户显式存过的值原样保留。
+  SERVER_TEMP: "0.7",
   SERVER_TOP_P: "0.9",
   SERVER_TOP_K: "40",
-  SERVER_REPEAT_PENALTY: "1.12",
+  SERVER_REPEAT_PENALTY: "1.0",
+  // llama.cpp 自己的 min_p 默认就是 0.05；presence penalty 默认 0 = 不惩罚。
+  SERVER_MIN_P: "0.05",
+  SERVER_PRESENCE_PENALTY: "0",
   // 0 = 关闭（默认）：空闲卸载是给「机器小、模型多」的人省显存用的，
   // 默认打开会让「昨晚还跑着的模型今天不见了」变成一个需要解释的意外。
   SERVER_IDLE_UNLOAD_MINUTES: "0",
@@ -381,8 +400,13 @@ const DEFAULTS: Record<SettingsKey, string> = {
   SERVER_GPU_LAYERS: "-1",
   SERVER_CACHE_TYPE_K: "q8_0",
   SERVER_CACHE_TYPE_V: "q8_0",
-  // 默认关：启动参数全部走设置里的现值，开「自动推算」是显式选择。
-  SERVER_AUTO_TUNE: "0",
+  // 默认开：按本机空闲显存 / 内存与模型元数据推算 ctx / batch / ubatch。手动默认值
+  // （固定 ctx 等）在小显存机器上常常起不来或白白浪费大显存，没碰过这个开关的人应得到
+  // 「能起来且尽量大」的那一份。算不出计划（HF 引用 / 元数据不足）时照旧回落到手动值。
+  // 迁移语义：DEFAULTS 只是读侧回落，不落库（getSetting 读不到行才用它；各页面保存
+  // 只提交自己改过的键），所以库里存着 "0" 的只可能是用户显式选过「手动」—— 不动它们，
+  // 从没碰过的用户自然拿到 "1"。
+  SERVER_AUTO_TUNE: "1",
   // 上下文下限 4096（与 launch-planner 的 MIN_FIT_CTX 同一量级，设置里可再调低）。
   SERVER_AUTO_TUNE_MIN_CTX: "4096",
   // auto = 不传参数（llama.cpp 自己的默认：能用 mmap 就用）。
@@ -405,6 +429,10 @@ const DEFAULTS: Record<SettingsKey, string> = {
   PROXY_MODE: "system",
   PROXY_URL: "",
   PROXY_ALLOW_LOCAL_NETWORK: "1",
+  DOWNLOAD_REGION: "auto",
+  DOWNLOAD_HF_ENDPOINT: "",
+  DOWNLOAD_PYPI_INDEX: "",
+  DOWNLOAD_GITHUB_MIRROR: "",
   MAX_VLLM_RETRIES: "6",
   MAX_VLLM_FAILURE_RETRIES: "0",
   PAGE_CONCURRENCY: "3",
@@ -419,6 +447,8 @@ const DEFAULTS: Record<SettingsKey, string> = {
   MLX_MODEL: "",
   MLX_CACHE_SIZE_GB: "8",
   // 国内环境优先走 hf-mirror，置空则使用 HuggingFace 官方。
+  // 注意：下载源已统一由 bun/net-sources.ts 按探测结果决定（HF_ENDPOINT 见 sourceEnv），
+  // 这个键只为兼容老用户的 MLX 配置保留，别在新代码里读它。
   MLX_HF_ENDPOINT: "https://hf-mirror.com",
   VLLM_MAX_MODEL_LEN: "8192",
   VLLM_TENSOR_PARALLEL_SIZE: "1",
@@ -554,6 +584,8 @@ const DEFAULTS: Record<SettingsKey, string> = {
   AGENT_GOAL_TOKEN_BUDGET: "0",
   /** 看图工具（view_image）：auto = 按模型名猜，on / off = 强制开或关。 */
   AGENT_VISION_TOOL: "auto",
+  /** 工具调用方式：classic = 全部工具一次交给模型；routed = 精简路由（本地小模型前缀更短）。 */
+  AGENT_TOOL_STRATEGY: "classic",
   // 回合快照：影子 git 仓库记下每轮开始前的工作区状态，界面可一键「撤销本轮」。
   AGENT_SNAPSHOTS: "1",
   // 影子仓库维护：占用超过 256MB 或快照条数到顶时自动 git gc（设置页可手动清理）。
@@ -734,12 +766,37 @@ export function invalidateSettingsCache() {
   settingsCache.clear();
 }
 
+/**
+ * 手调过这些启动参数的人，自动调参默认保持关。
+ *
+ * SERVER_AUTO_TUNE 的默认值从「关」改成了「开」，而自动模式会接管 ctx / batch / ubatch / GPU 层数。
+ * 老用户在手动模式下存过这些值（比如把上下文调到 81920），默认一翻就被规划器悄悄换成
+ * 别的数 —— 一台 16 GB 的 Mac 上 4B 模型被规划到 258K 窗口、吃掉 12.9 GB。
+ * 所以只有「自动调参没表过态、也没手存过任何启动参数」的人才默认开；表过态的以他为准。
+ */
+const MANUAL_LAUNCH_KEYS = ["SERVER_CTX_SIZE", "SERVER_BATCH_SIZE", "SERVER_UBATCH_SIZE", "SERVER_GPU_LAYERS"] as const;
+
+function defaultFor(key: SettingsKey, storedKeys: () => Set<string>): string {
+  if (key !== "SERVER_AUTO_TUNE") return DEFAULTS[key];
+  const stored = storedKeys();
+  return MANUAL_LAUNCH_KEYS.some((k) => stored.has(k)) ? "0" : DEFAULTS[key];
+}
+
+function storedManualLaunchKeys(): Set<string> {
+  const rows = db
+    .select({ key: settingsTable.key })
+    .from(settingsTable)
+    .where(inArray(settingsTable.key, [...MANUAL_LAUNCH_KEYS]))
+    .all();
+  return new Set(rows.map((r) => r.key));
+}
+
 export function getSetting(key: SettingsKey): string {
   const now = Date.now();
   const cached = settingsCache.get(key);
   if (cached && now - cached.at < SETTINGS_CACHE_TTL_MS) return cached.value;
   const row = db.select().from(settingsTable).where(eq(settingsTable.key, key)).get();
-  const value = maybeDecrypt(key, row?.value ?? DEFAULTS[key]);
+  const value = maybeDecrypt(key, row?.value ?? defaultFor(key, storedManualLaunchKeys));
   settingsCache.set(key, { value, at: now });
   return value;
 }
@@ -760,7 +817,11 @@ export function setServerFlashAttnEffective(value: EffectiveFlashAttn): void {
 
 export function getAllSettings(): Record<string, string> {
   const rows = db.select().from(settingsTable).all();
-  const result: Record<string, string> = { ...DEFAULTS };
+  const stored = new Set(rows.map((r) => r.key));
+  const result: Record<string, string> = {
+    ...DEFAULTS,
+    SERVER_AUTO_TUNE: defaultFor("SERVER_AUTO_TUNE", () => stored),
+  };
   for (const row of rows) {
     // 敏感槽位解密后再交给调用方（RPC 会下发给渲染进程，落盘是密文，内存是明文 ——
     // 与加密前行为一致，避免前端各处读 key 的逻辑崩掉）。
@@ -830,6 +891,10 @@ export function updateSettings(values: Record<string, string>) {
     ) {
       continue;
     }
+    // 下载源只认三态（读侧 net-sources 也会把非法值当 auto，这里先拒，免得界面显示错位）。
+    if (key === "DOWNLOAD_REGION" && !(DOWNLOAD_REGION_VALUES as readonly string[]).includes(value)) {
+      continue;
+    }
     // SERVER_FLASH_ATTN_EFFECTIVE 是程序状态（上次启动的实际值），不走枚举白名单，
     // 也不该从用户面写进来：这里只收空串与 on/off，其余（包括枚举之外的值）拒掉。
     if (key === "SERVER_FLASH_ATTN_EFFECTIVE" && !EFFECTIVE_FLASH_ATTN_VALUES.includes(value)) {
@@ -842,6 +907,8 @@ export function updateSettings(values: Record<string, string>) {
       .run();
     // 缓存内存的是解密后的明文（紧接的 getSetting 直接命中，行为一致）
     settingsCache.set(key, { value, at: Date.now() });
+    // 自动调参的默认值由「存没存过手动启动参数」推出来（见 defaultFor），这里存了一个就作废它
+    if ((MANUAL_LAUNCH_KEYS as readonly string[]).includes(key)) settingsCache.delete("SERVER_AUTO_TUNE");
   }
 }
 

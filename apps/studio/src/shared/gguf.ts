@@ -5,6 +5,7 @@
  * 训练上下文等元数据，用来自动推算启动参数。字节流由调用方喂进来，读到多少算多少：
  * 不够时返回 truncated + needBytes，调用方可以再等再试。
  */
+import type { SamplingParams } from "./model-params";
 
 export type GgufValue = number | bigint | boolean | string | GgufValue[];
 
@@ -320,6 +321,11 @@ export type GgufModelMeta = {
   nextnPredictLayers: number | null;
   feedForwardLength: number | null;
   leadingDenseBlockCount: number | null;
+  /**
+   * 作者写进文件的推荐采样（`general.sampling.*`，llama.cpp gguf-py 的 Keys.General.SAMPLING_*）。
+   * 可选字段：旧代码 / 测试手搓的 meta 没有它也合法；没有任何有效键时为 null。
+   */
+  sampling?: SamplingParams | null;
 };
 
 // llama.cpp 的 llama_ftype
@@ -517,5 +523,36 @@ export function ggufModelMeta(
     nextnPredictLayers: asPositiveInt(g("nextn_predict_layers")),
     feedForwardLength: asPositiveInt(g("feed_forward_length")),
     leadingDenseBlockCount: asPositiveInt(g("leading_dense_block_count")),
+    sampling: ggufSampling(kv),
   };
+}
+
+// 有限实数（含 0 和负数；采样值的合法区间由 ggufSampling 逐项把关）
+function asFiniteNumber(v: GgufValue | undefined): number | null {
+  if (typeof v === "bigint") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * `general.sampling.*` → SamplingParams。键名以 llama.cpp gguf-py constants.py 为准：
+ * temp / top_p / top_k / min_p / penalty_repeat（GGUF 没有 presence penalty 键）。
+ * 越界值（负温度、top_p > 1 之类）当没写，别把坏值塞进启动参数。
+ */
+export function ggufSampling(kv: Record<string, GgufValue>): SamplingParams | null {
+  const n = (k: string) => asFiniteNumber(kv[`general.sampling.${k}`]);
+  const out: SamplingParams = {};
+  const temp = n("temp");
+  if (temp !== null && temp >= 0) out.temperature = temp;
+  const topP = n("top_p");
+  if (topP !== null && topP > 0 && topP <= 1) out.topP = topP;
+  const topK = n("top_k");
+  if (topK !== null && Number.isInteger(topK) && topK >= 0) out.topK = topK;
+  const minP = n("min_p");
+  if (minP !== null && minP >= 0 && minP <= 1) out.minP = minP;
+  const rep = n("penalty_repeat");
+  if (rep !== null && rep > 0) out.repeatPenalty = rep;
+  return Object.keys(out).length > 0 ? out : null;
 }

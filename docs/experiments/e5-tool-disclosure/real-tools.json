@@ -1,0 +1,940 @@
+[
+ {
+  "group": "core",
+  "name": "read_file",
+  "description": "Read a text file from disk. Use an absolute path or a path relative to the workspace. Returns the content with line numbers, truncated for very large files.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "path"
+   ],
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path, or path relative to the workspace."
+    },
+    "offset": {
+     "type": "number",
+     "description": "1-based line number to start from."
+    },
+    "limit": {
+     "type": "number",
+     "description": "Maximum number of lines to read."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "list_dir",
+  "description": "List files and directories. Directories are suffixed with '/'. Useful to explore an unfamiliar project.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "path"
+   ],
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Directory to list (default: workspace root)."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "glob",
+  "description": "Find files whose path matches a glob pattern, e.g. `**/*.ts` or `src/**/*.test.ts`. Searched from the workspace root or the given directory.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "pattern"
+   ],
+   "properties": {
+    "pattern": {
+     "type": "string",
+     "description": "Glob pattern, e.g. `**/*.ts`."
+    },
+    "path": {
+     "type": "string",
+     "description": "Directory to search from."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "grep",
+  "description": "Search file contents with a regular expression and return matching lines with file:line. Faster than reading every file when you need to locate a symbol.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "pattern"
+   ],
+   "properties": {
+    "pattern": {
+     "type": "string",
+     "description": "Regular expression to search for."
+    },
+    "path": {
+     "type": "string",
+     "description": "Directory or file to search in."
+    },
+    "include": {
+     "type": "string",
+     "description": "Optional glob filter, e.g. `*.ts`."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "web_search",
+  "description": "Search the web for up-to-date information (docs, releases, error messages) and return titles, URLs and snippets.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "query"
+   ],
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Search query — prefer keywords over full sentences."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "web_fetch",
+  "description": "Fetch a URL and return its readable text (HTML tags stripped). Use it to read a page found by web_search, or any docs URL. Only http/https.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "url"
+   ],
+   "properties": {
+    "url": {
+     "type": "string",
+     "description": "Absolute URL (http/https)."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "knowledge_search",
+  "description": "Search the user's local knowledge bases (documents / notes / web pages imported in OmniStudio). Use it when the task may relate to materials the user stored locally, before searching the web.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "query"
+   ],
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Search query — natural language is fine."
+    },
+    "kb": {
+     "type": "string",
+     "description": "Knowledge base name to restrict the search to. Omit for all."
+    },
+    "top_k": {
+     "type": "number",
+     "description": "Max chunks to return (default 6)."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "read_skill",
+  "description": "Read a user-installed Skill (a SKILL.md instruction file) by name, or list the available skills when called without a name. Skills often contain the exact procedure the user wants for a task: when the current task matches a skill listed in your system prompt, read it BEFORE acting. Use `file` to read a script or template inside the skill directory (path relative to that directory).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Skill id as listed in the system prompt. Omit to list all skills."
+    },
+    "file": {
+     "type": "string",
+     "description": "Optional path of a file inside the skill directory (e.g. 'scripts/run.py'). Defaults to SKILL.md."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "think",
+  "description": "A private scratchpad for reasoning that should not appear in your visible answer: weighing options, planning a multi-step approach, double-checking an assumption, or working out why something failed. Nothing happens as a result — use it when thinking in the open would clutter the reply. For short reasoning just answer directly; do not call this every turn.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "thoughts"
+   ],
+   "properties": {
+    "thoughts": {
+     "type": "string",
+     "description": "The reasoning to record. Be specific; this is for you, not the user."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "checkpoint",
+  "description": "Mark the start of a large exploration, then call `rewind` with your findings when it is done. Everything between checkpoint and rewind is dropped from context and replaced by your findings, so use it before reading many files to answer one question. Do NOT use it for ordinary work (edits you want to keep, or a task you are about to finish).",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "goal"
+   ],
+   "properties": {
+    "goal": {
+     "type": "string",
+     "description": "What you are about to investigate, in one short sentence."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "rewind",
+  "description": "Finish an exploration started with `checkpoint`: everything read since the checkpoint is dropped and replaced by the report you write here. The report must be self-contained — it is the ONLY thing that survives, so include paths, line numbers, causes and the conclusion. Set revert_files=true only when you created scratch files during the exploration and want them undone.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "report"
+   ],
+   "properties": {
+    "report": {
+     "type": "string",
+     "description": "Your findings: conclusion first, then the evidence (file:line, command output). Must stand alone without the exploration it replaces."
+    },
+    "revert_files": {
+     "type": "boolean",
+     "description": "Also restore the workspace to its state at the checkpoint (undoes files YOU changed during the exploration). Default false — leave it false unless you made throwaway changes."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "todo_write",
+  "description": "Create or update the task list for the current work. Pass the FULL list every time (it replaces the previous one). Keep at most one item in_progress. Use it for multi-step work so the user can see progress.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "todos"
+   ],
+   "properties": {
+    "todos": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "content"
+      ],
+      "properties": {
+       "content": {
+        "type": "string",
+        "description": "What this step does (short, imperative)."
+       },
+       "status": {
+        "type": "string",
+        "description": "pending | in_progress | completed | cancelled"
+       },
+       "priority": {
+        "type": "string",
+        "description": "high | medium | low"
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "ask_user",
+  "description": "Ask the user one or more questions and wait for the answer. Use it when the task is ambiguous or a decision must be made by the user (choices, preferences, credentials). Prefer concrete options; the user can always type a custom answer.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "questions"
+   ],
+   "properties": {
+    "questions": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "question"
+      ],
+      "properties": {
+       "header": {
+        "type": "string",
+        "description": "Short label for the question."
+       },
+       "question": {
+        "type": "string",
+        "description": "The question to ask."
+       },
+       "options": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "required": [
+          "label"
+         ],
+         "properties": {
+          "label": {
+           "type": "string"
+          },
+          "description": {
+           "type": "string"
+          }
+         }
+        }
+       },
+       "multiple": {
+        "type": "boolean",
+        "description": "Allow selecting several options."
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "get_context_remaining",
+  "description": "Report how much of the context window is still free for this session. Call it before starting a large read (many files, a big directory) when the task has already been running for a while, or when you are unsure whether you can afford one more step.",
+  "parameters": {
+   "type": "object",
+   "properties": {}
+  }
+ },
+ {
+  "group": "core",
+  "name": "request_permissions",
+  "description": "Ask the user to grant access to a path outside the workspace (for example a sibling repository or a data folder). Always explain why you need it. The user approves or denies on a card in the conversation; once approved you may read/write that path in this session.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "path",
+    "reason"
+   ],
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path (or path outside the workspace) you need access to."
+    },
+    "reason": {
+     "type": "string",
+     "description": "One sentence: what you will do with it."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "write_file",
+  "description": "Create or overwrite a file inside the workspace with the given content. Parent directories are created automatically. Prefer `edit_file` for surgical changes.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "path",
+    "content"
+   ],
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Path relative to the workspace, or absolute inside it."
+    },
+    "content": {
+     "type": "string",
+     "description": "Full file content to write."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "edit_file",
+  "description": "Replace an exact string inside a file inside the workspace. `old_str` must appear exactly once unless `replace_all` is true. Read the file first to get the exact text.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "path",
+    "old_str",
+    "new_str"
+   ],
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Path relative to the workspace, or absolute inside it."
+    },
+    "old_str": {
+     "type": "string",
+     "description": "Exact text to replace (including whitespace)."
+    },
+    "new_str": {
+     "type": "string",
+     "description": "Replacement text."
+    },
+    "replace_all": {
+     "type": "boolean",
+     "description": "Replace every occurrence."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "apply_patch",
+  "description": "Apply a multi-file patch. Wrap hunks between '*** Begin Patch' and '*** End Patch'. Use '*** Add File: <path>' (every content line prefixed with '+'), '*** Update File: <path>' (optional '*** Move to: <new path>', then '@@' sections with context lines prefixed by a space, removals by '-', additions by '+'), and '*** Delete File: <path>'. Prefer this over several edit_file calls: it is atomic — if any section fails to match, nothing is written and you get a precise error.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "patch"
+   ],
+   "properties": {
+    "patch": {
+     "type": "string",
+     "description": "The full patch text, starting with '*** Begin Patch' and ending with '*** End Patch'."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "write_plan",
+  "description": "Write the implementation plan to a plan file (outside the workspace) and show it to the user. This is the ONLY way to save something in Plan mode — the workspace stays untouched. Write the full plan in one call, replacing any previous version. After writing it, summarise the plan briefly in your reply and stop; the user approves or asks for changes.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "content"
+   ],
+   "properties": {
+    "content": {
+     "type": "string",
+     "description": "The plan in Markdown. It must be executable by someone who was not in this conversation: goal, files to touch (with paths), step-by-step changes, risks, and how to verify. Every path you name must have been read in this session — mark anything unverified as such."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "goal",
+  "description": "Manage the current goal (Goal mode). `create` sets the objective and acceptance criteria — call it FIRST, before doing any work, and use ask_user if the criteria are not clear yet. `get` reports objective, status and budget usage. `complete` finishes the goal — pass the evidence in outcome (files, commands, output). `abandon` gives up with a reason — use it when genuinely blocked instead of claiming success.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "op"
+   ],
+   "properties": {
+    "op": {
+     "type": "string",
+     "description": "create | get | complete | abandon"
+    },
+    "objective": {
+     "type": "string",
+     "description": "create: what must be achieved, in one sentence."
+    },
+    "acceptance": {
+     "type": "string",
+     "description": "create: how we will know it is done (concrete, checkable). Agree it with the user first."
+    },
+    "outcome": {
+     "type": "string",
+     "description": "complete: the evidence. abandon: why it cannot be done."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "bash",
+  "description": "Run a shell command inside the workspace and return stdout+stderr. Use for builds, tests, git, and package managers. Long-running or interactive commands are not suitable. For full test suites, dependency installs, or long builds, raise timeout_ms (max 600000) instead of letting the command die at the default 120s.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "command"
+   ],
+   "properties": {
+    "command": {
+     "type": "string",
+     "description": "Shell command to execute."
+    },
+    "timeout_ms": {
+     "type": "number",
+     "description": "Milliseconds before the command is killed. Default 120000, max 600000. Raise it for full test suites, installs, and builds."
+    }
+   }
+  }
+ },
+ {
+  "group": "core",
+  "name": "task",
+  "description": "Delegate a self-contained sub-task to a subagent that has its own context window, then returns only its final answer. Use it for broad exploration (\"find every place X is used\") or work that would flood your own context with tool output. The subagent cannot ask the user.\n- subagent_type=explore: read-only search over the workspace.\n- subagent_type=general: full tools (default), for doing a self-contained piece of work.\n- subagent_type=review: review the CURRENT uncommitted workspace changes. You do not need to describe what changed — the diff is handed to the reviewer; just say what to focus on.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "description",
+    "prompt"
+   ],
+   "properties": {
+    "description": {
+     "type": "string",
+     "description": "Short (3-5 words) description of the sub-task."
+    },
+    "prompt": {
+     "type": "string",
+     "description": "Full, self-contained instructions for the subagent."
+    },
+    "subagent_type": {
+     "type": "string",
+     "description": "explore (read-only) | general (full tools, default) | review (review current changes)"
+    }
+   }
+  }
+ },
+ {
+  "group": "mediaRead",
+  "name": "media_search",
+  "description": "Look up the media assets that already exist in OmniStudio: images, speech (TTS) and videos — both the ones the user generated by hand in the app and the ones generated by agents. Use it before generating anything new (to reuse existing material), and when the user refers to something they made earlier (\"我上次生成的那张图\"). Results are newest-first with dates, prompts, refs and file paths.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Keywords matched against prompts / spoken text / model names. Omit to list what was made recently."
+    },
+    "kind": {
+     "type": "string",
+     "description": "Restrict to one kind: \"image\" | \"video\" | \"audio\". Default: all."
+    },
+    "source": {
+     "type": "string",
+     "description": "Restrict by origin: \"manual\" (the user made it in the UI) | \"agent\". Default: all."
+    },
+    "days": {
+     "type": "number",
+     "description": "Only assets created within the last N days."
+    },
+    "limit": {
+     "type": "number",
+     "description": "Max items (default 12, max 50)."
+    }
+   }
+  }
+ },
+ {
+  "group": "notes",
+  "name": "note_list",
+  "description": "List the user's notes from OmniStudio's Notes app (日记 / 随手记) — id, date, title, tags and a short excerpt, most recently updated first. Use it when the user asks about their notes or diary in general (\"看看我的日记\", \"我最近记了什么\", \"what did I write down\"), instead of asking them to paste the text.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "limit": {
+     "type": "number",
+     "description": "Max notes (default 8, max 20)."
+    }
+   }
+  }
+ },
+ {
+  "group": "notes",
+  "name": "note_search",
+  "description": "Search the user's notes (title, body and tags) by keyword. Use it when the user refers to something they wrote before (\"我上次记的那条\", \"笔记里关于部署的\"), and when a memory entry begins with 笔记《…》 — then use the id from the results with note_read to get the full text.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "query"
+   ],
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Keywords to look for, e.g. '爬山' / 'deployment'."
+    },
+    "limit": {
+     "type": "number",
+     "description": "Max notes (default 8, max 20)."
+    }
+   }
+  }
+ },
+ {
+  "group": "notes",
+  "name": "note_read",
+  "description": "Read one note in full (Markdown) by id. Ids come from note_list / note_search, and a memory entry mentioning `note_read #<id>` points at one too. The text is the user's own writing — treat it as their words, do not rewrite it unless asked.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "id"
+   ],
+   "properties": {
+    "id": {
+     "type": "number",
+     "description": "Note id, e.g. 12."
+    }
+   }
+  }
+ },
+ {
+  "group": "jev",
+  "name": "jev_evaluate",
+  "description": "Ask one or more **typed** questions about a piece of text and get structured answers instead of prose — JEV (System One, the TypeSafe protocol). Three question types:\n  · noul   — yes/no, returns P(true) in 0..1 (`Does this message ask for a refund?`)\n  · choice — pick one of the options you list, returns the choice + probabilities + confidence\n  · score  — rate on an ordered rubric you describe, returns the expected level + probabilities + confidence\nUse it when a judgment must be consistent and machine-readable: classification / triage / labelling / rubric scoring / ratings / `is this X?` checks — especially when you would otherwise need several runs to compare answers, or the answer must land in a fixed set of options. Questions are evaluated independently and in parallel against the same state, so ask many at once.\nPrefer this over guessing for anything you must be consistent about; do NOT use it to generate text. Free (price 0); it runs on whichever JEV backend is configured (local runtime or cloud).",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "state",
+    "questions"
+   ],
+   "properties": {
+    "state": {
+     "type": "string",
+     "description": "The content every question refers to. Plain text; put the whole thing in here (the model sees nothing else)."
+    },
+    "questions": {
+     "type": "object",
+     "properties": {},
+     "additionalProperties": {
+      "type": "object",
+      "required": [
+       "type"
+      ],
+      "properties": {
+       "type": {
+        "anyOf": [
+         {
+          "type": "string",
+          "const": "noul"
+         },
+         {
+          "type": "string",
+          "const": "choice"
+         },
+         {
+          "type": "string",
+          "const": "score"
+         }
+        ],
+        "description": "noul (yes/no) · choice (pick one) · score (ordered rubric)"
+       },
+       "instructions": {
+        "type": "string",
+        "description": "The question itself, e.g. 'Which team should handle this?'"
+       },
+       "criteria": {
+        "anyOf": [
+         {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "description": "score: ordered levels, low → high (index = level number from 0)"
+         },
+         {
+          "type": "object",
+          "patternProperties": {
+           "^.*$": {
+            "type": "string"
+           }
+          },
+          "description": "choice: {label: when it applies}; score is also accepted as an array of level descriptions"
+         }
+        ],
+        "description": "noul: omit (or give a short description of what a yes means). choice: map of option → when it applies (required). score: ordered level descriptions (required)."
+       }
+      }
+     },
+     "description": "Questions keyed by the name you want back in the answer, e.g. {department: {type:'choice', ...}}."
+    },
+    "model": {
+     "type": "string",
+     "description": "Model override. Default: the configured JEV model. Cloud aliases: jev-latest / jev-preview / jev-1.13.0. Local (laya-mlx): laya-latest / laya-multilingual / laya-typed-decisions."
+    }
+   }
+  }
+ },
+ {
+  "group": "mediaGen",
+  "name": "generate_image",
+  "description": "Generate image(s) with the image backend already configured in OmniStudio (local MLX / OpenAI-compatible API / ComfyUI). If the backend or model is not set up yet, a dialog pops up asking the user to configure it and to pick a model — wait for their confirmation instead of guessing, and never retry by yourself when the user cancels. Results are stored in the media library (findable later via media_search). When illustrating a document, pass `save_to` so the files are copied next to your text and can be referenced by relative path. Note: cloud backends may cost money and take a while; prefer reusing an existing asset via media_search when possible.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "prompt"
+   ],
+   "properties": {
+    "prompt": {
+     "type": "string",
+     "description": "What to draw — subject, style, lighting, composition. Be specific and visual."
+    },
+    "negative_prompt": {
+     "type": "string",
+     "description": "What to avoid in the image."
+    },
+    "count": {
+     "type": "number",
+     "description": "How many images to generate (1-8, default 1)."
+    },
+    "aspect_ratio": {
+     "type": "string",
+     "description": "Aspect ratio: 1:1 | 16:9 | 9:16 | 4:3 | 3:4. Default 1:1."
+    },
+    "width": {
+     "type": "number",
+     "description": "Explicit width in pixels (with height, overrides aspect_ratio)."
+    },
+    "height": {
+     "type": "number",
+     "description": "Explicit height in pixels."
+    },
+    "model": {
+     "type": "string",
+     "description": "Model / checkpoint id override. Usually omit to use the configured default."
+    },
+    "reference": {
+     "type": "string",
+     "description": "Existing image to edit or restyle: a media_search ref, `image#12`, or a workspace file path. Only supported by the OpenAI-compatible backend."
+    },
+    "seed": {
+     "type": "number",
+     "description": "Seed for reproducible results."
+    },
+    "save_to": {
+     "type": "string",
+     "description": "Workspace-relative directory to copy the results into, e.g. \"assets\". Omit to keep them in the media library only."
+    }
+   }
+  }
+ },
+ {
+  "group": "mediaGen",
+  "name": "generate_speech",
+  "description": "Turn text into a speech audio file using the TTS engines configured in OmniStudio: the local audio.cpp engine, a third-party OpenAI-compatible provider, or the free online Edge TTS (tried in that order). The audio is stored in the media library (findable via media_search). Long scripts should be split into a few calls.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "text"
+   ],
+   "properties": {
+    "text": {
+     "type": "string",
+     "description": "Text to speak. Keep each call under ~2000 characters for best results."
+    },
+    "voice": {
+     "type": "string",
+     "description": "Voice id or clone name, e.g. \"zh-CN-XiaoxiaoNeural\" for Edge TTS. Omit to use the configured default voice."
+    },
+    "model": {
+     "type": "string",
+     "description": "TTS model id override (local catalog id or provider model)."
+    },
+    "engine": {
+     "type": "string",
+     "description": "Which engine to use: \"auto\" (default) | \"local\" | \"provider\" | \"edge\"."
+    },
+    "save_to": {
+     "type": "string",
+     "description": "Workspace-relative directory to copy the audio into, e.g. \"assets\"."
+    }
+   }
+  }
+ },
+ {
+  "group": "mediaGen",
+  "name": "generate_video",
+  "description": "Generate a video with the backend configured in OmniStudio (MiniMax / Seedance cloud, or a local ComfyUI Wan workflow). Video generation is asynchronous and usually takes 1-5 minutes, so this tool submits the job and waits for it. Cloud backends cost money — only use it when the user actually asked for a video.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "prompt"
+   ],
+   "properties": {
+    "prompt": {
+     "type": "string",
+     "description": "What the video should show, including camera and motion."
+    },
+    "aspect_ratio": {
+     "type": "string",
+     "description": "Aspect ratio, e.g. \"16:9\" | \"9:16\" | \"1:1\". Default 16:9."
+    },
+    "duration": {
+     "type": "number",
+     "description": "Duration in seconds (cloud backends: 4-15)."
+    },
+    "resolution": {
+     "type": "string",
+     "description": "Resolution tier: \"768P\" | \"2K\" | \"480P\" (MiniMax) or \"480p\" | \"720p\" | \"1080p\" (Seedance)."
+    },
+    "model": {
+     "type": "string",
+     "description": "Model id override. Usually omit."
+    },
+    "first_frame": {
+     "type": "string",
+     "description": "Image used as the first frame (image-to-video): a media_search ref, `image#12`, or a workspace image path."
+    },
+    "seed": {
+     "type": "number",
+     "description": "Seed for reproducible results."
+    },
+    "save_to": {
+     "type": "string",
+     "description": "Workspace-relative directory to copy the finished video into, e.g. \"assets\"."
+    },
+    "timeout_seconds": {
+     "type": "number",
+     "description": "How long to wait for the result (default 600, max 1800)."
+    }
+   }
+  }
+ },
+ {
+  "group": "mediaGen",
+  "name": "media_export",
+  "description": "Copy existing media assets (from media_search) into the workspace so they can be referenced by relative path from the document / page you are writing. Use this to reuse images, audio or video the user already has instead of generating them again.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "refs",
+    "save_to"
+   ],
+   "properties": {
+    "refs": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Asset handles from media_search: refs like `gen/xxx.png`, or `image#12` / `video#3` / `audio#7`."
+    },
+    "save_to": {
+     "type": "string",
+     "description": "Workspace-relative target directory, e.g. \"assets\"."
+    },
+    "name": {
+     "type": "string",
+     "description": "Optional file name when exporting exactly one asset, e.g. `cover.png`. An existing file with the same name is overwritten."
+    }
+   }
+  }
+ },
+ {
+  "group": "memory",
+  "name": "memory_search",
+  "description": "Search the user's long-term memory (facts, preferences, past decisions, lessons) by keyword or meaning. Results are ranked by relevance, importance and freshness. Use it before asking the user to repeat context they may have told you before.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "query"
+   ],
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Keywords or a short question, e.g. '部署' / 'deployment workflow'."
+    },
+    "limit": {
+     "type": "number",
+     "description": "Max entries to return (1-20, default 8)."
+    }
+   }
+  }
+ },
+ {
+  "group": "memory",
+  "name": "memory_save",
+  "description": "Persist a durable fact, preference, decision or lesson to the user's shared long-term memory (visible to every agent they use). Only save stable, reusable knowledge — not transient task details, not secrets or credentials. Near-duplicate content is merged automatically; pass supersedes with ids from memory_search when this replaces outdated memories.",
+  "parameters": {
+   "type": "object",
+   "required": [
+    "content"
+   ],
+   "properties": {
+    "content": {
+     "type": "string",
+     "description": "The memory, one concise self-contained sentence (max 500 chars)."
+    },
+    "category": {
+     "anyOf": [
+      {
+       "type": "string",
+       "const": "fact"
+      },
+      {
+       "type": "string",
+       "const": "preference"
+      },
+      {
+       "type": "string",
+       "const": "experience"
+      },
+      {
+       "type": "string",
+       "const": "skill"
+      },
+      {
+       "type": "string",
+       "const": "other"
+      }
+     ],
+     "description": "fact | preference | experience | skill | other"
+    },
+    "tags": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Short lookup tags."
+    },
+    "scope": {
+     "anyOf": [
+      {
+       "type": "string",
+       "const": "project"
+      },
+      {
+       "type": "string",
+       "const": "global"
+      }
+     ],
+     "description": "project = only this workspace (default for facts/experiences), global = every workspace (default for preferences/skills). Use global for things about the user, project for things about this codebase."
+    },
+    "supersedes": {
+     "type": "array",
+     "items": {
+      "type": "number"
+     },
+     "description": "Ids of memories this one replaces (conflicting/outdated facts). They are marked superseded."
+    }
+   }
+  }
+ },
+ {
+  "group": "memory",
+  "name": "memory_forget",
+  "description": "Delete a memory that is wrong, outdated or that the user asked you to forget. Give the id from memory_search, or a query to match the best hit.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "number",
+     "description": "Memory id to delete."
+    },
+    "query": {
+     "type": "string",
+     "description": "If no id: delete the best match for this query."
+    },
+    "reason": {
+     "type": "string",
+     "description": "Why it should be forgotten (kept in the audit log)."
+    }
+   }
+  }
+ }
+]

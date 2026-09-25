@@ -121,3 +121,40 @@ export function isModelSideFailure(kind: StartupErrorKind): boolean {
     kind === "download-incomplete"
   );
 }
+
+// ---------- 请求期错误：上下文超窗 ----------
+
+/**
+ * 服务端「这次请求超出上下文窗口」的判定（聊天路径把它翻成一句能照做的话）。
+ *
+ * 各家原文：
+ *   llama.cpp  `the request exceeds the available context size, try increasing it`
+ *              （错误类型 `exceed_context_size_error`，HTTP 400；我们给聊天实例发了
+ *              `--no-context-shift`，超窗时一定走到这里，而不是悄悄丢掉前面的对话）
+ *   vLLM       `This model's maximum context length is N tokens ...`
+ *   OpenAI 兼容 `context_length_exceeded`
+ * 比 benchmark.ts 那条窄：那边连 `too long` / `n_ctx` 都算（只是决定要不要跳过更大档位），
+ * 这里命中就会把用户引去调上下文长度，所以只认明确说「超窗」的措辞。
+ */
+const CONTEXT_OVERFLOW_PATTERN =
+  /exceeds? the available context size|exceed_context_size|context_length_exceeded|maximum context length is|prompt is too long for the context/i;
+
+export function isContextOverflowError(text: string | null | undefined): boolean {
+  return CONTEXT_OVERFLOW_PATTERN.test(text ?? "");
+}
+
+/**
+ * 超窗时给用户看的那句话（中英两版；主进程按界面语言挑）。
+ * 暂不进 shared/i18n.ts 字典：那份文件由界面侧统一维护，这里先内联两种语言。
+ */
+export const CONTEXT_OVERFLOW_HINT = {
+  zh: "上下文不够：这段对话已经超过模型当前的上下文长度。去「模型参数」里调大上下文长度，或者新开一个对话。",
+  en: "Out of context: this conversation is longer than the model's current context length. Increase the context length in Model parameters, or start a new conversation.",
+} as const;
+
+/** 把请求错误原文换成可照做的提示（不是超窗就原样返回）；原文附在后面便于排查。 */
+export function explainRequestError(message: string, lang: "zh" | "en"): string {
+  if (!isContextOverflowError(message)) return message;
+  const raw = message.slice(0, 200);
+  return lang === "zh" ? `${CONTEXT_OVERFLOW_HINT.zh}（${raw}）` : `${CONTEXT_OVERFLOW_HINT.en} (${raw})`;
+}

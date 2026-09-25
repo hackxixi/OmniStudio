@@ -164,8 +164,9 @@ describe("classifyModel", () => {
 // ---------------------------------------------------------------------------
 
 describe("MODEL_SOURCE_META", () => {
-  test("names the real host each platform's bytes come from", () => {
+  // 平台域名；HF 实际走官方还是 hf-mirror 由下载源路由决定，界面按路由结果显示
+  test("names each platform's own host", () => {
     expect(MODEL_SOURCE_META.modelscope.host).toBe("modelscope.cn");
-    expect(MODEL_SOURCE_META.huggingface.host).toBe("hf-mirror.com");
+    expect(MODEL_SOURCE_META.huggingface.host).toBe("huggingface.co");
   });
 });

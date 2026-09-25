@@ -213,6 +213,24 @@ describe("plannerHardwareSnapshot", () => {
     expect(hw.vramFreeBytes).toBeNull();
   });
 
+  test("空闲内存按每次快照现取：同一进程里空闲变了，规划器看到的也跟着变", async () => {
+    // getHardwareInfo 的静态画像是缓存的，但 freeMemoryBytes 每次调用现读；
+    // 这里用「每次调用返回不同空闲」的桩确认快照没有自己再把它记住。
+    const base = noGpuHardware();
+    const frees = [30 * 1024 ** 3, 2 * 1024 ** 3];
+    let call = 0;
+    mock.module(hardwareModule, () => ({
+      ...realHardware,
+      getHardwareInfo: () => ({ ...base, freeMemoryBytes: frees[call++] }),
+    }));
+    stubGpuStats({ available: false, reason: "no-tool" });
+    const first = await plannerHardwareSnapshot();
+    const second = await plannerHardwareSnapshot();
+    expect(first.systemFreeBytes).toBe(30 * 1024 ** 3);
+    expect(second.systemFreeBytes).toBe(2 * 1024 ** 3);
+    expect(second.systemTotalBytes).toBe(first.systemTotalBytes);
+  });
+
   test("kind === none（无 GPU）→ hasGpu false，vram 全 null", async () => {
     stubHardware(noGpuHardware());
     stubGpuStats({ available: false, reason: "no-tool" });

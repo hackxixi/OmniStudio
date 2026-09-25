@@ -20,6 +20,9 @@ import {
   type DownloadOptions,
   type DownloadProgress,
 } from "./downloader";
+import { reportSourceFailure } from "./net-sources";
+import { hfEndpointsOf, resolveModelScopeRepo, sourcePlanWithin } from "./model-source-map";
+import { listRepoFiles as listHuggingFaceRepoFiles } from "./huggingface";
 
 export { isModelWeightExt, modelDisplayName, safeRepoId, removePartialFiles };
 export type { MarketFile, MarketModel, DownloadProgress };
@@ -154,11 +157,30 @@ export async function searchModels(
   };
 }
 
+/**
+ * 列 ModelScope 仓库文件。仓库不在 ModelScope 上（404，常见于引导页 / 推荐清单给的
+ * HF 仓库 id）时不直接报错：先按 model-source-map 找 ModelScope 上的等价仓库
+ * （组织改名），再没有就改列 Hugging Face（走镜像）—— 下载管理器按同样的顺序回退，
+ * 列出来的文件名与实际下载的字节来自同一个仓库。
+ */
 export async function listRepoFiles(repo: string): Promise<MarketFile[]> {
+  const direct = await listModelScopeFiles(repo);
+  if (direct) return direct;
+  const mapped = await resolveModelScopeRepo(repo);
+  if (mapped.status === "found" && mapped.repo !== repo) {
+    const files = await listModelScopeFiles(mapped.repo);
+    if (files) return files;
+  }
+  return listHuggingFaceRepoFiles(repo);
+}
+
+/** 直接列 ModelScope 上这个 id 的文件；仓库不存在返回 null（其它错误照常抛出）。 */
+export async function listModelScopeFiles(repo: string): Promise<MarketFile[] | null> {
   const { owner, name } = splitRepo(repo);
   const url = `${MODELSCOPE_BASE}/api/v1/models/${owner}/${name}/repo/files?Revision=master&Recursive=true`;
 
   const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+  if (res.status === 404) return null;
   if (!res.ok) throw new Error(`ModelScope files failed: ${res.status}`);
 
   const body = (await res.json()) as {
@@ -260,19 +282,38 @@ export async function downloadFile(
   repo: string,
   fileName: string,
   options: DownloadOptions = {},
+  /**
+   * 实际去 ModelScope 拉字节的仓库 id（HF id 映射到 ModelScope 改名组织时与 repo 不同）；
+   * 落盘目录始终按 repo，本地模型列表 / 已下载判断才认得出来。
+   */
+  remoteRepo: string = repo,
 ): Promise<{ path: string; size: number }> {
   const dir = path.join(getModelsBaseDir(), safeRepoId(repo));
   mkdirSync(dir, { recursive: true });
   const destPath = modelDestPath(repo, fileName);
   if (!destPath) throw new Error(`非法的模型文件名：${fileName}`);
 
-  return downloadWithResume(resolveFileUrl(repo, fileName), destPath, options);
+  return downloadWithResume(resolveFileUrl(remoteRepo, fileName), destPath, options);
+}
+
+/** 下载内核抛出的 HTTP 错误带 status（见 downloader 的 HttpStatusError）。 */
+export function httpStatusOf(e: unknown): number | null {
+  const status = (e as { status?: unknown } | null)?.status;
+  if (typeof status === "number") return status;
+  const m = e instanceof Error ? /failed: (\d{3})\b/.exec(e.message) : null;
+  return m ? Number(m[1]) : null;
+}
+
+/** 404 / 401 / 403 / 451：文件不在 / 要授权 —— 是仓库的事，不是这个源连不上。 */
+function isRepoSideStatus(status: number | null): boolean {
+  return status === 404 || status === 401 || status === 403 || status === 451;
 }
 
 /**
  * 下载 HuggingFace 仓库里的单个文件（audio.cpp GGUF 等不在 ModelScope 上的资源）。
- * 优先走国内镜像 hf-mirror.com，失败后回退官方 huggingface.co；每个镜像都继承
- * 断点续传与重试（换镜像时保留已下载的分片，从断点接着下）。
+ * 端点顺序来自下载源路由（net-sources：国内镜像优先或官方直连优先，官方永远兜底）；
+ * 每个端点都继承断点续传与重试（换端点时保留已下载的分片，从断点接着下）。
+ * 连不上的端点报给路由（reportSourceFailure）降级；404 这类仓库侧错误不算源的锅。
  */
 export async function downloadHuggingFaceFile(
   repo: string,
@@ -283,19 +324,19 @@ export async function downloadHuggingFaceFile(
   if (!destPath) throw new Error(`非法的模型文件路径：${filePath}`);
   mkdirSync(path.dirname(destPath), { recursive: true });
 
-  const mirrors = [
-    `https://hf-mirror.com/${repo}/resolve/main/${filePath}`,
-    `https://huggingface.co/${repo}/resolve/main/${filePath}`,
-  ];
-
+  const endpoints = hfEndpointsOf(await sourcePlanWithin());
   let lastError: Error | null = null;
-  for (const url of mirrors) {
+  for (const endpoint of endpoints) {
+    const url = `${endpoint}/${repo}/resolve/main/${filePath}`;
     try {
       return await downloadWithResume(url, destPath, options);
     } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
       // 被用户取消/暂停就直接抛出，不换镜像。
       if (options.signal?.aborted) throw e;
+      // 第一个错误最有信息量（首选源为什么不行）；但 404 这类要保留下来给上层判断回退。
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (!lastError || isRepoSideStatus(httpStatusOf(err))) lastError = err;
+      if (!isRepoSideStatus(httpStatusOf(err))) reportSourceFailure(url);
     }
   }
   throw lastError ?? new Error("HF download failed");

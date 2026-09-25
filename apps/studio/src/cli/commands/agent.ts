@@ -137,6 +137,8 @@ export async function cmdAgent(parsed: ParsedArgs): Promise<void> {
   const ok = await streamAgentRun(socketPath, payload, timeoutMs, (line) => {
     // 默认只输出事件与结果；正文增量在流式响应里本来就是给 --chunks 用的。
     if (line.type === "chunk" && !payload.chunks) return;
+    // 心跳只是为了让连接在模型预填充的长静默里不被掐断，不是事件。
+    if (line.type === "heartbeat") return;
     process.stdout.write(`${JSON.stringify(line)}\n`);
   });
   if (!ok) process.exit(1);

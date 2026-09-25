@@ -6,6 +6,7 @@ import { and, asc, eq, gt, inArray, like, sql } from "drizzle-orm";
 
 import {
   Agent,
+  type AfterToolCallContext,
   type AfterToolCallResult,
   type AgentEvent,
   type AgentMessage,
@@ -40,6 +41,17 @@ import {
   type ToolOutcome,
 } from "./agent-tools";
 import { loadProjectInstructions } from "./agent-instructions";
+import { parseToolStrategy, type AgentToolStrategy } from "../shared/agent-tool-strategy";
+import {
+  assembleRoutedTools,
+  createLoadToolsTool,
+  partitionRoutedTools,
+  ROUTED_GROUP_ORDER,
+  type RoutedGroupId,
+  type RoutedToolset,
+} from "./agent-routed-tools";
+import { TurnLoopGuard } from "./agent-loop-guard";
+import { pickToolGroups, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
 import { buildSystemOneAgentTools } from "./systemone-tools";
@@ -717,7 +729,33 @@ const MODE_INSTRUCTION: Record<AgentMode, string> = {
   ].join("\n"),
 };
 
-function buildSystemPrompt(mode: AgentMode, workspace: string, goalSection?: string | null): string {
+/**
+ * 精简路由策略（`AGENT_TOOL_STRATEGY=routed`）的工作准则：面向日常助理任务，只提现有工具
+ * （recall / find / load_tools …），不带编码专用的补丁 / 子智能体 / 验证阶梯 —— 那些工具在这个策略下根本不在。
+ * 本地小模型每多读一千个 token 就多几秒，这一段刻意写短。
+ */
+const ROUTED_GUIDELINES = [
+  "1. 路径尽量用相对工作区的相对路径。",
+  "2. 一次只调用当下最需要的工具，拿到结果再决定下一步。",
+  "3. 用户已有的资料（知识库、笔记、记忆）用 recall 查；找工作区里的文件用 find，再用 read_file 读。",
+  "4. 缺少只有用户知道的信息（发给谁、什么时间、改成什么）时，用 ask_user 问清楚，不要猜、不要编。",
+  "5. 当前工具做不了用户要的事时，先用 load_tools 加载需要的工具组。",
+  "6. 有副作用的操作可能触发用户授权：被拒绝时不要硬绕，换思路或直接问用户。",
+];
+const ROUTED_DELIVERY = [
+  "交付要求：",
+  "- 没做完就别说做完；每个结论都要有工具结果作为依据，不要编造。",
+  "- 生成了图片 / 语音 / 视频，在回答里写明它的编号或路径。",
+  "- 最终回答用简洁的中文写清：做了什么、结果在哪。",
+];
+
+function buildSystemPrompt(
+  mode: AgentMode,
+  workspace: string,
+  goalSection?: string | null,
+  strategy: AgentToolStrategy = "classic",
+): string {
+  const routed = strategy === "routed" && mode !== "plan";
   const guidelines = [
     "1. 路径尽量用相对工作区的相对路径；绝对路径只允许落在工作区内用于写操作。",
     "2. 一次只调用当下最需要的工具，拿到结果再决定下一步，不要成批猜测。",
@@ -746,7 +784,12 @@ function buildSystemPrompt(mode: AgentMode, workspace: string, goalSection?: str
    * 有意的边界：**不在回合结束时自动抽取记忆** —— 那需要每 N 轮多跑一次推理，
    * 本地模型上这笔开销该由用户显式选择（对齐摘要式压缩的取舍）。
    */
-  if (getSetting("MEMORY_ENABLED") === "1" && mode !== "plan") {
+  if (routed && getSetting("MEMORY_ENABLED") === "1") {
+    guidelines.splice(0, guidelines.length, ...ROUTED_GUIDELINES);
+    guidelines.push("7. 产生了以后还用得上的用户偏好或事实时，用 remember 记一句结论；拿不准就不记。");
+  } else if (routed) {
+    guidelines.splice(0, guidelines.length, ...ROUTED_GUIDELINES);
+  } else if (getSetting("MEMORY_ENABLED") === "1" && mode !== "plan") {
     guidelines.push(
       "10. 任务里产生了**下次还用得上**的结论时（用户的稳定偏好、项目约定、踩过的坑与解法），" +
         "用 memory_save 记一条；只记结论性的一句话，不要记流水账，也不要记这次任务的一次性细节。" +
@@ -767,19 +810,7 @@ function buildSystemPrompt(mode: AgentMode, workspace: string, goalSection?: str
     "工作准则：",
     ...guidelines,
     "",
-    "做完之前先验证（按你改了什么选一种，别跳过）：",
-    "- 改了代码 → 真的跑一次（测试 / 构建 / 直接运行），把命令和输出写进总结；",
-    "- 改了文档 / 配置 → 重新读一遍落盘后的内容，确认写进去的是你以为的东西；",
-    "- 生成了媒体 / 复制了文件 → 确认目标路径下真的存在（list_dir 或读一次）；",
-    "- 修 bug → 先能复现、修完确认不再复现，两者都要有命令依据。",
-    "没法验证时（环境不具备、需要用户机器上的东西）就**明说没验证**，不要用「应该没问题」糊过去。",
-    "",
-    "交付要求：",
-    "- 没做完就别说做完；没验证过的结论要写明是推测。",
-    "- 不要编造：文件内容、命令输出、测试结果都要有工具调用作为依据。",
-    "- 不要偷偷缩小范围：说好做 A 就做 A，做不到就说清卡在哪，不要交一个「A 的一部分」当成 A。",
-    "- 不要治症状：用抑制报错、特判输入这类办法绕开问题时，先说清楚为什么这才是对的。",
-    "- 最终回答用简洁的中文写清：做了什么、改了哪些文件、怎么验证的。",
+    ...(routed ? ROUTED_DELIVERY : CLASSIC_DELIVERY),
   ];
   // 项目指令（AGENTS.md）：仓库自己的约定比通用准则更贴近现场，放在记忆之前。
   const instructions = loadProjectInstructions(workspace);
@@ -803,6 +834,23 @@ function buildSystemPrompt(mode: AgentMode, workspace: string, goalSection?: str
   sections.push("", MODE_INSTRUCTION[mode]);
   return sections.join("\n");
 }
+
+/** 经典策略的验证与交付要求（编码场景）。 */
+const CLASSIC_DELIVERY = [
+  "做完之前先验证（按你改了什么选一种，别跳过）：",
+  "- 改了代码 → 真的跑一次（测试 / 构建 / 直接运行），把命令和输出写进总结；",
+  "- 改了文档 / 配置 → 重新读一遍落盘后的内容，确认写进去的是你以为的东西；",
+  "- 生成了媒体 / 复制了文件 → 确认目标路径下真的存在（list_dir 或读一次）；",
+  "- 修 bug → 先能复现、修完确认不再复现，两者都要有命令依据。",
+  "没法验证时（环境不具备、需要用户机器上的东西）就**明说没验证**，不要用「应该没问题」糊过去。",
+  "",
+  "交付要求：",
+  "- 没做完就别说做完；没验证过的结论要写明是推测。",
+  "- 不要编造：文件内容、命令输出、测试结果都要有工具调用作为依据。",
+  "- 不要偷偷缩小范围：说好做 A 就做 A，做不到就说清卡在哪，不要交一个「A 的一部分」当成 A。",
+  "- 不要治症状：用抑制报错、特判输入这类办法绕开问题时，先说清楚为什么这才是对的。",
+  "- 最终回答用简洁的中文写清：做了什么、改了哪些文件、怎么验证的。",
+];
 
 /** 工具分类：只读 / 有副作用 / 与用户交互（列表页分组展示用）。名字要与工具真实注册名一致。 */
 const READ_ONLY_TOOLS = new Set([
@@ -1099,6 +1147,33 @@ export async function listAgentTools(mode: AgentMode = getAgentMode()): Promise<
   }));
 }
 
+/**
+ * 精简路由策略的会话状态：完整工具已切成核心 + 各组（`partitionRoutedTools`），
+ * `loaded` 是本会话已经加载过的组 —— 只增不减，同一会话里工具列表稳定，推理引擎的前缀缓存才能命中。
+ */
+type RoutedState = {
+  set: RoutedToolset;
+  loaded: RoutedGroupId[];
+  /** load_tools 在本轮加载了新组：下一轮开始前（prepareNextTurnWithContext）换上新工具列表。 */
+  pendingReload: boolean;
+  /** 本轮循环守卫（搜索打转、生成失败后反复重试）：每轮用户消息开始时换新的。 */
+  guard: TurnLoopGuard;
+};
+
+/** 当前应发给模型的工具列表：核心 + 已加载的组 + （还有没加载的组时）load_tools。 */
+function routedToolList(routed: RoutedState): ReturnType<typeof assembleRoutedTools> {
+  const available = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
+  const loadTools = available.length
+    ? createLoadToolsTool(available, (group) => {
+        if (!routed.loaded.includes(group)) {
+          routed.loaded.push(group);
+          routed.pendingReload = true;
+        }
+      })
+    : null;
+  return assembleRoutedTools(routed.set, routed.loaded, loadTools);
+}
+
 type Session = {
   agent: Agent;
   mode: AgentMode;
@@ -1118,6 +1193,10 @@ type Session = {
   startupContext: string;
   /** 建这个会话时用的模型（`currentModelKey()`）：换了模型要重建会话。 */
   modelKey: string;
+  /** 建这个会话时的工具策略（`AGENT_TOOL_STRATEGY`）：换了要重建会话，工具列表与系统提示都跟着变。 */
+  toolStrategy: AgentToolStrategy;
+  /** 精简路由策略的状态；经典策略（或 Plan 模式）为 null。 */
+  routed: RoutedState | null;
   /**
    * 摘要式压缩的记账（`AGENT_COMPACT_MODE=summary` 时用）。
    *
@@ -1685,6 +1764,10 @@ async function runSubagent(opts: {
     // 按轮数封顶，而不是"只跑一轮"：子智能体通常要先调研再写结论，
     // 一轮就掐断会让它永远交不出结论 —— 主线拿到的是「（无输出）」。
     // 空回合同样要提醒：子智能体的失败在主线上只表现为「（无输出）」，最难查。
+    // 步数用尽时给一次收尾回合（tools 置空 + 让它按已有信息写结论）——
+    // 主线拿到的是子智能体的最后一段正文，没有收尾回合的话它"用满预算"
+    // 就交不出结论，主线看到的还是「（无输出）」，最难查的那一种。
+    let subagentWrapUp = false;
     attachTurnRecovery(agent, {
       steps: () => subagentSteps,
       maxSteps: maxSubagentSteps,
@@ -1698,6 +1781,17 @@ async function runSubagent(opts: {
           subagentId,
           output: `子智能体空回合，已提醒它继续（第 ${attempt} 次）。`,
         }),
+      onWrapUp: () => {
+        subagentWrapUp = true;
+        recordEvent({
+          conversationId: opts.conversationId,
+          messageId: opts.parentMessageId,
+          kind: "status",
+          toolName: "task",
+          subagentId,
+          output: `子智能体达到步数上限（${maxSubagentSteps} 步），已让它停下工具、按已查到的信息直接总结。`,
+        });
+      },
     });
     await agent.prompt(opts.prompt + reviewContext + planContext);
     recordEvent({
@@ -1708,7 +1802,9 @@ async function runSubagent(opts: {
       subagentId,
       output: text.trim()
         ? `完成：${text.trim().slice(0, 400)}`
-        : `已停止（达到子任务步数上限 ${maxSubagentSteps}，未给出结论）`,
+        : subagentWrapUp
+          ? `达到子任务步数上限 ${maxSubagentSteps}，已让它停下工具直接总结（但收尾后仍无正文，可能模型/推理服务异常）`
+          : `已停止（达到子任务步数上限 ${maxSubagentSteps}，未给出结论）`,
       isError: !text.trim(),
     });
     return text.trim();
@@ -2136,6 +2232,85 @@ export function makeContextTransform(
   return null;
 }
 
+/**
+ * 精简路由策略：在工具结果落定前过一遍本轮循环守卫（agent-loop-guard.ts），需要时在结果末尾追加
+ * 「停止搜索 / 不要重试生成」的提示。经典策略原样返回超限转存钩子的结果。
+ * 工具失败有两种形态：抛错（内核标 isError）与 errorResult（details.error），两种都算。
+ */
+function withLoopGuard(
+  session: Session,
+  spill: ReturnType<typeof makeToolOutputHook>,
+): (context: AfterToolCallContext) => Promise<AfterToolCallResult | undefined> {
+  return async (context) => {
+    const base = await spill(context);
+    const guard = session.routed?.guard;
+    if (!guard) return base;
+    const details = (context.result as { details?: { error?: unknown } } | undefined)?.details;
+    const failed = context.isError || Boolean(details?.error);
+    const notice = guard.record(context.toolCall.name, resultText(context.result), failed);
+    if (!notice) return base;
+    const content = base?.content ?? context.result.content ?? [];
+    return { ...base, content: [...content, { type: "text" as const, text: `\n\n${notice}` }] };
+  };
+}
+
+/**
+ * 按策略装配会话初始工具：经典策略原样返回；精简路由策略切成核心 + 各组，
+ * 一开始只给核心（与 load_tools），每轮开始时再由 routeToolGroups 按请求加组。
+ */
+function withToolStrategy<T extends Parameters<typeof partitionRoutedTools>[0]>(session: Session, tools: T): T {
+  if (session.toolStrategy !== "routed") return tools;
+  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard() };
+  return routedToolList(session.routed) as T;
+}
+
+/**
+ * 精简路由策略的每轮选组：JEV 判断这一轮要哪些工具组，并入本会话已加载的组（只增不减），
+ * 换上新的工具列表，并把选组结果写进轨迹。返回附在本轮用户消息末尾的说明（还有哪些组没加载）。
+ * 经典策略返回空串，什么都不做。
+ */
+async function routeToolGroups(
+  session: Session,
+  conversationId: number,
+  content: string,
+  files: { name: string }[],
+  imagePaths: string[],
+): Promise<string> {
+  const routed = session.routed;
+  if (!routed) return "";
+  routed.guard = new TurnLoopGuard();
+  const available = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
+  const pick = await pickToolGroups(content, available, {
+    attachments: [...files.map((f) => f.name), ...imagePaths.map((p) => path.basename(p))],
+  });
+  const added = pick.groups.filter((g) => !routed.loaded.includes(g));
+  routed.loaded.push(...added);
+  routed.pendingReload = false;
+  session.agent.state.tools = routedToolList(routed);
+  if (available.length) {
+    const top = pick.probabilities
+      ? Object.entries(pick.probabilities)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 2)
+          .map(([g, p]) => `${g} ${p.toFixed(2)}`)
+          .join("，")
+      : "";
+    recordEvent({
+      conversationId,
+      messageId: currentMessageId(conversationId),
+      kind: "status",
+      toolName: "tool_routing",
+      output:
+        pick.via === "jev"
+          ? `工具组：${added.length ? `加载 ${added.join(" + ")}` : "只用核心工具"}（JEV：${top}）`
+          : `工具组：判定服务不可用，加载全部工具组（${pick.error ?? "未知原因"}）`,
+    });
+  }
+  const notLoaded = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
+  const note = routedTurnNote(notLoaded);
+  return note ? `\n\n${note}` : "";
+}
+
 async function getOrCreateSession(
   conversationId: number,
   mode: AgentMode,
@@ -2152,13 +2327,16 @@ async function getOrCreateSession(
    * 正文回填成 transcript，所以换模型 = 换引擎、上下文照旧。
    */
   const modelKey = currentModelKey();
+  // 工具策略也算进缓存键：设置页切换后，下一轮就按新策略建工具列表与系统提示。
+  const toolStrategy: AgentToolStrategy = mode === "plan" ? "classic" : parseToolStrategy(getSetting("AGENT_TOOL_STRATEGY"));
   const existing = sessions.get(conversationId);
   if (
     existing &&
     existing.mode === mode &&
     existing.workspace === workspace &&
     existing.headless === headless &&
-    existing.modelKey === modelKey
+    existing.modelKey === modelKey &&
+    existing.toolStrategy === toolStrategy
   ) {
     return existing;
   }
@@ -2188,7 +2366,7 @@ async function getOrCreateSession(
   const startupContext = startupHook.context.length
     ? `\n\n# 会话启动上下文（session_start hook）\n\n${startupHook.context.join("\n\n")}`
     : "";
-  const systemPrompt = buildSystemPrompt(mode, workspace, goalPromptSection(conversationId)) + startupContext;
+  const systemPrompt = buildSystemPrompt(mode, workspace, goalPromptSection(conversationId), toolStrategy) + startupContext;
   if (startupHook.runs > 0) {
     recordEvent({
       conversationId,
@@ -2212,6 +2390,8 @@ async function getOrCreateSession(
     systemPromptTokens: estimateTokens(systemPrompt),
     startupContext,
     modelKey,
+    toolStrategy,
+    routed: null,
     summary: null,
     summaryFailedAt: null,
     turnSnapshotId: null,
@@ -2231,7 +2411,7 @@ async function getOrCreateSession(
       ...(getAgentThinkingLevel() === "off"
         ? {}
         : { thinkingLevel: getAgentThinkingLevel() as Exclude<AgentThinkingLevel, "off"> }),
-      tools: await toolsForMode(
+      tools: withToolStrategy(session, await toolsForMode(
         mode,
         workspace,
         conversationId,
@@ -2247,7 +2427,7 @@ async function getOrCreateSession(
           // write_plan 三种模式都给：它写的是数据目录，碰不到工作区。
           onWritePlan: (content) => handleWritePlan(conversationId, workspace, currentMessageId(conversationId), content),
         },
-      ),
+      )),
       messages: historyAsAgentMessages(conversationId, { dropTrailingUser: true }),
     },
     /**
@@ -2256,6 +2436,19 @@ async function getOrCreateSession(
      */
     transformContext: makeContextTransform(session, conversationId, { model, models, streamFn }),
     /**
+     * 精简路由策略：load_tools 在这一轮加载了新组时，下一轮开始前把新工具列表换进上下文。
+     * 内核在每次运行开始时拷贝一份工具列表，运行中途改 `agent.state.tools` 不会生效，只能从这里换；
+     * 新组追加在列表末尾，前面的核心工具不动，前缀缓存不受影响。
+     */
+    prepareNextTurnWithContext: (turn) => {
+      const routed = session.routed;
+      if (!routed?.pendingReload) return undefined;
+      routed.pendingReload = false;
+      const tools = routedToolList(routed);
+      session.agent.state.tools = tools;
+      return { context: { ...turn.context, tools } };
+    },
+    /**
      * 工具执行前的授权闸门：
      * 1. 先做「原地打转」检测（同一调用连续重复 3 次 → 按 doom_loop 询问）；
      * 2. 再按权限策略评估，ask 会挂起并把请求推给 UI。
@@ -2263,6 +2456,11 @@ async function getOrCreateSession(
     beforeToolCall: async (context, signal) => {
       const toolName = context.toolCall.name;
       const args = (context.args ?? {}) as Record<string, unknown>;
+      // 精简路由策略的参数兜底：小模型缺信息时爱填占位符（"<收件人>"、"unknown"），拦下来让它先问用户。
+      if (session.routed) {
+        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName);
+        if (problem) return { block: true, reason: problem };
+      }
       const fingerprint = `${toolName}:${JSON.stringify(args)}`;
       session.recentCalls.push(fingerprint);
       if (session.recentCalls.length > 8) session.recentCalls.shift();
@@ -2297,7 +2495,7 @@ async function getOrCreateSession(
      * 工具结果的最后一道处理：超限就转存 + 截断 + 给出读回路径（见 makeToolOutputHook）。
      * 放在这里而不是每个工具里，是为了让 MCP / 媒体 / 未来新增的工具自动享受同一套。
      */
-    afterToolCall: makeToolOutputHook(conversationId),
+    afterToolCall: withLoopGuard(session, makeToolOutputHook(conversationId)),
   });
   session.agent = agent;
   sessions.set(conversationId, session);
@@ -2567,6 +2765,8 @@ export async function runAgentTurn(opts: {
   let fullText = "";
   let reasoning = "";
   let step = 0;
+  /** 步数上限后是否给过一次收尾回合（轨迹文案用，见 attachTurnRecovery）。 */
+  let stepLimitWrapUp = false;
   let aborted = false;
   /**
    * 自愈（见 `agent-retry.ts`）：`retryLimit` 是这一个回合可以花的重发 / 提醒次数；
@@ -2738,6 +2938,25 @@ export async function runAgentTurn(opts: {
           detail: { conversationId, attempt, model: modelName, mode },
         });
       },
+      onWrapUp: () => {
+        // 步数用满时它还在调工具：给一次收尾回合（tools 置空 + 让它写结论），
+        // 而不是停在空壳上 —— 那是"执行没完成、什么结论都没有"的现场。
+        stepLimitWrapUp = true;
+        recordEvent({
+          conversationId,
+          messageId: assistantId,
+          kind: "status",
+          toolName: "retry",
+          output: `达到步数上限（${maxSteps} 步），已让它停下工具、按已查到的信息直接总结。`,
+        });
+        logEvent({
+          level: "info",
+          source: "agent",
+          event: "agent.turn.step_limit_wrap_up",
+          message: "步数用尽：已注入收尾回合（tools 置空，要求直接给结论）",
+          detail: { conversationId, maxSteps, model: modelName, mode },
+        });
+      },
     });
 
     /**
@@ -2762,7 +2981,7 @@ export async function runAgentTurn(opts: {
     // 可能在上几轮里变了。只有内容真的变了才写回 —— 系统提示是请求里最靠前的部分，
     // 无谓地重写会让后端的前缀缓存整段作废（内容里的时间提醒已挪到本轮用户消息）。
     const refreshedPrompt =
-      buildSystemPrompt(mode, workspace, goalPromptSection(conversationId)) + session.startupContext;
+      buildSystemPrompt(mode, workspace, goalPromptSection(conversationId), session.toolStrategy) + session.startupContext;
     if (refreshedPrompt !== agent.state.systemPrompt) {
       agent.state.systemPrompt = refreshedPrompt;
       session.systemPromptTokens = estimateTokens(refreshedPrompt);
@@ -2797,6 +3016,7 @@ export async function runAgentTurn(opts: {
     const hookContext = promptHook.context.length
       ? `\n\n--- 来自 user_prompt_submit hook 的上下文 ---\n${promptHook.context.join("\n\n")}\n--- hook 上下文结束 ---`
       : "";
+    const routingNote = promptHook.blocked ? "" : await routeToolGroups(session, conversationId, content, files, imagePaths);
 
     if (promptHook.blocked) {
       // 拦下这一轮：不发给模型，但仍要走完落库与 emitDone（否则消息会一直停在"运行中"）。
@@ -2824,7 +3044,7 @@ export async function runAgentTurn(opts: {
        */
       const runTurnWithRecovery = async (): Promise<void> => {
         const prompt =
-          withAttachments(content, files, imagePaths, recall, currentTimeLine()) + hookContext;
+          withAttachments(content, files, imagePaths, recall, currentTimeLine()) + hookContext + routingNote;
         /** 用户按过停止（`stopAgentRun` 留的标记）就不再发请求 —— 退避期间按的也算。 */
         const stopped = () => stopRequested || stopRequests.has(conversationId);
         let attempt = 0;
@@ -2954,7 +3174,8 @@ export async function runAgentTurn(opts: {
       fullText = `⚠️ ${note}`;
     }
 
-    if (step >= maxSteps) {
+    // 收尾回合给过的话，onWrapUp 已经在轨迹里记过一条说明，这里不再重复。
+    if (step >= maxSteps && !stepLimitWrapUp) {
       recordEvent({
         conversationId,
         messageId: assistantId,

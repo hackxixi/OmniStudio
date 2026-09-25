@@ -8,6 +8,8 @@ import { getImagesBaseDir } from "./image-server";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { convertFileToImages } from "./vllm";
 import { downloadHttpFile, type DownloadProgress } from "./modelscope";
+import { getSourcePlan } from "./net-sources";
+import { installEnv, installFromIndexes, resolveUv } from "./python-sources";
 import { resolveOcrImage, saveOcrRecord, type OcrLine, type OcrResult } from "./ocr";
 import type { PpOcrModelSize } from "../shared/ocr";
 
@@ -310,7 +312,7 @@ export async function getPpOcrStatus(): Promise<PpOcrStatus> {
 }
 
 // ---------------------------------------------------------------------------
-// 一键安装引擎（uv venv + pip，默认源失败自动换清华镜像）
+// 一键安装引擎（uv venv + pip，PyPI 索引按下载源计划依次尝试）
 // ---------------------------------------------------------------------------
 
 /** 「下载引擎」进行中的标记文件；重启后残留且引擎未装好 → 提示安装中断。 */
@@ -424,7 +426,9 @@ async function doDownloadPpOcrEngine(): Promise<{
     }
   }
 
-  const uv = Bun.which("uv", { PATH: getSearchPath() });
+  const uv = resolveUv(getSearchPath());
+  const plan = await getSourcePlan();
+  const env = { ...process.env, ...installEnv(plan) };
 
   // ---- 创建 venv ----
   if (!existsSync(enginePython)) {
@@ -436,6 +440,7 @@ async function doDownloadPpOcrEngine(): Promise<{
       const venv = Bun.spawnSync([uv, "venv", "--clear", "--python", python, engineDir], {
         stdout: "pipe",
         stderr: "pipe",
+        env,
       });
       if (venv.exitCode !== 0) {
         return {
@@ -463,23 +468,18 @@ async function doDownloadPpOcrEngine(): Promise<{
     } catch {}
   }
 
-  // ---- 安装 paddleocr + paddlepaddle（CPU 版；默认源失败自动换清华镜像重试） ----
-  const mirror = "https://pypi.tuna.tsinghua.edu.cn/simple";
+  // ---- 安装 paddleocr + paddlepaddle（CPU 版；索引按下载源计划依次尝试） ----
   const runInstall = async (indexArgs: string[]): Promise<number> => {
     const cmd = uv
       ? [uv, "pip", "install", "--python", enginePython, "--upgrade", "paddleocr", "paddlepaddle", ...indexArgs]
       : [venvBinary("pip3"), "install", "--upgrade", "paddleocr", "paddlepaddle", ...indexArgs];
     emitLog(`$ ${cmd.join(" ")}`);
-    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", env });
     await Promise.all([streamLines(proc.stdout), streamLines(proc.stderr, true)]);
     return await proc.exited;
   };
 
-  let code = await runInstall([]);
-  if (code !== 0) {
-    emitLog(`默认 PyPI 源安装失败（退出码 ${code}），改用清华镜像重试…`);
-    code = await runInstall(["-i", mirror]);
-  }
+  const { code } = await installFromIndexes({ plan, what: "paddleocr", run: runInstall, log: emitLog });
   if (code !== 0) {
     emitLog("paddleocr 安装失败");
     logEvent({

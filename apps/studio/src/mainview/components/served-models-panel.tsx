@@ -36,6 +36,11 @@ import type { ServedModelInfo } from "@/shared/served-models";
 import { serverErrorHint } from "@/mainview/lib/server-error";
 import { AgentDiagnoseButton } from "@/mainview/components/agent-diagnose-button";
 import { cn } from "@/mainview/lib/utils";
+import {
+  CustomizedParamsBadge,
+  ModelParamsButton,
+  useCustomizedModels,
+} from "@/mainview/components/model-params-sheet";
 
 /**
  * 已启动模型（同时驻留多个）的面板：控制台用它管启停，概览页用它看状态。
@@ -127,6 +132,7 @@ function ServedModelRow({ model }: { model: ServedModelInfo }) {
   const t = useT();
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  const isCustomized = useCustomizedModels();
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["served-models"] });
@@ -177,6 +183,7 @@ function ServedModelRow({ model }: { model: ServedModelInfo }) {
           {ENGINE_SHORT_NAMES[model.engine]}
         </span>
         <StatusChip status={model.status} />
+        {isCustomized(model.modelRef) && <CustomizedParamsBadge />}
         {model.usesDefaultPort && (
           <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
             {t("console.defaultPort")}
@@ -205,6 +212,8 @@ function ServedModelRow({ model }: { model: ServedModelInfo }) {
               {t("console.setActive")}
             </Button>
           )}
+          {/* 按模型参数：target 用实例的 modelRef（与启动时同一份，服务端再归一） */}
+          <ModelParamsButton model={model.modelRef} label={model.label || model.servedName} size="xs" />
           <Button
             variant="outline"
             size="xs"
@@ -250,6 +259,16 @@ function ServedModelRow({ model }: { model: ServedModelInfo }) {
           </span>
         )}
       </div>
+
+      {/* 显存不足时后台自动降级重试成功：跑起来的不是用户设的那套参数，得说出来。 */}
+      {!rawError && model.degraded && (
+        <p className="flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400">
+          <AlertTriangleIcon className="mt-0.5 size-3 shrink-0" />
+          <span className="min-w-0 break-words">
+            {t("models.served.degraded", { summary: model.degraded.summary })}
+          </span>
+        </p>
+      )}
 
       {rawError && (
         <div className="space-y-0.5">

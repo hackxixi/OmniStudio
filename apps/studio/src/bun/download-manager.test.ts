@@ -41,6 +41,11 @@ await mockModulePartial<typeof import("./model-store")>("./model-store", {
 let modelsRoot = mkdtempSync(join(tmpdir(), "omni-download-manager-test-"));
 const modelsRootOf = () => modelsRoot;
 
+/** 每次下载调用：`ms:<实际拉取的仓库>/<文件>` / `hf:<仓库>/<文件>`（平台回退用例看它）。 */
+const dlCalls: string[] = [];
+/** 这些仓库在对应平台上 404。 */
+const msNotFound = new Set<string>();
+const hfNotFound = new Set<string>();
 /** 前 N 次下载调用抛错（模拟 ModelScope 偶发 500）。 */
 let failFirst = 0;
 /** 已启动的下载（按启动顺序），每个都闸住直到测试放行。 */
@@ -53,7 +58,9 @@ await mockModulePartial<typeof import("./modelscope")>("./modelscope", {
   // test-preload 的临时数据目录一致）—— verify 时扫的就是这里。
   getModelsBaseDir: () => modelsRootOf(),
   removePartialFiles: () => {},
-  downloadFile: async (_repo: string, fileName: string) => {
+  downloadFile: async (repo: string, fileName: string, _opts?: unknown, remoteRepo?: string) => {
+    dlCalls.push(`ms:${remoteRepo ?? repo}/${fileName}`);
+    if (msNotFound.has(remoteRepo ?? repo)) throw Object.assign(new Error("Download failed: 404"), { status: 404 });
     if (failFirst > 0) {
       failFirst -= 1;
       throw new Error("Download failed: 500");
@@ -63,12 +70,44 @@ await mockModulePartial<typeof import("./modelscope")>("./modelscope", {
     await gate;
     return { path: `models/${fileName}`, size: 1 };
   },
-  downloadHuggingFaceFile: async (_repo: string, fileName: string) => {
+  downloadHuggingFaceFile: async (repo: string, fileName: string) => {
+    dlCalls.push(`hf:${repo}/${fileName}`);
+    if (hfNotFound.has(repo)) throw Object.assign(new Error("Download failed: 404"), { status: 404 });
     const gate = new Promise<void>((resolve) => gates.push(resolve));
     started.push(fileName);
     await gate;
     return { path: `models/${fileName}`, size: 1 };
   },
+});
+
+/**
+ * ModelScope 等价仓库查询（真实实现会联网）：默认「同名就有」，走原来的 downloadFile；
+ * 回退用例改 `msLookup` 模拟「ModelScope 上没有 / 改名组织」。
+ */
+let msLookup: (repo: string) => import("./model-source-map").ModelScopeLookup = (repo) => ({
+  status: "found",
+  repo,
+});
+/** 下载源路由：固定成「国内」结论，不让真实探测在测试里联网。 */
+const fixedPlan: import("../shared/net-sources").SourcePlan = {
+  mode: "cn",
+  decidedBy: "setting",
+  cnLocale: true,
+  modelSource: "modelscope",
+  hfEndpoints: ["https://hf-mirror.com", "https://huggingface.co"],
+  pypiIndexes: [],
+  githubPrefixes: [""],
+  homebrewEnv: {},
+  probes: [],
+  at: 0,
+};
+await mockModulePartial<typeof import("./net-sources")>("./net-sources", {
+  peekSourcePlan: () => fixedPlan,
+  getSourcePlan: async () => fixedPlan,
+  reportSourceFailure: () => {},
+});
+await mockModulePartial<typeof import("./model-source-map")>("./model-source-map", {
+  resolveModelScopeRepo: async (repo: string) => msLookup(repo),
 });
 
 const { DownloadManager } = await import("./download-manager");
@@ -434,4 +473,93 @@ test("writeDownloadManifest 返回 false（写失败）→ 下载照常进行、
   process.env.OMNI_DATA_DIR = realDataDir;
   dataDownloadsOverride = null;
   rmSync(badData, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// 平台回退：HF 仓库 id 走 ModelScope 时先找等价仓库，找不到 / 404 改走 Hugging Face。
+// ---------------------------------------------------------------------------
+
+function resetSources() {
+  dlCalls.length = 0;
+  msNotFound.clear();
+  hfNotFound.clear();
+  msLookup = (repo) => ({ status: "found", repo });
+}
+
+test("ModelScope 上确认没有这个仓库 → 直接走 Hugging Face，不白等一轮 404", async () => {
+  reset();
+  resetSources();
+  msLookup = () => ({ status: "missing" });
+  const dm = new DownloadManager();
+  const task = dm.start("hf-only/model", "a.gguf", "chat", "modelscope", { size: 10 });
+  await waitForCount(started, 1);
+  await releaseAll();
+  const done = await waitFor(dm, task.id, (t) => t.status === "completed");
+  expect(done?.status).toBe("completed");
+  expect(dlCalls).toEqual(["hf:hf-only/model/a.gguf"]);
+  // 实际来源写回任务：元数据 / 重试都按真实平台走。
+  expect(done?.source).toBe("huggingface");
+  resetSources();
+});
+
+test("组织改名：按映射后的 ModelScope 仓库拉字节，落盘仍按原仓库 id", async () => {
+  reset();
+  resetSources();
+  msLookup = () => ({ status: "found", repo: "LLM-Research/Llama-3.2-3B-Instruct" });
+  const dm = new DownloadManager();
+  const task = dm.start("meta-llama/Llama-3.2-3B-Instruct", "config.json", "chat", "modelscope", { size: 10 });
+  await waitForCount(started, 1);
+  await releaseAll();
+  const done = await waitFor(dm, task.id, (t) => t.status === "completed");
+  expect(done?.status).toBe("completed");
+  expect(dlCalls).toEqual(["ms:LLM-Research/Llama-3.2-3B-Instruct/config.json"]);
+  expect(done?.repo).toBe("meta-llama/Llama-3.2-3B-Instruct");
+  expect(done?.source).toBe("modelscope");
+  resetSources();
+});
+
+test("ModelScope 文件 404（两边文件名不一致）→ 退到 Hugging Face 再下", async () => {
+  reset();
+  resetSources();
+  msNotFound.add("some/renamed");
+  const dm = new DownloadManager();
+  const task = dm.start("some/renamed", "w.gguf", "chat", "modelscope", { size: 10 });
+  await waitForCount(started, 1);
+  await releaseAll();
+  const done = await waitFor(dm, task.id, (t) => t.status === "completed");
+  expect(done?.status).toBe("completed");
+  expect(dlCalls).toEqual(["ms:some/renamed/w.gguf", "hf:some/renamed/w.gguf"]);
+  expect(done?.source).toBe("huggingface");
+  resetSources();
+});
+
+test("Hugging Face 404 → 同名试一次 ModelScope（ModelScope 独有仓库）", async () => {
+  reset();
+  resetSources();
+  hfNotFound.add("iic/SenseVoiceSmall");
+  const dm = new DownloadManager();
+  const task = dm.start("iic/SenseVoiceSmall", "model.pt", "asr", "huggingface", { size: 10 });
+  await waitForCount(started, 1);
+  await releaseAll();
+  const done = await waitFor(dm, task.id, (t) => t.status === "completed");
+  expect(done?.status).toBe("completed");
+  expect(dlCalls).toEqual(["hf:iic/SenseVoiceSmall/model.pt", "ms:iic/SenseVoiceSmall/model.pt"]);
+  expect(done?.source).toBe("modelscope");
+  resetSources();
+});
+
+test("不指定平台 → 跟随下载源路由的默认平台", async () => {
+  reset();
+  resetSources();
+  const dm = new DownloadManager();
+  const task = dm.start("default/source", "x.bin", "chat", undefined, { size: 10 });
+  expect(task.source).toBe("modelscope");
+  fixedPlan.modelSource = "huggingface";
+  const task2 = dm.start("default/source", "y.bin", "chat", undefined, { size: 10 });
+  expect(task2.source).toBe("huggingface");
+  fixedPlan.modelSource = "modelscope";
+  await waitForCount(started, 2);
+  await releaseAll();
+  await waitFor(dm, task.id, (t) => t.status === "completed");
+  await waitFor(dm, task2.id, (t) => t.status === "completed");
 });

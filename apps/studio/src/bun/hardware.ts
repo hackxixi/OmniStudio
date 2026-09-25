@@ -6,10 +6,13 @@ import {
   classifyChipVendor,
   inferenceMemoryBudget,
   parseDisplaysChipset,
+  parseNvidiaSmiMemory,
   parseNvidiaSmiOutput,
+  parseVmStatAvailable,
   type ChipVendor,
   type GpuInfo,
   type HardwareInfo,
+  type ResourceUsageInfo,
 } from "../shared/hardware";
 import { logEvent } from "./app-log";
 import { DEFAULT_COMMAND_TIMEOUT_MS, defaultCommandRunner, type CommandRunner } from "./command-runner";
@@ -328,12 +331,123 @@ export function detectHardware(options: DetectHardwareOptions = {}): HardwareInf
 
 let cached: HardwareInfo | null = null;
 
+export type GetHardwareInfoOptions = {
+  refresh?: boolean;
+  /** 读「此刻空闲内存」的入口，默认 `node:os` 的 freemem()（测试注入）。 */
+  readFreeMemory?: () => number;
+};
+
 /**
- * 机器画像（进程内缓存）。芯片与内存在运行期不会变，引导页的「重新检测」只关心
- * 引擎二进制，不必把 sysctl / system_profiler 再跑一遍。
+ * 机器画像（进程内缓存）。芯片、核数、总内存、显卡在运行期不会变，引导页的「重新检测」
+ * 只关心引擎二进制，不必把 sysctl / system_profiler 再跑一遍。
+ *
+ * 但空闲内存是随时在变的：之前把 freemem() 连同整份画像一起缓存到进程结束，
+ * 规划器（CPU-only 预算、显存溢出到内存的余量）和引导页的「当前空闲」拿到的都是
+ * App 刚启动那一刻的数 —— 开着浏览器 / 另一个模型之后仍按启动时的空闲来算，会高估。
+ * 所以只缓存静态部分，freeMemoryBytes 每次调用现读（freemem() 是一次 sysctl/proc 读，很便宜）。
+ * 注意：因此每次返回的是新对象，调用方不要拿引用相等判断「画像没变」。
  */
-export function getHardwareInfo(options: { refresh?: boolean } = {}): HardwareInfo {
-  if (!options.refresh && cached) return cached;
-  cached = detectHardware();
-  return cached;
+export function getHardwareInfo(options: GetHardwareInfoOptions = {}): HardwareInfo {
+  if (options.refresh || !cached) cached = detectHardware();
+  const readFree = options.readFreeMemory ?? freemem;
+  return { ...cached, freeMemoryBytes: readFree() };
+}
+
+// ---------------------------------------------------------------------------
+// 资源余量（顶栏状态胶囊）
+// ---------------------------------------------------------------------------
+
+/** vm_stat / nvidia-smi 是毫秒级命令，给足但超时也要能降级。 */
+const USAGE_PROBE_TIMEOUT_MS = 2_000;
+/** 读数缓存：胶囊 5 秒轮询，2 秒内多个调用方共用一次 spawn，不必更久。 */
+const USAGE_CACHE_TTL_MS = 2_000;
+
+let usageCache: { at: number; value: ResourceUsageInfo } | null = null;
+
+export type GetResourceUsageOptions = {
+  refresh?: boolean;
+  runner?: CommandRunner;
+  /** macOS 可用内存读法（vm_stat），默认 spawn `vm_stat`（测试注入）。 */
+  readMacAvailable?: () => number | null;
+  /** NVIDIA 显存读法（nvidia-smi），默认 spawn 查询（测试注入）。 */
+  readNvidiaMemory?: () => { totalBytes: number; freeBytes: number } | null;
+  now?: number;
+};
+
+/**
+ * macOS 的「可用内存」：`vm_stat`（页大小在输出首行里）。只在这台 Mac 上跑 ——
+ * 其它平台 `node:os` 的 freemem() 读的就是 /proc/meminfo 的 free+buffered/cache，
+ * 已经是「可回收」口径，不需要这条。
+ */
+function readMacAvailableMemory(runner: CommandRunner): number | null {
+  const res = runner.run(["vm_stat"], USAGE_PROBE_TIMEOUT_MS);
+  if (res.code !== 0) return null;
+  return parseVmStatAvailable(res.stdout);
+}
+
+/** NVIDIA 显存（多卡求和）；命令不存在 / 输出读不出来时返回 null（没有独立显存）。 */
+function readNvidiaMemory(runner: CommandRunner): {
+  totalBytes: number;
+  freeBytes: number;
+} | null {
+  const res = runner.run(
+    [
+      "nvidia-smi",
+      "--query-gpu=memory.total,memory.free",
+      "--format=csv,noheader,nounits",
+    ],
+    USAGE_PROBE_TIMEOUT_MS,
+  );
+  if (res.code !== 0) return null;
+  return parseNvidiaSmiMemory(res.stdout);
+}
+
+/**
+ * 此刻的内存 / 显存余量（胶囊每 5 秒问一次，这里缓存 2 秒避免每次轮询都 spawn）。
+ *
+ * 静态部分（是否统一内存、有没有 N 卡）走 `getHardwareInfo` 的进程内缓存；
+ * 空闲数每次现读。两条读数独立降级：vm_stat 挂了回 freemem()，nvidia-smi 挂了
+ * 只把 vram 置 null（界面上就只剩内存一段），都不给假数。
+ */
+export function getResourceUsage(
+  options: GetResourceUsageOptions = {},
+): ResourceUsageInfo {
+  const now = options.now ?? Date.now();
+  if (!options.refresh && usageCache && now - usageCache.at < USAGE_CACHE_TTL_MS) {
+    return usageCache.value;
+  }
+
+  const runner = options.runner ?? defaultRunner;
+  const gpu = getHardwareInfo().gpu;
+
+  // runner 注入只影响 macOS 的 vm_stat（读法可测）；nvidia-smi 走注入的
+  // `readNvidiaMemory`（不 spawn 真机命令），两者都缺时 vram 读不出来置 null ——
+  // 与 getGpuStats 同一约定：测试断言「降级方向」，不钉真机输出。
+  const macAvailable =
+    options.readMacAvailable?.() ??
+    (process.platform === "darwin" ? readMacAvailableMemory(runner) : null);
+  const ramFree =
+    process.platform === "darwin" ? (macAvailable ?? freemem()) : freemem();
+
+  const nvidia =
+    options.readNvidiaMemory?.() ??
+    (process.platform === "darwin" && gpu.kind === "apple" ? null : readNvidiaMemory(runner));
+
+  const value: ResourceUsageInfo = {
+    ram: { totalBytes: totalmem(), freeBytes: ramFree },
+    vram:
+      nvidia !== null
+        ? { totalBytes: nvidia.totalBytes, freeBytes: nvidia.freeBytes }
+        : gpu.vramBytes && gpu.vramBytes > 0 && !gpu.unifiedMemory
+          ? { totalBytes: gpu.vramBytes, freeBytes: null }
+          : null,
+    unifiedMemory: gpu.unifiedMemory === true || gpu.kind === "apple",
+  };
+  usageCache = { at: now, value };
+  return value;
+}
+
+/** 测试用：读缓存是进程级全局，用例之间互不污染。 */
+export function clearResourceUsageCache(): void {
+  usageCache = null;
 }

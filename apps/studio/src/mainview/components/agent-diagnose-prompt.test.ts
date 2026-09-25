@@ -30,8 +30,11 @@ test("日志只带末尾 40 行，空行不算", () => {
   expect(prompt).not.toContain("line 60\n");
 });
 
-test("没有日志就不出现日志段", () => {
-  expect(buildDiagnosisPrompt({ intro: "x", error: "y" })).not.toContain("日志");
+test("没有日志就不出现日志段（但行动建议还在，它只是引用了上面的日志）", () => {
+  const prompt = buildDiagnosisPrompt({ intro: "x", error: "y" });
+  expect(prompt).not.toContain("日志（末尾");
+  // 行动建议末尾依然带一句"先读上面给出的日志……"—— 它指的是调用方传入的现场，
+  // 没有现场时这句话变成"读报错"（下面的用例单独验证它始终存在）。
 });
 
 test("日志里的 ANSI 颜色码与控制字符剥干净（真机第一次点时满屏 ⌧[34m）", () => {
@@ -49,4 +52,19 @@ test("日志里的 ANSI 颜色码与控制字符剥干净（真机第一次点�
   expect(prompt).toContain("0.00.065.874 E srv  llama_server: exiting due to model loading error");
   // 只剩颜色码的那一行清完就是空行，不该占一行。
   expect(prompt).toContain("日志（末尾 2 行）");
+});
+
+test("结尾始终带一句行动建议：先读已有日志、工作区外用 bash、别大范围搜源码", () => {
+  // 这句是省步数的关键（真机上它先花十几步 glob/grep 找日志在哪，还被工作区权限拒了）。
+  // 无论带不带现场、带不带日志，它都要在 —— 调用方忘了传路径时也至少能防住"搜源码"。
+  const advice =
+    "先读上面给出的日志与报错，工作区外的文件用 bash（cat / grep / sed）读取；判断清楚后直接给出结论与修复步骤，不要大范围搜索源码。";
+  const cases = [
+    buildDiagnosisPrompt({ intro: "x", error: "y" }),
+    buildDiagnosisPrompt({ intro: "x", error: "y", context: ["平台：darwin arm64"] }),
+    buildDiagnosisPrompt({ intro: "x", error: "y", logs: ["a", "b"] }),
+  ];
+  for (const prompt of cases) {
+    expect(prompt.endsWith(advice)).toBe(true);
+  }
 });

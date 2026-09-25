@@ -1,7 +1,16 @@
 import { existsSync, readdirSync, statSync, type Dirent } from "fs";
 import path from "path";
-import { downloadFile, downloadHuggingFaceFile, getModelsBaseDir, modelDestPath, removePartialFiles } from "./modelscope";
-import { concurrentFileLimit, partsBudgetFor, type DownloadProgress } from "./downloader";
+import {
+  downloadFile,
+  downloadHuggingFaceFile,
+  getModelsBaseDir,
+  httpStatusOf,
+  modelDestPath,
+  removePartialFiles,
+} from "./modelscope";
+import { concurrentFileLimit, partsBudgetFor, type DownloadOptions, type DownloadProgress } from "./downloader";
+import { peekSourcePlan } from "./net-sources";
+import { resolveModelScopeRepo } from "./model-source-map";
 import { setModelMeta } from "./model-store";
 import { getSetting, updateSettings } from "./db/settings";
 import { safeRepoId, type ModelCategory, type ModelSource } from "../shared/modelscope";
@@ -17,7 +26,10 @@ import {
 
 export type DownloadStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "canceled";
 
-/** 下载源：ModelScope（默认）或 HuggingFace（优先走 hf-mirror 镜像）。 */
+/**
+ * 下载源：ModelScope 或 HuggingFace（端点顺序由下载源路由决定）。调用方不指定时
+ * 取路由的默认平台（国内 ModelScope、海外 Hugging Face）。
+ */
 export type DownloadSource = ModelSource;
 
 export type DownloadTask = {
@@ -217,9 +229,11 @@ export class DownloadManager {
     repo: string,
     fileName: string,
     category?: ModelCategory,
-    source: DownloadSource = "modelscope",
+    requestedSource?: DownloadSource,
     opts: { size?: number | null; explicit?: boolean; manifestFiles?: unknown } = {},
   ): DownloadTask {
+    // 没指定平台（控制套接字 / 老调用）→ 下载源路由的默认平台（同步取缓存结论，不等探测）。
+    const source: DownloadSource = requestedSource ?? defaultDownloadSource();
     const existing = [...this.tasks.values()].find(
       (t) =>
         t.repo === repo &&
@@ -394,8 +408,7 @@ export class DownloadManager {
     let lastProgressEmit = 0;
 
     try {
-      const dl = task.source === "huggingface" ? downloadHuggingFaceFile : downloadFile;
-      const result = await dl(task.repo, task.fileName, {
+      const result = await fetchWithSourceFallback(task, {
         total: task.size ?? task.total ?? undefined,
         // 分片数按当前并发文件数分摊全局连接预算：2 个文件同时下时每个 2 片，
         // 而不是各自 4 片 —— 后者对站点的实际并发是 8，会触发 ModelScope 的 500。
@@ -624,6 +637,76 @@ export class DownloadManager {
     for (const cb of this.listeners) cb();
     // 状态变化立即持久化,进度更新节流持久化,保证中断后能恢复。
     this.persistTasks(force);
+  }
+}
+
+/** 调用方没指定平台时的默认下载源：跟随下载源路由（peek 不发网络请求）。 */
+export function defaultDownloadSource(): DownloadSource {
+  try {
+    return peekSourcePlan().modelSource;
+  } catch {
+    return "modelscope";
+  }
+}
+
+/**
+ * 按任务的平台下载，平台上没有这个仓库 / 文件（404）时换平台，而不是直接失败：
+ *
+ *   ModelScope：先查等价仓库（HF id 同名或组织改名，见 model-source-map）——
+ *     确认没有就直接走 Hugging Face（镜像），省掉一轮必然 404 的重试；
+ *     有就按映射后的 id 下载，仍然 404（两边文件名不一致）再退到 Hugging Face。
+ *   Hugging Face：404 时同名试一次 ModelScope（ModelScope 独有的仓库）。
+ *
+ * 实际成功的平台写回 task.source：本地模型元数据记的是真实来源，重试也直接走对的平台。
+ * 落盘目录始终按 task.repo，已下载判断不受映射影响。
+ */
+async function fetchWithSourceFallback(
+  task: DownloadTask,
+  options: DownloadOptions,
+): Promise<{ path: string; size: number }> {
+  const aborted = () => options.signal?.aborted === true;
+  const is404 = (e: unknown) => httpStatusOf(e) === 404;
+
+  if (task.source === "huggingface") {
+    try {
+      return await downloadHuggingFaceFile(task.repo, task.fileName, options);
+    } catch (e) {
+      if (aborted() || !is404(e)) throw e;
+      const result = await downloadFile(task.repo, task.fileName, options);
+      task.source = "modelscope";
+      return result;
+    }
+  }
+
+  const lookup = await resolveModelScopeRepo(task.repo);
+  if (aborted()) throw new Error("aborted");
+  if (lookup.status === "missing") {
+    logEvent({
+      level: "info",
+      source: "download",
+      event: "download.source_fallback",
+      message: `ModelScope 上没有 ${task.repo}，改从 Hugging Face 下载`,
+      detail: { repo: task.repo, fileName: task.fileName },
+    });
+    const result = await downloadHuggingFaceFile(task.repo, task.fileName, options);
+    task.source = "huggingface";
+    return result;
+  }
+  const remoteRepo = lookup.status === "found" ? lookup.repo : task.repo;
+  try {
+    return await downloadFile(task.repo, task.fileName, options, remoteRepo);
+  } catch (e) {
+    if (aborted() || !is404(e)) throw e;
+    logEvent({
+      level: "info",
+      source: "download",
+      event: "download.source_fallback",
+      message: `ModelScope 上找不到 ${remoteRepo}/${task.fileName}，改从 Hugging Face 下载`,
+      detail: { repo: task.repo, remoteRepo, fileName: task.fileName },
+    });
+    const result = await downloadHuggingFaceFile(task.repo, task.fileName, options);
+    task.source = "huggingface";
+    return result;
   }
 }
 

@@ -475,7 +475,10 @@ describe("引擎能力守卫（验证评审 MED 修复）", () => {
     ];
     const res = await Registry.startServedModel({ model: modelSt });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("vllm");
+    // 引擎推荐是平台感知的（mac → mlx / 其它 → vllm），断言稳定文案「嵌入」
+    // + 错误里提到的引擎名，不分平台。
+    const expectedEngine = process.platform === "darwin" ? "mlx" : "vllm";
+    expect(res.error).toContain(expectedEngine);
     expect(res.error).toContain("嵌入");
     // 守卫必须在 allocatePort / createRuntime 之前生效：不留半成品实例
     expect(created.length).toBe(0);

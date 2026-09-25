@@ -3,7 +3,9 @@ import { getSetting, getServerPort, ENGINE_EXTRA_ARGS_KEYS } from "../db/setting
 import { resolveManagedPython } from "../python-engine";
 import { markServerStarted } from "../stats";
 import { extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
+import { getModelParams } from "../db/model-params";
+import { shellJoin, splitShellArgs } from "./shell-args";
 import type {
   BinaryCheckResult,
   LogListener,
@@ -128,10 +130,26 @@ export class SglangRuntime implements Runtime {
     return { model: "" };
   }
 
+  /** 本次运行实际发出去的 argv（没启动过 = null），needsRestart 的比对基准。 */
+  private launchedArgs: string[] | null = null;
+
+  needsRestart(): boolean {
+    if (this.launchedArgs === null || this.serverStatus !== "running") return false;
+    const { model, servedName } = this.resolveModel();
+    return shellJoin(this.buildArgs(model, servedName)) !== shellJoin(this.launchedArgs);
+  }
+
+  /**
+   * 按模型参数（key = 模型 target）只用得上 ctxSize（→ --context-length）与追加参数：
+   * SGLang 没有服务端级的数值采样默认值开关（只有 --sampling-defaults model|openai，
+   * 默认就是读模型的 generation_config），采样交给请求体；思考开关同样没有服务端默认。
+   */
   private buildArgs(model: string, servedName?: string): string[] {
     const port = this.overrides.port ?? getServerPort(this.id);
     const host = getSetting("SERVER_HOST") || "127.0.0.1";
-    const contextLength = getSetting("SGLANG_CONTEXT_LENGTH") || "8192";
+    const mp = getModelParams(model);
+    const contextLength =
+      mp?.ctxSize !== undefined ? String(mp.ctxSize) : getSetting("SGLANG_CONTEXT_LENGTH") || "8192";
     const tpSize = getSetting("SGLANG_TP_SIZE") || "1";
     const memFraction = getSetting("SGLANG_MEM_FRACTION_STATIC") || "0.88";
     const chunkedPrefill = getSetting("SGLANG_CHUNKED_PREFILL_SIZE") || "";
@@ -159,8 +177,9 @@ export class SglangRuntime implements Runtime {
       args.push("--chunked-prefill-size", chunkedPrefill);
     }
 
-    const extra = getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]);
-    if (extra.trim()) args.push(...extra.trim().split(/\s+/));
+    // 追加参数放最后：全局在前、按模型在后（后者盖过前者）；按 shell 引号规则切分。
+    args.push(...splitShellArgs(getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]) || ""));
+    if (mp?.extraArgs) args.push(...splitShellArgs(mp.extraArgs));
 
     return args;
   }
@@ -181,7 +200,7 @@ export class SglangRuntime implements Runtime {
       Bun.which("python3") ??
       Bun.which("python") ??
       "python3";
-    return [python, ...this.buildArgs(model, servedName)].join(" ");
+    return shellJoin([python, ...this.buildArgs(model, servedName)]);
   }
 
   async start(): Promise<StartResult> {
@@ -200,14 +219,21 @@ export class SglangRuntime implements Runtime {
     }
 
     const args = this.buildArgs(model, servedName);
+    this.launchedArgs = args;
     this.lastError = "";
     this.setStatus("starting");
 
     const cmd = [binary.path!, ...args];
-    this.appendLog(`$ ${cmd.join(" ")}\n`);
+    this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
     try {
-      this.serverProcess = spawnServerProcess(cmd, undefined, "sglang");
+      // 同 vLLM：HF 端点按下载源路由；国内且仓库原样在 ModelScope 时走 SGLANG_USE_MODELSCOPE。
+      const env = await downloadSourceEnv({
+        model,
+        python: binary.path,
+        modelScopeVar: "SGLANG_USE_MODELSCOPE",
+      });
+      this.serverProcess = spawnServerProcess(cmd, env, "sglang");
       pumpServerOutput(this.serverProcess, this.appendLog.bind(this));
 
       const self = this;

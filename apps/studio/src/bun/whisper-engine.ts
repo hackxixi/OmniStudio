@@ -4,6 +4,8 @@ import { WHISPER_CPP_RELEASE_TAG, WHISPER_CPP_REPO } from "../shared/whispercpp"
 import { getDataDir } from "./paths";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { fetchAssetFromSources, githubReleaseUrls, officialWithMirrors } from "./mirror-download";
+import { getSourcePlan } from "./net-sources";
+import type { SourcePlan } from "../shared/net-sources";
 
 /**
  * whisper.cpp 本地识别引擎（whisper-cli / whisper-server）的一键安装。
@@ -121,11 +123,16 @@ function cleanupStaging(staging: string): void {
 
 type CondaFile = { pkg: string; version: string; basename: string } | null;
 
+/** conda-forge 的平台子目录（本引擎只在 macOS 走 conda 包）。 */
+function condaSubdir(): string {
+  return process.platform === "darwin" ? (process.arch === "arm64" ? "osx-arm64" : "osx-64") : "";
+}
+
 /** 锚定 conda-forge 的 whisper.cpp 及其依赖（llvm-openmp / libcxx），取当前平台最新。 */
-async function fetchCondaFile(pkg: string): Promise<CondaFile> {
+async function fetchCondaFile(pkg: string, timeoutMs: number): Promise<CondaFile> {
   try {
     const res = await fetch(`https://api.anaconda.org/package/conda-forge/${pkg}`, {
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as {
@@ -134,9 +141,7 @@ async function fetchCondaFile(pkg: string): Promise<CondaFile> {
     };
     const version = json.latest_version;
     if (!version || !Array.isArray(json.files)) return null;
-    const subdir = process.platform === "darwin"
-      ? process.arch === "arm64" ? "osx-arm64" : "osx-64"
-      : "";
+    const subdir = condaSubdir();
     const file = json.files.find(
       (f) => f.version === version && f.basename?.startsWith(`${subdir}/`) && f.basename.endsWith(".conda"),
     );
@@ -147,14 +152,122 @@ async function fetchCondaFile(pkg: string): Promise<CondaFile> {
   }
 }
 
-/** conda 包下载地址（官方 + 国内镜像回退）。 */
-function condaUrls(f: NonNullable<CondaFile>): string[] {
+/** conda 版本号比较（按 `.` / `_` / `-` 分段，数字段按数值、其余按字典序），返回 -1 / 0 / 1。 */
+export function compareCondaVersion(a: string, b: string): number {
+  const pa = a.split(/[._-]/);
+  const pb = b.split(/[._-]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? "0";
+    const y = pb[i] ?? "0";
+    const nx = /^\d+$/.test(x) ? Number(x) : NaN;
+    const ny = /^\d+$/.test(y) ? Number(y) : NaN;
+    if (!Number.isNaN(nx) && !Number.isNaN(ny)) {
+      if (nx !== ny) return nx < ny ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+type RepodataEntry = { name?: string; version?: string; build?: string; build_number?: number; timestamp?: number };
+
+/**
+ * 从频道索引（repodata）里挑某个包的最新 `.conda`：版本最高 → build 号最大 → 非 debug 构建 →
+ * 最新上传。返回的 basename 带子目录前缀（与 api.anaconda.org 的 files[].basename 同形）。
+ */
+export function pickFromRepodata(
+  repodata: { packages?: Record<string, RepodataEntry>; "packages.conda"?: Record<string, RepodataEntry> },
+  pkg: string,
+  subdir: string,
+): CondaFile {
+  let best: { file: string; entry: RepodataEntry } | null = null;
+  for (const [file, entry] of Object.entries(repodata["packages.conda"] ?? {})) {
+    if (entry.name !== pkg || !entry.version) continue;
+    if (!best) {
+      best = { file, entry };
+      continue;
+    }
+    const b = best.entry;
+    const byVersion = compareCondaVersion(entry.version, b.version!);
+    const byBuild = (entry.build_number ?? 0) - (b.build_number ?? 0);
+    const debugRank = Number(!(entry.build ?? "").startsWith("debug")) - Number(!(b.build ?? "").startsWith("debug"));
+    const byTime = (entry.timestamp ?? 0) - (b.timestamp ?? 0);
+    const better = byVersion !== 0 ? byVersion > 0 : byBuild !== 0 ? byBuild > 0 : debugRank !== 0 ? debugRank > 0 : byTime > 0;
+    if (better) best = { file, entry };
+  }
+  if (!best) return null;
+  return { pkg, version: best.entry.version!, basename: `${subdir}/${best.file}` };
+}
+
+/**
+ * api.anaconda.org 不可达时的兜底：直接读频道索引 `current_repodata.json`（只含各包最新版，
+ * osx-arm64 约 30MB）。国内先读清华 / 上交镜像，海外先读 conda.anaconda.org（CDN）。
+ */
+function repodataUrls(subdir: string, plan: SourcePlan): string[] {
+  const official = `https://conda.anaconda.org/conda-forge/${subdir}/current_repodata.json`;
+  const mirrors = CONDA_MIRRORS.map((m) => `${m}/${subdir}/current_repodata.json`);
+  return plan.mode === "cn" ? [...mirrors, official] : [official, ...mirrors];
+}
+
+async function fetchCondaFilesFromRepodata(
+  pkgs: string[],
+  plan: SourcePlan,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Map<string, CondaFile>> {
+  const subdir = condaSubdir();
+  const out = new Map<string, CondaFile>();
+  for (const url of repodataUrls(subdir, plan)) {
+    try {
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(180_000) });
+      if (!res.ok) continue;
+      const repodata = (await res.json()) as Parameters<typeof pickFromRepodata>[0];
+      for (const pkg of pkgs) out.set(pkg, pickFromRepodata(repodata, pkg, subdir));
+      if (pkgs.every((pkg) => out.get(pkg))) return out;
+    } catch {
+      // 换下一个索引源
+    }
+  }
+  return out;
+}
+
+/**
+ * 三个包的最新文件：先问 api.anaconda.org（国内给短超时，它在 AWS 上时通时不通），
+ * 有任何一个问不到就整体改读频道索引。
+ */
+export async function resolveCondaFiles(
+  pkgs: string[],
+  plan: SourcePlan,
+  deps: {
+    fromApi?: (pkg: string, timeoutMs: number) => Promise<CondaFile>;
+    fromRepodata?: (pkgs: string[], plan: SourcePlan) => Promise<Map<string, CondaFile>>;
+  } = {},
+): Promise<CondaFile[]> {
+  const fromApi = deps.fromApi ?? fetchCondaFile;
+  const fromRepodata = deps.fromRepodata ?? ((p: string[], pl: SourcePlan) => fetchCondaFilesFromRepodata(p, pl));
+  const timeoutMs = plan.mode === "cn" ? 10_000 : 30_000;
+  const viaApi = await Promise.all(pkgs.map((pkg) => fromApi(pkg, timeoutMs)));
+  if (viaApi.every(Boolean)) return viaApi;
+  const viaIndex = await fromRepodata(pkgs, plan);
+  return pkgs.map((pkg, i) => viaApi[i] ?? viaIndex.get(pkg) ?? null);
+}
+
+/**
+ * conda-forge 的国内镜像（频道根）。镜像的目录结构是 `<频道>/<子目录>/<文件名>`
+ * （与 conda.anaconda.org 相同），不是 api.anaconda.org 的 `<包>/<版本>/<子目录>/<文件名>`。
+ */
+const CONDA_MIRRORS = [
+  "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
+  "https://mirror.sjtu.edu.cn/anaconda/cloud/conda-forge",
+] as const;
+
+/** conda 包下载地址（官方 + CDN + 国内镜像回退）。 */
+export function condaUrls(f: NonNullable<CondaFile>): string[] {
   const { pkg, version, basename } = f;
-  const rel = `${pkg}/${version}/${basename}`;
   return [
-    `https://api.anaconda.org/download/conda-forge/${rel}`,
-    `https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/${rel}`,
-    `https://mirrors.sjtug.sjtu.edu.cn/anaconda/cloud/conda-forge/${rel}`,
+    `https://api.anaconda.org/download/conda-forge/${pkg}/${version}/${basename}`,
+    `https://conda.anaconda.org/conda-forge/${basename}`,
+    ...CONDA_MIRRORS.map((m) => `${m}/${basename}`),
   ];
 }
 
@@ -195,11 +308,10 @@ async function extractCondaArchive(tmp: string, staging: string): Promise<void> 
  * （libomp / libc++ 是 whisper.cpp 的运行依赖，合并后即可脱离 conda 使用。）
  */
 async function downloadCondaEngine(): Promise<{ ok: boolean; error?: string; version?: string }> {
-  const [whisper, omp, cxx] = await Promise.all([
-    fetchCondaFile("whisper.cpp"),
-    fetchCondaFile("llvm-openmp"),
-    fetchCondaFile("libcxx"),
-  ]);
+  const [whisper, omp, cxx] = await resolveCondaFiles(
+    ["whisper.cpp", "llvm-openmp", "libcxx"],
+    await getSourcePlan(),
+  );
   for (const f of [whisper, omp, cxx]) {
     if (!f) {
       return { ok: false, error: "无法获取 whisper.cpp 的 macOS 预编译包（conda-forge 不可达）" };

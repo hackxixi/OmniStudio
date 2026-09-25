@@ -34,6 +34,9 @@ import { engineVersionFilePath, llamaCppRootDir, pythonEngineDir, type PythonEng
 import { getHardwareInfo } from "./hardware";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { fetchAssetFromSources, githubReleaseUrls } from "./mirror-download";
+import { fetchGithubJson, fetchGithubText } from "./github-api";
+import { getSourcePlan } from "./net-sources";
+import type { SourcePlan } from "../shared/net-sources";
 import {
   installPythonEngine,
   readPythonEngineVersion,
@@ -258,14 +261,49 @@ const LLAMA_TAG = /^b\d+$/;
 
 export type LlamaRelease = { tag: string; assets: string[]; sizes: Record<string, number> };
 
-/** 读最新几个发布（新到旧），挑第一个带二进制的 `b<构建号>`。 */
-export async function fetchLatestLlamaRelease(fetchImpl: typeof fetch = fetch): Promise<LlamaRelease | null> {
-  const res = await fetchImpl(`https://api.github.com/repos/${LLAMA_RELEASE_REPO}/releases?per_page=15`, {
-    headers: { accept: "application/vnd.github+json", "user-agent": "OmniStudio" },
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!res.ok) throw new Error(`GitHub API 返回 ${res.status}`);
-  const releases = (await res.json()) as { tag_name?: string; assets?: { name?: string; size?: number }[] }[];
+type GithubReleaseJson = { tag_name?: string; assets?: { name?: string; size?: number }[] };
+
+/**
+ * 读最新几个发布（新到旧），挑第一个带二进制的 `b<构建号>`。
+ *
+ * 首选 GitHub API（按下载源计划的链路顺序：海外直连在前，与原来一致；国内先走能代理 API
+ * 的 gh-proxy）。API 整个不可达时不再直接判死 —— 换一条不依赖 API 的路：
+ * 从仓库 refs 里取最新的几个构建号 tag，再读 release 页的资产清单（见 fetchLlamaReleaseWithoutApi）。
+ */
+export async function fetchLatestLlamaRelease(
+  fetchImpl: typeof fetch = fetch,
+  plan?: SourcePlan,
+): Promise<LlamaRelease | null> {
+  let releases: GithubReleaseJson[];
+  try {
+    releases = await fetchGithubJson<GithubReleaseJson[]>(
+      `https://api.github.com/repos/${LLAMA_RELEASE_REPO}/releases?per_page=15`,
+      {
+        plan,
+        fetchImpl,
+        timeoutMs: 20_000,
+        headers: { accept: "application/vnd.github+json", "user-agent": "OmniStudio" },
+        validate: Array.isArray,
+      },
+    );
+  } catch (apiErr) {
+    const apiError = apiErr instanceof Error ? apiErr.message : String(apiErr);
+    logEvent({
+      level: "warn",
+      source: "server",
+      event: "engine.release.api_unreachable",
+      message: "GitHub API 不可达，改从仓库 refs 与 release 页解析 llama.cpp 最新构建",
+      detail: { error: apiError },
+    });
+    const fallback = await fetchLlamaReleaseWithoutApi(fetchImpl, plan);
+    if (fallback) return fallback;
+    throw new Error(apiError);
+  }
+  return pickLlamaRelease(releases);
+}
+
+/** API 返回的发布列表 → 第一个带二进制的 `b<构建号>` 发布。 */
+export function pickLlamaRelease(releases: GithubReleaseJson[]): LlamaRelease | null {
   for (const release of releases) {
     const tag = release.tag_name ?? "";
     const assets = (release.assets ?? []).map((a) => a.name ?? "").filter(Boolean);
@@ -277,6 +315,75 @@ export async function fetchLatestLlamaRelease(fetchImpl: typeof fetch = fetch): 
     return { tag, assets, sizes };
   }
   return null;
+}
+
+/** git smart HTTP 的 refs 公告里所有 `b<构建号>` tag，新到旧。 */
+export function parseLlamaTagsFromRefs(refs: string): string[] {
+  const seen = new Set<number>();
+  for (const m of refs.matchAll(/refs\/tags\/b(\d+)(?![\w.^-])/g)) seen.add(Number(m[1]));
+  return [...seen].sort((a, b) => b - a).map((n) => `b${n}`);
+}
+
+/** release 页资产片段（`releases/expanded_assets/<tag>`）里的资产名。 */
+export function parseExpandedAssets(html: string, tag: string): string[] {
+  const out: string[] = [];
+  const re = new RegExp(`/releases/download/${tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/([^"'?#\\s<>]+)`, "g");
+  for (const m of html.matchAll(re)) {
+    const name = decodeURIComponent(m[1]!);
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * 资产清单也拿不到时，按上游的命名规律拼出这个 tag 下「一定会有」的那几个包名：
+ * macOS（Metal）、Linux / Windows 的 CPU 与 Vulkan 构建。CUDA 构建要配套运行库包、
+ * 版本号也常变，猜错就是白下一趟，所以不猜 —— N 卡机器在这条兜底路径上装 Vulkan / CPU 版。
+ */
+export function guessLlamaAssets(tag: string): string[] {
+  return [
+    `llama-${tag}-bin-macos-arm64.tar.gz`,
+    `llama-${tag}-bin-macos-x64.tar.gz`,
+    `llama-${tag}-bin-ubuntu-x64.tar.gz`,
+    `llama-${tag}-bin-ubuntu-arm64.tar.gz`,
+    `llama-${tag}-bin-ubuntu-vulkan-x64.tar.gz`,
+    `llama-${tag}-bin-win-cpu-x64.zip`,
+    `llama-${tag}-bin-win-cpu-arm64.zip`,
+    `llama-${tag}-bin-win-vulkan-x64.zip`,
+  ];
+}
+
+/**
+ * 不走 API 解析最新构建：
+ *  1. `github.com/<repo>.git/info/refs`（git 的 refs 公告，三个前缀镜像都能代理）→ 最新几个 `b<构建号>`；
+ *  2. 读 `releases/expanded_assets/<tag>`（ghfast / ghproxy 能代理）拿真实资产清单；
+ *  3. 资产页也读不到：按命名规律拼出最新 tag 的基础包名（guessLlamaAssets）。
+ * `/releases/latest` 的跳转不能用：它指向 `v0.x` 那种不带二进制的稳定标签。
+ */
+export async function fetchLlamaReleaseWithoutApi(
+  fetchImpl: typeof fetch = fetch,
+  plan?: SourcePlan,
+): Promise<LlamaRelease | null> {
+  const refs = await fetchGithubText(
+    `https://github.com/${LLAMA_RELEASE_REPO}.git/info/refs?service=git-upload-pack`,
+    { plan, fetchImpl, timeoutMs: 30_000, validate: (text) => text.includes("refs/tags/b") },
+  );
+  if (!refs) return null;
+  // 上游的发布流程是 CI 产物齐了才打 tag 建 release，最新 tag 基本都带二进制；多看一个只为防个别例外，
+  // 再多看就是在资产页整个读不到时白白多等几轮超时。
+  const tags = parseLlamaTagsFromRefs(refs).slice(0, 2);
+  if (tags.length === 0) return null;
+  for (const tag of tags) {
+    const html = await fetchGithubText(`https://github.com/${LLAMA_RELEASE_REPO}/releases/expanded_assets/${tag}`, {
+      plan,
+      fetchImpl,
+      timeoutMs: 15_000,
+      validate: (text) => text.includes(`/releases/download/${tag}/`),
+    });
+    const assets = html ? parseExpandedAssets(html, tag) : [];
+    if (assets.some((name) => name.startsWith(`llama-${tag}-bin-`))) return { tag, assets, sizes: {} };
+  }
+  return { tag: tags[0]!, assets: guessLlamaAssets(tags[0]!), sizes: {} };
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +542,7 @@ export async function installLlamaCpp(deps: LlamaInstallDeps): Promise<EngineIns
   const arch = deps.arch ?? process.arch;
   const gpuKind = deps.gpuKind ?? getHardwareInfo().gpu.kind;
   const rootDir = deps.rootDir ?? llamaCppRootDir();
-  const fetchRelease = deps.fetchRelease ?? (() => fetchLatestLlamaRelease());
+  const fetchRelease = deps.fetchRelease ?? (async () => fetchLatestLlamaRelease(fetch, await getSourcePlan()));
   const fetchAsset = deps.fetchAsset ?? defaultAssetFetcher;
 
   const finish = (result: EngineInstallResult, why?: string): EngineInstallResult => {

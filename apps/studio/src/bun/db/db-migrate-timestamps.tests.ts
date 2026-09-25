@@ -36,6 +36,14 @@ import { join } from "path";
 
 const reimport = join(import.meta.dir, "db-reimport.ts");
 const journalPath = join(import.meta.dir, "migrations", "meta", "_journal.json");
+/**
+ * 当前 journal 的条目数与末条 when：0040 之后还会有新迁移（0041_model_params …），
+ * 断言跟着 journal 走，钉住的是「末条就是全序列最大值、伪造值都清掉了」这条不变量，
+ * 而不是某个具体的条目数。
+ */
+const JOURNAL_ENTRIES = (JSON.parse(readFileSync(journalPath, "utf8")) as { entries: { when: number }[] }).entries;
+const JOURNAL_LEN = JOURNAL_ENTRIES.length;
+const LATEST_WHEN = JOURNAL_ENTRIES[JOURNAL_LEN - 1]!.when;
 /** 0028 归真后的 when（git 提交毫秒 + 1，见 _journal.json 修订说明）。 */
 const CORRECTED_0028_WHEN = 1789285860001;
 /**
@@ -112,18 +120,21 @@ function stripMultimodal(db: Database): void {
 }
 
 describe("迁移时间戳自愈", () => {
-  test("journal 时间戳严格递增，且全序列最大值就是末条 0040 的归真时间戳（伪造未来值已清零）", () => {
+  test("journal 时间戳严格递增，且全序列最大值就是末条的时间戳（0040 已归真、伪造未来值已清零）", () => {
     const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
       entries: { when: number }[];
     };
     const whens = journal.entries.map((e) => e.when);
-    expect(whens.length).toBe(41);
+    expect(whens.length).toBeGreaterThanOrEqual(41);
     for (let i = 1; i < whens.length; i++) {
       expect(whens[i]!).toBeGreaterThan(whens[i - 1]!);
     }
-    // 任何 when 都不得超过末条的归真值 —— 否则下一条真实时间戳的新迁移又会
+    // 任何 when 都不得超过末条 —— 否则下一条真实时间戳的新迁移又会
     // 被静默跳过（这正是本次故障的成因）。
-    expect(Math.max(...whens)).toBe(CORRECTED_MUSIC_0040_WHEN);
+    expect(Math.max(...whens)).toBe(whens[whens.length - 1]!);
+    // 0040（idx 40）是归真值，伪造的未来值不在 journal 里
+    expect(whens[40]).toBe(CORRECTED_MUSIC_0040_WHEN);
+    expect(whens).not.toContain(OLD_FAKE_MUSIC_0040_WHEN);
   });
 
   test("中毒库重启后自愈：六列建回、0037 已应用、已应用行时间戳归真", () => {
@@ -158,13 +169,15 @@ describe("迁移时间戳自愈", () => {
     expect(columnsOf(healed, "knowledge_bases")).toContain("embed_image");
     expect(columnsOf(healed, "knowledge_chunks")).toContain("modality");
     const rows = createdAts(healed);
-    expect(rows.length).toBe(41);
+    expect(rows.length).toBe(JOURNAL_LEN);
     // 0037 的记录被补了回来（它的 when 已不是全序列最大值，drizzle 自己够不着它，
     // 靠 repairUnreachableMigrations 补跑并记账）
     expect(rows).toContain(CORRECTED_TIRED_WHEN);
-    expect(rows[rows.length - 1]!).toBe(CORRECTED_MUSIC_0040_WHEN);
+    expect(rows[rows.length - 1]!).toBe(LATEST_WHEN);
+    expect(rows).toContain(CORRECTED_MUSIC_0040_WHEN);
     // 伪造未来值已清除
-    expect(rows.every((v) => v <= CORRECTED_MUSIC_0040_WHEN)).toBe(true);
+    expect(rows.every((v) => v <= LATEST_WHEN)).toBe(true);
+    for (const fake of [OLD_FAKE_0028_WHEN, OLD_FAKE_MUSIC_0040_WHEN]) expect(rows).not.toContain(fake);
     healed.close();
   });
 
@@ -221,9 +234,11 @@ describe("迁移时间戳自愈", () => {
       healed.query("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_records'").get(),
     ).not.toBeNull();
     const rows = createdAts(healed);
-    expect(rows.length).toBe(41);
-    expect(rows[rows.length - 1]!).toBe(CORRECTED_MUSIC_0040_WHEN);
-    expect(rows.every((v) => v <= CORRECTED_MUSIC_0040_WHEN)).toBe(true);
+    expect(rows.length).toBe(JOURNAL_LEN);
+    expect(rows[rows.length - 1]!).toBe(LATEST_WHEN);
+    expect(rows).toContain(CORRECTED_MUSIC_0040_WHEN);
+    expect(rows.every((v) => v <= LATEST_WHEN)).toBe(true);
+    for (const fake of [OLD_FAKE_0028_WHEN, OLD_FAKE_MUSIC_0040_WHEN]) expect(rows).not.toContain(fake);
     healed.close();
   });
 
@@ -276,9 +291,10 @@ describe("迁移时间戳自愈", () => {
       healed.query("SELECT name FROM sqlite_master WHERE type='table' AND name='music_playlists'").get(),
     ).not.toBeNull();
     const rows = createdAts(healed);
-    expect(rows.length).toBe(41);
+    expect(rows.length).toBe(JOURNAL_LEN);
     expect(rows).toContain(CORRECTED_TIRED_WHEN);
-    expect(rows.every((v) => v <= CORRECTED_MUSIC_0040_WHEN)).toBe(true);
+    expect(rows.every((v) => v <= LATEST_WHEN)).toBe(true);
+    for (const fake of [OLD_FAKE_0028_WHEN, OLD_FAKE_MUSIC_0040_WHEN]) expect(rows).not.toContain(fake);
     healed.close();
   });
 

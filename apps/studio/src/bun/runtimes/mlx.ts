@@ -5,7 +5,16 @@ import { getSetting, getServerPort, ENGINE_EXTRA_ARGS_KEYS } from "../db/setting
 import { resolveManagedPython } from "../python-engine";
 import { markServerStarted } from "../stats";
 import { extractDeadWorkerError, extractStartupError } from "./errors";
-import { MAX_LOG_CHARS, killProcessTree, probeCommand, pumpServerOutput, spawnServerProcess } from "./proc";
+import { MAX_LOG_CHARS, downloadSourceEnv, killProcessTree, probeCommand, pumpServerOutput, readHelpText, spawnServerProcess } from "./proc";
+import { getModelParams } from "../db/model-params";
+import {
+  cachedMlxHelpSupport,
+  mlxSamplingArgs,
+  parseMlxHelp,
+  resolveSamplingOrNull,
+  setMlxHelpSupport,
+} from "./engine-sampling";
+import { shellJoin, splitShellArgs } from "./shell-args";
 import type {
   BinaryCheckResult,
   LogListener,
@@ -23,6 +32,19 @@ function slugModelName(name: string): string {
 }
 
 /** 当前活动引擎是不是 MLX（请求侧判断「要不要换成 mlx 认的模型 id」）。 */
+/** MLX_HF_ENDPOINT 的出厂默认值（db/settings 的默认表）：等于它就当用户没改过。 */
+const MLX_HF_ENDPOINT_DEFAULT = "https://hf-mirror.com";
+
+/**
+ * 用户显式设置的 MLX HF 端点；没改过（仍是出厂默认）返回 null，交给下载源路由决定。
+ * 置空视为「明确要官方」。设置层分不出「存的就是默认值」和「没存」，两者同样跟随路由。
+ */
+export function explicitMlxHfEndpoint(stored: string | null | undefined): string | null {
+  const value = (stored ?? MLX_HF_ENDPOINT_DEFAULT).trim().replace(/\/+$/, "");
+  if (value === MLX_HF_ENDPOINT_DEFAULT) return null;
+  return value || "https://huggingface.co";
+}
+
 export function isMlxActive(): boolean {
   return getSetting("INFERENCE_ENGINE") === "mlx";
 }
@@ -193,8 +215,13 @@ export class MlxRuntime implements Runtime {
     return { model, servedName: slugModelName(base) };
   }
 
+  /**
+   * 拼 mlx_lm.server 参数。`model` 是模型 target（本地目录 / repo id），同时也是按模型参数的 key。
+   * mlx_lm.server 没有上下文长度开关（KV 按需增长），按模型的 ctxSize 在这里不适用。
+   */
   private buildArgs(model: string): string[] {
     const host = getSetting("SERVER_HOST") || "127.0.0.1";
+    const mp = getModelParams(model);
     const port = this.overrides.port ?? getServerPort(this.id);
 
     const args: string[] = [
@@ -210,10 +237,40 @@ export class MlxRuntime implements Runtime {
     // 未探测（如命令预览）或都不支持时省略，保证任何版本都能启动。
     if (this.cacheArgs) args.push(...this.cacheArgs);
 
-    const extra = getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]);
-    if (extra.trim()) args.push(...extra.trim().split(/\s+/));
+    // 服务端默认采样 + 关思考：按 --help 探测到的开关发（没探过一律不发，见 engine-sampling.ts）。
+    args.push(
+      ...mlxSamplingArgs(resolveSamplingOrNull(model, mp), mp?.thinking, cachedMlxHelpSupport(this.helpKey())),
+    );
+
+    // 追加参数放最后：全局在前、按模型在后（后者盖过前者）；按 shell 引号规则切分。
+    args.push(...splitShellArgs(getSetting(ENGINE_EXTRA_ARGS_KEYS[this.id]) || ""));
+    if (mp?.extraArgs) args.push(...splitShellArgs(mp.extraArgs));
 
     return args;
+  }
+
+  /** 探测缓存的 key：启动形态 + 可执行文件（托管 venv 与系统 python 的 mlx-lm 版本可能不同）。 */
+  private helpKey(): string | null {
+    return this.binary && this.binaryMode ? `${this.binaryMode}:${this.binary}` : null;
+  }
+
+  private helpCommand(): string[] | null {
+    const bin = this.binary;
+    const mode = this.binaryMode;
+    if (!bin || !mode) return null;
+    return mode === "server"
+      ? [bin, "--help"]
+      : mode === "mlx-lm"
+        ? [bin, "server", "--help"]
+        : [bin, "-m", "mlx_lm.server", "--help"];
+  }
+
+  /** 本次运行实际发出去的 argv（没启动过 = null），needsRestart 的比对基准。 */
+  private launchedArgs: string[] | null = null;
+
+  needsRestart(): boolean {
+    if (this.launchedArgs === null || this.serverStatus !== "running") return false;
+    return shellJoin(this.buildArgs(this.resolveModel().model)) !== shellJoin(this.launchedArgs);
   }
 
   /**
@@ -222,26 +279,23 @@ export class MlxRuntime implements Runtime {
    */
   private cacheArgs: string[] | null = null;
 
+  /**
+   * 一次 `--help` 出两样：KV 缓存参数形态（返回值）+ 采样 / 模板开关支持（写进进程级缓存，
+   * buildArgs 同步读）。同一份可执行文件探过就不再为采样重跑。
+   */
   private async probeCacheArgs(): Promise<string[]> {
     const cacheGb = Number(getSetting("MLX_CACHE_SIZE_GB"));
-    if (!Number.isFinite(cacheGb) || cacheGb <= 0) return [];
+    const wantCache = Number.isFinite(cacheGb) && cacheGb > 0;
+    const key = this.helpKey();
+    const helpCmd = this.helpCommand();
+    if (!key || !helpCmd) return [];
+    if (!wantCache && cachedMlxHelpSupport(key) !== null) return [];
 
     try {
-      const bin = this.binary;
-      const mode = this.binaryMode;
-      if (!bin || !mode) return [];
-      const helpCmd =
-        mode === "server"
-          ? [bin, "--help"]
-          : mode === "mlx-lm"
-            ? [bin, "server", "--help"]
-            : [bin, "-m", "mlx_lm.server", "--help"];
-      const proc = Bun.spawn(helpCmd, { stdout: "pipe", stderr: "pipe" });
-      const [out, err] = await Promise.all([
-        new Response(proc.stdout).text().catch(() => ""),
-        new Response(proc.stderr).text().catch(() => ""),
-      ]);
-      const help = `${out}\n${err}`;
+      const help = await readHelpText(helpCmd, 15_000);
+      if (help === null) return [];
+      setMlxHelpSupport(key, parseMlxHelp(help));
+      if (!wantCache) return [];
       if (help.includes("--cache-size-gb")) {
         return ["--cache-size-gb", String(Math.round(cacheGb))];
       }
@@ -259,9 +313,9 @@ export class MlxRuntime implements Runtime {
     const args = this.buildArgs(model);
     // 未启动过时按最常见的 console script 形式给出可复制命令。
     const mode = this.binaryMode ?? "server";
-    if (mode === "server") return [this.binary ?? "mlx_lm.server", ...args].join(" ");
-    if (mode === "mlx-lm") return [this.binary ?? "mlx_lm", "server", ...args].join(" ");
-    return [this.binary ?? "python3", "-m", "mlx_lm.server", ...args].join(" ");
+    if (mode === "server") return shellJoin([this.binary ?? "mlx_lm.server", ...args]);
+    if (mode === "mlx-lm") return shellJoin([this.binary ?? "mlx_lm", "server", ...args]);
+    return shellJoin([this.binary ?? "python3", "-m", "mlx_lm.server", ...args]);
   }
 
   private binary: string | null = null;
@@ -287,6 +341,7 @@ export class MlxRuntime implements Runtime {
     this.cacheArgs = await this.probeCacheArgs();
 
     const args = this.buildArgs(model);
+    this.launchedArgs = args;
     this.lastError = "";
     this.setStatus("starting");
 
@@ -299,12 +354,16 @@ export class MlxRuntime implements Runtime {
           ? [this.binary, "server", ...args]
           : [this.binary, "-m", "mlx_lm.server", ...args];
 
-    this.appendLog(`$ ${cmd.join(" ")}\n`);
+    this.appendLog(`$ ${shellJoin(cmd)}\n`);
 
-    // 国内环境优先走 hf-mirror；置空 MLX_HF_ENDPOINT 则使用 HuggingFace 官方。
-    const hfEndpoint = (getSetting("MLX_HF_ENDPOINT") || "").trim();
-    const env: Record<string, string> = {};
-    if (hfEndpoint) env.HF_ENDPOINT = hfEndpoint;
+    // HF 端点：默认跟随下载源路由（国内镜像 / 官方直连）；用户显式改过 MLX_HF_ENDPOINT
+    // 就尊重用户（置空 = 官方）。
+    const env = await downloadSourceEnv();
+    const explicit = explicitMlxHfEndpoint(getSetting("MLX_HF_ENDPOINT"));
+    if (explicit) {
+      env.HF_ENDPOINT = explicit;
+      env.MODEL_ENDPOINT = explicit;
+    }
 
     try {
       this.serverProcess = spawnServerProcess(cmd, env, "mlx");

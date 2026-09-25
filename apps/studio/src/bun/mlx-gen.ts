@@ -11,6 +11,9 @@ import { logEvent } from "./app-log";
 import { getDataDir } from "./paths";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { getSetting } from "./db/settings";
+import { getSourcePlan, peekSourcePlan } from "./net-sources";
+import { installEnv, installFromIndexes, pythonChildEnv, resolveUv } from "./python-sources";
+import type { SourcePlan } from "../shared/net-sources";
 
 /**
  * MLX 本地生图引擎（Apple Silicon）。
@@ -114,6 +117,14 @@ function getSearchPath(): string {
   ];
   const current = process.env.PATH ?? "";
   return [...extra, current].join(":");
+}
+
+/**
+ * venv 里 Python 子进程（mlx-worker / mlx-model / mflux CLI）的环境：按下载源计划带上
+ * HF_ENDPOINT 与 OMNI_HF_ENDPOINTS（脚本按这个顺序逐个端点回退）。
+ */
+function mlxChildEnv(plan: SourcePlan = peekSourcePlan()): Record<string, string | undefined> {
+  return { ...process.env, ...pythonChildEnv(plan) };
 }
 
 /** mflux venv 根目录（userData/engines/mflux，结构为标准 python venv）。 */
@@ -256,7 +267,7 @@ export async function getMlxGenStatus(): Promise<MlxGenStatus> {
  * 1. 优先使用 uv（速度快一个量级）：`uv venv` + `uv pip install mflux`；
  *    没有 uv 时回退到 `python3 -m venv` + pip。
  * 2. Python 版本优先 3.12 / 3.13（依赖轮子最全），3.14 兜底。
- * 3. 默认 PyPI 源失败时自动用清华镜像重试一次。
+ * 3. PyPI 索引按下载源计划依次尝试（首选最快的那个，失败换下一个）。
  * 4. 已有 venv 的 Python 版本与目标不一致时删掉重建，避免旧环境损坏。
  *
  * 全程日志通过 onInstallLog 广播，主进程转发到前端实时展示。
@@ -303,7 +314,9 @@ export async function downloadMlxEngine(): Promise<{
     }
   }
 
-  const uv = Bun.which("uv", { PATH: getSearchPath() });
+  const uv = resolveUv(getSearchPath());
+  const plan = await getSourcePlan();
+  const env = { ...process.env, ...installEnv(plan) };
 
   // ---- 创建 venv ----
   if (!existsSync(enginePython)) {
@@ -312,6 +325,7 @@ export async function downloadMlxEngine(): Promise<{
       const venv = Bun.spawnSync([uv, "venv", "--python", python, engineDir], {
         stdout: "pipe",
         stderr: "pipe",
+        env,
       });
       if (venv.exitCode !== 0) {
         const err = venv.stderr.toString().slice(0, 500) || "创建虚拟环境失败";
@@ -332,14 +346,13 @@ export async function downloadMlxEngine(): Promise<{
     }
   }
 
-  // ---- 安装 mflux（默认源失败自动换清华镜像重试） ----
-  const mirror = "https://pypi.tuna.tsinghua.edu.cn/simple";
+  // ---- 安装 mflux（索引按下载源计划依次尝试） ----
   const runInstall = async (indexArgs: string[]): Promise<number> => {
     const cmd = uv
       ? [uv, "pip", "install", "--python", enginePython, "--upgrade", "mflux", ...indexArgs]
       : [venvBinary("pip3"), "install", "--upgrade", "mflux", ...indexArgs];
     emitLog(`$ ${cmd.join(" ")}`);
-    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", env });
     await Promise.all([
       streamLines(proc.stdout),
       streamLines(proc.stderr, true),
@@ -347,11 +360,7 @@ export async function downloadMlxEngine(): Promise<{
     return await proc.exited;
   };
 
-  let code = await runInstall([]);
-  if (code !== 0) {
-    emitLog(`默认 PyPI 源安装失败（退出码 ${code}），改用清华镜像重试…`);
-    code = await runInstall(["-i", mirror]);
-  }
+  const { code } = await installFromIndexes({ plan, what: "mflux", run: runInstall, log: emitLog });
   if (code !== 0) {
     emitLog("mflux 安装失败");
     logMlxFailure("image.mlx.install_failed", `mflux 安装失败（退出码 ${code}）`, {
@@ -564,7 +573,7 @@ async function doDownloadMlxModel(
 
   const proc = Bun.spawn(
     [py, modelHelperScript(), "download", model.id],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", env: mlxChildEnv(await getSourcePlan()) },
   );
 
   const parser = (async () => {
@@ -739,7 +748,7 @@ export async function isMlxModelDownloaded(modelId: string): Promise<boolean> {
   try {
     const proc = Bun.spawnSync(
       [py, modelHelperScript(), "check", modelId],
-      { stdout: "pipe", stderr: "pipe", timeout: 30_000 },
+      { stdout: "pipe", stderr: "pipe", timeout: 30_000, env: mlxChildEnv() },
     );
     const out = proc.stdout.toString();
     const ok = proc.exitCode === 0 && /\bOK\b/.test(out);
@@ -1079,6 +1088,8 @@ export async function startMlxModel(
       stdout: "pipe",
       stderr: "pipe",
       stdin: "pipe",
+      // 首次加载会下权重：HF 端点按下载源计划给（worker 读 OMNI_HF_ENDPOINTS）。
+      env: mlxChildEnv(),
     }) as unknown as PipeProc;
   } catch (e) {
     const err = `启动 worker 失败：${e instanceof Error ? e.message : e}`;
@@ -1298,7 +1309,7 @@ async function generateWithMlxInner(
 
   // 超时保护：进程挂住（网络/内存等）时不再让 UI 永远停在“生图当中”。
   const TIMEOUT_MS = 30 * 60_000;
-  const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe", env: mlxChildEnv() });
   activeGenerate = proc.exited;
   let timedOut = false;
   const timer = setTimeout(() => {

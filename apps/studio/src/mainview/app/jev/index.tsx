@@ -12,7 +12,7 @@
  */
 import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { SlidersHorizontalIcon } from "lucide-react";
+import { WaypointsIcon } from "lucide-react";
 
 import { rpcClient } from "@lib/rpc";
 import { useJevStore } from "@stores/jev";
@@ -89,7 +89,8 @@ function JevConsole() {
       {/* 左：引擎 + 参数（宽度与语音页的参数列一致） */}
       <section className="flex w-[380px] min-w-[340px] flex-none flex-col gap-4 overflow-y-auto border-r p-4">
         <div className="flex items-center gap-2">
-          <SlidersHorizontalIcon className="size-4 text-muted-foreground" aria-hidden />
+          {/* 与左侧一级菜单 JEV 条目同一个图标（Waypoints == 判定 / 选路），让用户一眼对上 */}
+          <WaypointsIcon className="size-4 text-muted-foreground" aria-hidden />
           <h1 className="text-sm font-semibold">{t("jev.title")}</h1>
           <span className="ml-auto flex items-center gap-1">
             {status.data?.resolved ? (

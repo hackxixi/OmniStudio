@@ -15,14 +15,17 @@
  * 校验（文件被换掉但名字不变时 mtime 兜住；stat 失败不丢弃计划——文件可能在网络盘上）。
  * 只保留最近 4 条，Map 的插入顺序天然就是 LRU（命中时移到队尾）。
  */
-import { lstatSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { readdirSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { getSetting, type SettingsKey } from "./db/settings";
 import { logEvent } from "./app-log";
 import { readGgufMeta } from "./gguf-meta";
+import { isMmprojFile } from "./model-scan";
+import { cachedKvUnifiedSupport, defaultLlamaServerBinary } from "./runtimes/llama-flash-attn";
 import { MIN_FIT_CTX } from "../shared/launch-planner";
 import { plannerHardwareSnapshot } from "./planner-hardware";
 import { planLlamaLaunch, type LaunchPlan } from "../shared/launch-planner";
+import type { ModelParams } from "../shared/model-params";
 
 export type { LaunchPlan };
 
@@ -36,6 +39,14 @@ export type LaunchPlanKey = {
   /** 用户显式指定的窗口，null = 自动。 */
   ctxOverride: number | null;
   flashAttn: boolean | null;
+  /**
+   * 这台 llama-server 认不认 `--kv-unified`（来自 `--help` 探测缓存；没探过 = false）。
+   * 不认时 parallel > 1 会把总窗口按 slot 均分，规划器要按「每 slot 窗口」计价 ——
+   * 不进 key 的话，同一模型在支持 / 不支持两种二进制下会命中同一份计划。
+   */
+  supportsKvUnified: boolean;
+  /** 同目录自动配对的 mmproj 文件字节数（没有 = null）：它也要占显存，预算要扣掉。 */
+  mmprojBytes: number | null;
 };
 
 const CACHE_MAX_ENTRIES = 4;
@@ -60,6 +71,8 @@ function planCacheKey(key: LaunchPlanKey): string {
     cv: key.cacheTypeV,
     ctx: key.ctxOverride,
     fa: key.flashAttn,
+    kvu: key.supportsKvUnified,
+    mm: key.mmprojBytes,
   });
 }
 
@@ -67,9 +80,11 @@ function statModelFile(
   modelPath: string,
 ): { mtimeMs: number; size: number } | null {
   try {
-    // lstat 而不是 stat：符号链接指向的源文件（比如引擎目录的 `current`）被替换时
-    // 链接自身的 mtime 会变，能兜住「模型被升级但 GGUF 文件名不变」的情况。
-    const st = lstatSync(resolve(modelPath));
+    // stat（跟随链接），必须与 gguf-meta 记指纹的口径一致：HF 缓存里的 GGUF 全是指向
+    // blobs/ 的符号链接，lstat 拿到的是链接本身（size 76），与计划里记的真文件大小永远
+    // 对不上 —— 每次读缓存都当成「文件换过」作废，HF 下载的模型自动调参从来没生效过。
+    // 链接改指向新文件时，目标的 mtime / size 同样会变，照样能兜住「文件名不变、内容换了」。
+    const st = statSync(resolve(modelPath));
     return { mtimeMs: st.mtimeMs, size: st.size };
   } catch {
     return null;
@@ -98,6 +113,8 @@ export async function refreshLaunchPlan(key: LaunchPlanKey): Promise<LaunchPlan 
   const plan = planLlamaLaunch({
     meta: read.data.meta,
     weightsBytes: read.data.totalFileBytes,
+    mmprojBytes: key.mmprojBytes,
+    supportsKvUnified: key.supportsKvUnified,
     hardware,
     minCtx,
     overrides: {
@@ -170,9 +187,10 @@ export function cachedLaunchPlan(key: LaunchPlanKey): LaunchPlan | null {
 
 /**
  * 自动推算时上下文的下限（token）：设置 `SERVER_AUTO_TUNE_MIN_CTX`，解析不了 / 非正数
- * 回落规划器的 MIN_FIT_CTX（4096）。只影响自动拟合（见 llama.ts），不影响任何设置值。
+ * 回落规划器的 MIN_FIT_CTX（4096）。只影响自动拟合与显存不足时的降级重试（见 llama.ts），
+ * 不影响任何设置值。
  */
-function autoTuneMinCtx(): number {
+export function autoTuneMinCtx(): number {
   const raw = Number(getSetting("SERVER_AUTO_TUNE_MIN_CTX" as SettingsKey));
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : MIN_FIT_CTX;
 }
@@ -182,31 +200,106 @@ export function clearLaunchPlanCache(): void {
 }
 
 /**
+ * 本地 GGUF 模型同目录下自动配对的多模态投影文件（mmproj-*.gguf），没有就 null。
+ *
+ * 聊天实例与嵌入实例共用这一条规则（llama.ts 拼 `--mmproj`、这里给规划器算字节数），
+ * 保证「命令里带的那个文件」就是「预算里扣掉的那个文件」。
+ * 多文件优先 f16：bf16 的名字里也含 "f16" 子串，直接 includes 会选错，所以要求 f16
+ * 前面不是字母；没有 f16 时按字典序取第一个兜底。
+ * `modelPath` 通常是主 GGUF 文件（目录条目已被 llamaLoadablePath 换成主文件），
+ * 投影文件在它的 dirname 里；万一传进来的就是目录（预览入口），直接在目录里找。
+ * 目录读不到（模型被移走等）按「无投影文件」处理。
+ */
+export function pairedMmprojPath(modelPath: string): string | null {
+  let dir: string;
+  try {
+    dir = statSync(modelPath).isDirectory() ? modelPath : dirname(modelPath);
+  } catch {
+    dir = dirname(modelPath);
+  }
+  try {
+    const names = readdirSync(dir);
+    // 平铺目录防误配：只有目录里的主 GGUF 都是「同一个模型的不同量化 / 分片」时才配对。
+    // 用户把几个不相干的模型平铺在一个文件夹里时，别人的 mmproj 会让纯文本模型直接加载失败
+    // （投影维度对不上），宁可不配 —— 看不了图比起不来强。
+    if (!singleModelFamily(names)) return null;
+    const candidates = names.filter(isMmprojFile).sort();
+    const f16 = candidates.find((n) => /(?:^|[^a-z])f16/i.test(n));
+    const picked = f16 ?? candidates[0];
+    return picked ? join(dir, picked) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 量化 / 精度 / 分片后缀（Qwen3-VL-8B-Instruct-UD-Q4_K_XL-00001-of-00002 → Qwen3-VL-8B-Instruct）。 */
+const QUANT_SUFFIX_RE =
+  /(?:[-._](?:\d{5}-of-\d{5}))?(?:[-._](?:UD[-_])?(?:I?Q\d[\w]*|B?F16|F32|MXFP4\w*))+(?:[-._]\d{5}-of-\d{5})?$/i;
+
+/** 目录里除 mmproj 外的 GGUF 是否同属一个模型（去掉量化后缀后名字一致）；一个都没有也算。 */
+export function singleModelFamily(names: string[]): boolean {
+  const stems = new Set(
+    names
+      .filter((n) => /\.gguf$/i.test(n) && !isMmprojFile(n))
+      .map((n) => n.replace(/\.gguf$/i, "").replace(QUANT_SUFFIX_RE, "").toLowerCase()),
+  );
+  return stems.size <= 1;
+}
+
+/** 配对到的 mmproj 字节数（没有 / stat 失败 = null），规划器的 `mmprojBytes` 输入。 */
+function pairedMmprojBytes(modelPath: string): number | null {
+  const mmproj = pairedMmprojPath(modelPath);
+  if (mmproj === null) return null;
+  try {
+    return statSync(mmproj).size;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 自动启动参数缓存 key 的唯一计算入口（llama.ts 与测试共用，从根上消灭两份 key
  * 构造规则各自演化导致不一致的这类 bug）。字段语义见 `LaunchPlanKey` 注释。
  *
  * `flashAttn` 参数是「用户设置 + 上次实测」折算后的布尔（llama.ts 的
  * `effectiveFlashAttnForPlan`），null = 调用方不知道（默认按关，保守）。
+ *
+ * `supportsKvUnified` / `mmprojBytes` 不靠调用方传：前者读 `--help` 探测缓存（按
+ * `defaultLlamaServerBinary` 那条同步路径规则，与 buildCommandLine 同源；没探过 = 不支持，
+ * 与「没探过就不发 --kv-unified」一致），后者按 `pairedMmprojPath` 现 stat。这样预览 RPC
+ * 与运行时不用各自补参数也拿到逐字段相同的 key。运行时在 start() 里刚探测过时可以用
+ * `opts.supportsKvUnified` 传当次探测值（探测成功也会写进同一份缓存，两者一致）。
+ *
+ * `opts.modelParams`（按模型参数，已经 db/model-params 校验过）逐字段盖过设置：
+ * ctxSize → ctxOverride（规划器尊重用户窗口、其余参数照样自动拟合）；parallel / KV 类型
+ * 同理 —— 它们既进 argv 也进计价，key 里必须是真正会发出去的那个值。
  */
 export function buildLaunchPlanKeyFromSettings(
   modelPath: string,
   get: (key: string) => string,
   flashAttn?: boolean | null,
+  opts?: { supportsKvUnified?: boolean | null; modelParams?: ModelParams | null },
 ): LaunchPlanKey {
   const parse = (raw: string): number | null => {
     if (!raw.trim()) return null;
     const n = Number(raw);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
   };
+  const mp = opts?.modelParams ?? null;
   return {
     modelPath,
-    parallel: parse(get("SERVER_PARALLEL")) ?? 1,
+    parallel: mp?.parallel ?? parse(get("SERVER_PARALLEL")) ?? 1,
     ubatch: parse(get("SERVER_UBATCH_SIZE")),
     batch: parse(get("SERVER_BATCH_SIZE")),
-    cacheTypeK: get("SERVER_CACHE_TYPE_K") || null,
-    cacheTypeV: get("SERVER_CACHE_TYPE_V") || null,
-    ctxOverride: null,
+    cacheTypeK: mp?.cacheTypeK ?? (get("SERVER_CACHE_TYPE_K") || null),
+    cacheTypeV: mp?.cacheTypeV ?? (get("SERVER_CACHE_TYPE_V") || null),
+    // 全局 SERVER_CTX_SIZE 不进来（自动模式下不把它当「用户显式指定」，否则自动推算失去意义）；
+    // 按模型固定的窗口才是用户明确说了的。
+    ctxOverride: mp?.ctxSize ?? null,
     flashAttn: flashAttn ?? false,
+    supportsKvUnified:
+      opts?.supportsKvUnified ?? cachedKvUnifiedSupport(defaultLlamaServerBinary()) ?? false,
+    mmprojBytes: pairedMmprojBytes(modelPath),
   };
 }
 

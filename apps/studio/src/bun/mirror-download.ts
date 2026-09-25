@@ -5,28 +5,29 @@
  * TCP 超时才失败（macOS 约 75s），再碰上 `AbortSignal.timeout(600_000)` 就是每个源
  * 白等 10 分钟，用户看到的是「正在下载引擎…」一直不动。这里统一做四件事：
  *
- *   1. 先探一下直连能不能通（结果带缓存）：能通就直连优先，海外用户走最快的那条；
- *      不能通就直接跳过，不再浪费 75s。
+ *   1. 候选顺序由下载源计划（net-sources.ts：探测官方 / 各镜像的可达性与延迟）决定：
+ *      官方直连模式直连在前，海外 / 开着代理的用户走最快的那条；国内加速模式镜像在前，
+ *      不再先撞一个要等 75s 才失败的直连。
  *   2. 依次尝试多个 GitHub 加速镜像；每条链路只给很短的“拿到响应头”预算，连不上立刻换。
  *   3. 传输阶段有停摆看门狗：中途一个字节都不来超过 stallMs 就换链路。
  *   4. 链路之间会“对冲”：当前这条跑太久还不结束，就把下一条也开起来，谁先完成用谁 ——
  *      镜像快慢随机（实测同一条镜像 28s ~ 180s+ 都有），串行等待会把耗时相加。
  *
  * 全部失败才返回错误，错误里带上每条链路的具体原因，并写进统一日志。
- * 加一条下载链路只需往 GITHUB_MIRRORS 里追加一项。
+ * 加一条 GitHub 下载链路只需往 net-sources.ts 的 GITHUB_PREFIX_MIRRORS 里追加一项。
  */
 
 import { mkdirSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
 import { logEvent } from "./app-log";
 import type { AppLogSource } from "./app-log";
+import { GITHUB_PREFIX_MIRRORS, getSourcePlan, githubCandidates, reportSourceFailure } from "./net-sources";
 
-/** GitHub 加速镜像（前缀式：`<mirror><原始 URL>`）。按实测可用性排序。 */
-export const GITHUB_MIRRORS = [
-  "https://gh-proxy.com/",
-  "https://ghfast.top/",
-  "https://ghproxy.net/",
-] as const;
+/**
+ * GitHub 加速镜像（前缀式：`<mirror><原始 URL>`）。清单本身挪到了 net-sources.ts
+ * （下载源路由统一在那里探测、排序），这里保留导出名给老调用方。
+ */
+export const GITHUB_MIRRORS = GITHUB_PREFIX_MIRRORS;
 
 /** 单条链路“拿到响应头”的预算。连不上就立刻换链路，不在这里耗时间。 */
 const FIRST_BYTE_MS = 8_000;
@@ -43,7 +44,7 @@ const HEDGE_AFTER_MS = 45_000;
 /** 同时最多跑几条链路（对冲只多开一条，避免把带宽摊薄到两条都变慢）。 */
 const MAX_PARALLEL = 2;
 
-/** 直连可达性探测的超时与缓存时长。 */
+/** 直连可达性探测的超时与缓存时长（只剩非 GitHub 的 officialWithMirrors 在用）。 */
 const PROBE_MS = 2_500;
 const PROBE_TTL_MS = 3 * 60_000;
 
@@ -53,6 +54,7 @@ const MAX_BYTES = 256 * 1024 * 1024;
 /** `origin -> 是否直连可达`，带 TTL；全部链路都失败时会被清掉，下次点击重新探测。 */
 const probeCache = new Map<string, { ok: boolean; at: number }>();
 
+/** 清掉本文件的直连探测缓存（下载源计划那边由逐条 reportSourceFailure 标记过期）。 */
 export function clearSourceProbeCache(): void {
   probeCache.clear();
 }
@@ -77,38 +79,40 @@ async function originReachable(origin: string): Promise<boolean> {
 }
 
 /**
- * 候选链路的通用排序：直连能通就直连优先，不能通则镜像在前、直连降到最后当兜底。
- * `mirrors` / `extras` 都是完整的 URL（前缀式镜像由调用方拼好）。
+ * GitHub Release 资产的候选链路：顺序由下载源计划决定（githubCandidates）——
+ * 官方直连模式直连在前，国内加速模式镜像在前、直连兜底。对冲 / 停摆看门狗照旧，
+ * 所以排错了也只是多花一个首包预算。
  */
-async function orderSources(
-  direct: string,
-  mirrors: string[],
-  extras: string[] = [],
-): Promise<string[]> {
-  const reachable = await originReachable(new URL(direct).origin).catch(() => false);
-  return reachable ? [direct, ...mirrors, ...extras] : [...mirrors, ...extras, direct];
-}
-
-/** GitHub Release 资产的候选链路。 */
-export function githubReleaseUrls(repo: string, tag: string, asset: string): Promise<string[]> {
+export async function githubReleaseUrls(repo: string, tag: string, asset: string): Promise<string[]> {
   const direct = `https://github.com/${repo}/releases/download/${tag}/${asset}`;
-  return orderSources(direct, GITHUB_MIRRORS.map((m) => `${m}${direct}`));
+  return githubCandidates(direct, await getSourcePlan());
 }
 
 /**
  * GitHub 仓库内文件（raw）的候选链路。
  * 除加速镜像外多挂一条 jsDelivr：它是 Fastly 上的独立 CDN，与 GitHub 及其加速站不同源。
+ * 直连在最后（国内加速）时 jsDelivr 插在直连前面；直连在前（官方直连）时 jsDelivr 垫底。
  */
-export function githubRawUrls(repo: string, branch: string, file: string): Promise<string[]> {
+export async function githubRawUrls(repo: string, branch: string, file: string): Promise<string[]> {
   const direct = `https://github.com/${repo}/raw/${branch}/${file}`;
-  const mirrors = GITHUB_MIRRORS.map((m) => `${m}${direct}`);
   const jsdelivr = `https://cdn.jsdelivr.net/gh/${repo}@${branch}/${file}`;
-  return orderSources(direct, mirrors, [jsdelivr]);
+  const urls = githubCandidates(direct, await getSourcePlan());
+  const at = urls.indexOf(direct);
+  if (at === urls.length - 1) urls.splice(at, 0, jsdelivr);
+  else urls.push(jsdelivr);
+  return urls;
 }
 
-/** 非 GitHub 官方域 + 自带镜像的候选链路。 */
-export function officialWithMirrors(direct: string, mirrors: string[]): Promise<string[]> {
-  return orderSources(direct, mirrors);
+/**
+ * 非 GitHub 官方域 + 自带镜像的候选链路。
+ * 国内加速模式：镜像在前、官方兜底；官方直连模式：仍探一下官方能不能通（这些域不在
+ * net-sources 的探测清单里），能通直连优先，不能通镜像在前。
+ */
+export async function officialWithMirrors(direct: string, mirrors: string[]): Promise<string[]> {
+  const plan = await getSourcePlan();
+  if (plan.mode === "cn") return [...mirrors, direct];
+  const reachable = await originReachable(new URL(direct).origin).catch(() => false);
+  return reachable ? [direct, ...mirrors] : [...mirrors, direct];
 }
 
 export type DownloadAttempt = { host: string; url: string; ms: number; error?: string };
@@ -353,6 +357,8 @@ export async function fetchAssetFromSources(opts: {
 
   const fail = (attempt: Attempt, error: string, ms: number): void => {
     attempts.push({ host: attempt.host, url: attempt.url, ms, error });
+    // 让下载源计划知道这个主机刚坏过：降级 + 下次重新探测（下一次下载就不再先撞它）。
+    reportSourceFailure(attempt.url);
     logEvent({
       level: "warn",
       source,

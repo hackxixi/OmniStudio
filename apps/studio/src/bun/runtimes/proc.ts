@@ -1,8 +1,11 @@
 import type { Subprocess } from "bun";
+import { existsSync } from "fs";
 
 import { logEvent } from "../app-log";
 import { forgetChild, recordChild } from "../child-registry";
 import { proxyChildEnv } from "../proxy";
+import { sourceEnv } from "../net-sources";
+import { hfEndpointsOf, looksLikeRepoId, resolveModelScopeRepo, sourcePlanWithin } from "../model-source-map";
 
 /**
  * 推理服务器子进程的公共设施：四个 runtime（llama.cpp / vLLM / SGLang / MLX）
@@ -63,6 +66,94 @@ function forgetChildSafe(pid: number): void {
   }
 }
 
+/**
+ * 子进程环境：父进程环境 < 代理变量 < 调用方给的（下载源 / 引擎专属）。
+ * 值为 undefined 的键丢掉（Bun.spawn 会把 "undefined" 当字符串传下去）。
+ */
+export function mergeChildEnv(
+  base: Record<string, string | undefined>,
+  proxy: Record<string, string>,
+  extra?: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const layer of [base, proxy, extra ?? {}]) {
+    for (const [k, v] of Object.entries(layer)) {
+      if (typeof v === "string") out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** 放进子进程环境、把 HF 端点顺序交给 python 侧脚本（mlx-model.py / mlx-worker.py）的变量名。 */
+export const OMNI_HF_ENDPOINTS_ENV = "OMNI_HF_ENDPOINTS";
+
+const pythonModuleCache = new Map<string, boolean>();
+
+/** 某个 python 能不能 import 某模块（按 python 路径缓存；探测失败 / 超时算没有）。 */
+async function pythonHasModule(python: string, mod: string): Promise<boolean> {
+  const key = `${python}\0${mod}`;
+  const hit = pythonModuleCache.get(key);
+  if (hit !== undefined) return hit;
+  const ok = await probeCommand([python, "-c", `import ${mod}`], 5_000);
+  pythonModuleCache.set(key, ok);
+  return ok;
+}
+
+/**
+ * 推理引擎子进程的下载源环境变量（llama.cpp `-hf`、vLLM / SGLang / MLX 自己拉权重时用）。
+ *
+ * - 基础：sourceEnv(plan)（HF_ENDPOINT / MODEL_ENDPOINT / PIP 索引…）+ OMNI_HF_ENDPOINTS；
+ *   用户自己在环境里设过的同名变量不覆盖（显式配置优先）。
+ * - `modelScopeVar`（VLLM_USE_MODELSCOPE / SGLANG_USE_MODELSCOPE）：仅当路由默认平台是
+ *   ModelScope、模型是**原样**存在于 ModelScope 的仓库 id（改名组织不行 —— 那得改 argv，
+ *   复制出来的命令就和实际不一致了）、且这个 python 装了 `modelscope` 包时才打开；
+ *   否则照旧走 HF_ENDPOINT（镜像）。
+ * - 整体最多等 ~`timeoutMs`：路由探测 / ModelScope 查询慢不能拖住引擎启动。
+ */
+export async function downloadSourceEnv(
+  opts: {
+    model?: string;
+    python?: string | null;
+    modelScopeVar?: "VLLM_USE_MODELSCOPE" | "SGLANG_USE_MODELSCOPE";
+    timeoutMs?: number;
+  } = {},
+): Promise<Record<string, string>> {
+  const timeoutMs = opts.timeoutMs ?? 3_000;
+  const plan = await sourcePlanWithin(timeoutMs);
+  const env: Record<string, string> = { ...sourceEnv(plan) };
+  env[OMNI_HF_ENDPOINTS_ENV] = hfEndpointsOf(plan).join(",");
+  for (const key of Object.keys(env)) {
+    if (process.env[key]) delete env[key];
+  }
+
+  const { model, python, modelScopeVar } = opts;
+  if (
+    modelScopeVar &&
+    !process.env[modelScopeVar] &&
+    plan.modelSource === "modelscope" &&
+    model &&
+    python &&
+    looksLikeRepoId(model) &&
+    !existsSync(model)
+  ) {
+    const decide = (async () => {
+      if (!(await pythonHasModule(python, "modelscope"))) return false;
+      const lookup = await resolveModelScopeRepo(model);
+      return lookup.status === "found" && lookup.repo === model;
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const useModelScope = await Promise.race([
+      decide.catch(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (useModelScope) env[modelScopeVar] = "True";
+  }
+  return env;
+}
+
 export function spawnServerProcess(
   cmd: string[],
   env?: Record<string, string>,
@@ -77,7 +168,7 @@ export function spawnServerProcess(
     detached: true,
     // 代理环境变量：vLLM / SGLang / MLX 起服务时会自己去 HuggingFace 拉权重，
     // 这一步在子进程里，只有 env 能带上代理设置（见 bun/proxy.ts）。
-    env: { ...(process.env as Record<string, string>), ...proxyChildEnv(), ...env },
+    env: mergeChildEnv(process.env as Record<string, string>, proxyChildEnv(), env),
   });
 
   // 落盘登记：父进程被 SIGKILL 时，下次启动靠这条记录把孤儿清掉。
@@ -191,5 +282,39 @@ export async function probeCommand(cmd: string[], timeoutMs = 5_000): Promise<bo
     }
   } catch {
     return false;
+  }
+}
+
+/**
+ * 跑一条 `--help` 类命令，拿 stdout + stderr 的全文（引擎开关探测用）。
+ * 与 probeCommand 不同，这里**不看退出码**：有的 CLI 打印帮助后退出码非 0（argparse 的
+ * 子命令组、`--help=all` 不认时的回落），只要吐出了文字就能拿来认开关。
+ * 启动失败 / 超时 / 什么都没输出 → null（调用方不落缓存，下回再试）。
+ */
+export async function readHelpText(cmd: string[], timeoutMs = 5_000): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        // 已经退出了
+      }
+    }, timeoutMs);
+    try {
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text().catch(() => ""),
+        new Response(proc.stderr).text().catch(() => ""),
+      ]);
+      await proc.exited;
+      const text = `${out}\n${err}`;
+      return timedOut || !text.trim() ? null : text;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
   }
 }

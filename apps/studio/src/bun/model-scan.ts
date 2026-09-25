@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, realpathSync, statSync, type Dirent } from "fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, type Dirent } from "fs";
 import path from "path";
 
 import {
@@ -62,6 +62,12 @@ export type ScannedModel = {
   supportFiles?: string[];
   /** 下载来源平台（应用下载的模型由 .vllm-meta.json 提供，HF 缓存固定是 huggingface）。 */
   source?: ModelSource;
+  /**
+   * 目录是某类非聊天权重时给出它的家族标识（目前只有 laya-mlx，JEV / SystemOne
+   * 的判定模型）。列表靠它隐藏启动入口、后端靠它拒绝启动推理服务 —— 两者共用
+   * 同一个判定函数，不会各写一套。
+   */
+  special?: "laya-mlx";
 };
 
 /** 扫描深度上限：防止用户把模型目录指到 `/` 或主目录导致全盘遍历。 */
@@ -225,6 +231,33 @@ export function isRepoModelDir(dir: string): boolean {
     (n) => fileKind(n) === "safetensors" || /\.(bin|pt|pth|ckpt)$/i.test(n),
   );
   return names.includes("config.json") && nonGgufWeight;
+}
+
+/**
+ * 目录里有没有 JEV / SystemOne 的 laya-mlx checkpoint（mlx_config.json 的
+ * `format: "laya-mlx"`）。
+ *
+ * 这些是**判定**模型（BERT 系小模型，走 `systemone-laya.ts` 的常驻 worker 按
+ * HF repo id 懒加载），不是能进推理服务器的聊天模型：拿目录去启动 vLLM / MLX
+ * 必然失败，而列表里它们又长得和正常 safetensors 仓库一模一样（model.safetensors
+ * + config + tokenizer），只能靠这个自声明的格式字段认出来。
+ *
+ * 只认 `format` 字段、不对 repo 名单：用户自己转换的 laya checkpoint（repo 名不
+ * 在 catalog 里）也应该被认出来；这里也不 import `systemone-laya` —— 那是带
+ * app-log / settings / net-sources 的重模块，不该被扫描器拖进依赖图。
+ */
+export function specialModelFormat(dir: string): "laya-mlx" | null {
+  const configPath = path.join(dir, "mlx_config.json");
+  if (!existsSync(configPath)) return null;
+  try {
+    const cfg = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!cfg || typeof cfg !== "object") return null;
+    return (cfg as Record<string, unknown>).format === "laya-mlx" ? "laya-mlx" : null;
+  } catch {
+    // JSON 坏了 / 不可读：不标记（宁可当普通目录，也不要因为一个损坏的
+    // 配置文件把能加载的模型从列表里藏掉）。
+    return null;
+  }
 }
 
 /**
@@ -419,9 +452,14 @@ export function scanPlainDir(root: string, origin: ModelOrigin): ScannedModel[] 
     isDir: true,
     files: r.files.map((f) => path.basename(f.path)),
     supportFiles: r.others.map((f) => path.basename(f.path)),
+    special: specialModelFormat(r.dir) ?? undefined,
   }));
 
   for (const e of fileEntries(files)) {
+    // laya-mlx 目录（mlx_config.json 自声明格式）不是标准仓库布局（没有 config.json），
+    // 扫描器按文件条目列出 —— 但同目录里的 mlx_config.json 仍然能认出它，
+    // 所以文件条目也要查一次目录（`specialModelFormat` 对非 laya 目录返回 null，代价极小）。
+    const special = specialModelFormat(path.dirname(e.path)) ?? undefined;
     out.push({
       repo: repoLabel(root, e.path),
       fileName: e.fileName,
@@ -432,6 +470,7 @@ export function scanPlainDir(root: string, origin: ModelOrigin): ScannedModel[] 
       runtimeTarget: resolveRuntimeTarget(e.path),
       isDir: false,
       files: e.members,
+      special,
     });
   }
 
@@ -565,6 +604,9 @@ export function scanHfCache(hubDir: string): ScannedModel[] {
       files: best.files.map((f) => path.basename(f.path)),
       supportFiles: best.others.map((f) => path.basename(f.path)),
       source: "huggingface",
+      // laya checkpoint 的权重就住在 HF 缓存里（worker 自己下的），这里是它唯一会
+      // 出现在「已安装」列表的位置 —— 不标的话用户会去点一个必然失败的「启动」。
+      special: specialModelFormat(best.dir) ?? undefined,
     });
   }
 

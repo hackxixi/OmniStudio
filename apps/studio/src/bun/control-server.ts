@@ -209,7 +209,9 @@ async function handle(req: ControlRequest): Promise<ControlResponse> {
         repo,
         fileName,
         typeof payload.category === "string" ? (payload.category as never) : undefined,
-        (payload.source as "modelscope" | "huggingface") ?? "modelscope",
+        // 没指定平台就交给下载管理器按下载源路由决定（国内 ModelScope / 海外 Hugging Face）；
+        // HF 仓库 id 在 ModelScope 上没有时下载管理器会自己回退。
+        payload.source === "modelscope" || payload.source === "huggingface" ? payload.source : undefined,
         {
           size: Number.isFinite(sizeHint) && sizeHint > 0 ? sizeHint : null,
           explicit: payload.explicit === true,
@@ -420,15 +422,23 @@ function streamAgentRun(payload: Record<string, unknown>): Response {
     );
   }
 
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      const write = (line: Headless.HeadlessLine) => {
+      const write = (line: Headless.HeadlessLine | { type: "heartbeat" }) => {
         try {
           controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`));
         } catch {
           // 客户端断开：后面的行没人要了，runHeadlessAgent 会照常跑完（会话仍落库）。
         }
       };
+      /**
+       * 心跳：每 5 秒吐一行 `{"type":"heartbeat"}`。Bun 的连接 10 秒没有数据就会被掐断，
+       * 而模型预填充期间流里可能几十秒一行都没有 —— 本地小模型读 4～8K token 的提示就要
+       * 25～45 秒 —— 于是 `omi agent run` 以「socket connection was closed unexpectedly」失败，
+       * 应用里那一轮却还在跑、占着推理槽，后面排队的请求跟着超时。客户端忽略这种行。
+       */
+      heartbeat = setInterval(() => write({ type: "heartbeat" }), 5_000);
       void Headless.runHeadlessAgent({
         prompt,
         workspace: typeof payload.workspace === "string" ? payload.workspace : undefined,
@@ -449,12 +459,16 @@ function streamAgentRun(payload: Record<string, unknown>): Response {
           });
         })
         .finally(() => {
+          clearInterval(heartbeat);
           try {
             controller.close();
           } catch {
             // 已经关了
           }
         });
+    },
+    cancel() {
+      clearInterval(heartbeat);
     },
   });
   return new Response(stream, { headers: { "content-type": "application/x-ndjson" } });

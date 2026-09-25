@@ -1,7 +1,7 @@
 /**
- * llama.cpp 的 flash attention 开关（`--flash-attn`）与模型加载模式（`--load-mode`）的
- * 版本探测：两者都只能从 `--help` 的输出里认出来，所以**合并成一次子进程调用**
- * （`probeServerHelp`），而不是为了两个开关各跑一遍。
+ * llama.cpp 的 flash attention 开关（`--flash-attn`）、模型加载模式（`--load-mode`）与
+ * `--kv-unified` 的版本探测：它们都只能从 `--help` 的输出里认出来，所以**合并成一次
+ * 子进程调用**（`probeServerHelp`），而不是为了每个开关各跑一遍。
  *
  * 为什么要探测而不是赌版本：
  *  - 新版（本机 llama.cpp 实测）是**三态**：`-fa, --flash-attn [on|off|auto]`
@@ -18,6 +18,25 @@
  * （哪怕是 "none"）落缓存 —— "none" 是真实答案，重试没有意义。
  */
 
+import { existsSync } from "fs";
+
+import { llamaCppBinaryPath } from "../engine-paths";
+
+/** 托管安装之外、按固定路径查找的 llama-server（Homebrew 两种前缀）。 */
+export const COMMON_LLAMA_SERVER_PATHS = [
+  "/opt/homebrew/bin/llama-server",
+  "/usr/local/bin/llama-server",
+];
+
+/**
+ * 同步路径（`buildCommandLine` / 计划 key / 预览 RPC）读探测缓存时用的二进制路径：
+ * 托管安装 → Homebrew → 裸名。缓存按路径分，所以**所有同步读者必须用同一条规则**，
+ * 否则「复制的命令」与预览、实际启动各读各的缓存条目、互相对不上。
+ */
+export function defaultLlamaServerBinary(): string {
+  return [llamaCppBinaryPath(), ...COMMON_LLAMA_SERVER_PATHS].find((p) => existsSync(p)) ?? "llama-server";
+}
+
 /** 真值表（llama-server --help 实测行）：
  *   `-fa, --flash-attn [on|off|auto]    set Flash Attention use ('on', 'off', or 'auto', default: 'auto')`
  */
@@ -27,6 +46,46 @@ export type FlashAttnSupport = "tristate" | "boolean" | "none";
 export type ServerHelpSupport = {
   loadMode: "load-mode" | "legacy" | "unknown";
   flashAttn: FlashAttnSupport;
+  /**
+   * 是否认 `--kv-unified`（`-kvu`）。不认的老版在 `--parallel N` 下会把 `--ctx-size`
+   * 按 slot 均分，每个请求只剩 1/N 的窗口 —— 规划器据此决定按哪种口径计价。
+   * 可选只是为了兼容旧调用方（测试注缓存）；缺省按不支持处理（不赌开关存在）。
+   */
+  kvUnified?: boolean;
+  /**
+   * 是否认 `-rea, --reasoning [on|off|auto]`（按模型「思考开关」直接交给引擎）。
+   * 不认的老版回落 `--chat-template-kwargs '{"enable_thinking":false}'`（只有关能这样表达）。
+   * 可选同 kvUnified：缺省按不支持处理。
+   */
+  reasoning?: boolean;
+  /**
+   * 显存相关的几个开关（同一次 --help）。缺省一律按不支持处理（不赌开关存在）：
+   *  - `fit`：`-fit, --fit [on|off]` —— llama.cpp 自己按设备空闲显存调整「没显式给」的参数
+   *    （层数 / 张量放置）。新版**默认 on**：计划已经证明装得下时它仍会为了留余量把约 1 GiB
+   *    挪出 GPU（Unsloth 实测），所以装得下要显式 `--fit off`，证明不了才交给它 `--fit on`；
+   *  - `nCpuMoe`：`-ncmoe, --n-cpu-moe N` —— 前 N 层的 MoE 专家权重放 CPU；
+   *  - `overrideTensor`：`-ot, --override-tensor` —— 没有 --n-cpu-moe 的版本用正则把专家张量放 CPU；
+   *  - `noContextShift`：`--no-context-shift` —— 超窗时报错而不是悄悄丢掉前面的对话。
+   */
+  fit?: boolean;
+  nCpuMoe?: boolean;
+  overrideTensor?: boolean;
+  noContextShift?: boolean;
+};
+
+/** 显存相关开关的支持形态（ServerHelpSupport 的后四项，缓存与同步读都按这一组）。 */
+export type MemoryFlagSupport = {
+  fit: boolean;
+  nCpuMoe: boolean;
+  overrideTensor: boolean;
+  noContextShift: boolean;
+};
+
+const NO_MEMORY_FLAGS: MemoryFlagSupport = {
+  fit: false,
+  nCpuMoe: false,
+  overrideTensor: false,
+  noContextShift: false,
 };
 
 /** `--load-mode` 的 `--help` 识别（照抄 llama-load-mode.ts 的正则，保持两处判定一致）。 */
@@ -48,11 +107,46 @@ function parseFlashAttnSupportText(help: string): FlashAttnSupport {
   return "none";
 }
 
-/** 一次 `--help` 解析出两个开关的支持形态。 */
+/**
+ * `--kv-unified` 的 `--help` 识别：`-kvu, --kv-unified` 那一行。
+ * 注意 `--no-kv-unified`（反向开关）不能算数 —— 它前面是 `no-` 而不是空白 / 逗号，
+ * 所以锚在「行首 / 空白 / 逗号」之后。
+ */
+function parseKvUnifiedSupportText(help: string): boolean {
+  return /(^|[\s,])--kv-unified\b/m.test(help) || /(^|[\s,])-kvu\b/m.test(help);
+}
+
+/**
+ * `--reasoning` 的 `--help` 识别：`-rea, --reasoning [on|off|auto]` 那一行。
+ * 同名前缀的 `--reasoning-format` / `--reasoning-budget` / `--reasoning-effort` 是另外的开关
+ * （老版早就有 --reasoning-format），不能算数 —— 所以要求后面不再跟 `-` / 单词字符。
+ */
+function parseReasoningSupportText(help: string): boolean {
+  return /(^|[\s,])--reasoning(?![-\w])/m.test(help);
+}
+
+/**
+ * 显存相关开关的 `--help` 识别。每个都要排除同名前缀的兄弟开关：
+ * `--fit-target` / `--fit-ctx`（不是 --fit 本身）、`--n-cpu-moe-draft` / `--override-tensor-draft`
+ * （草稿模型那份）—— 所以后面不能再跟 `-` / 单词字符（与 --reasoning 同一种锚法）。
+ */
+function parseMemoryFlagsText(help: string): MemoryFlagSupport {
+  return {
+    fit: /(^|[\s,])--fit(?![-\w])/m.test(help),
+    nCpuMoe: /(^|[\s,])--n-cpu-moe(?![-\w])/m.test(help),
+    overrideTensor: /(^|[\s,])--override-tensor(?![-\w])/m.test(help),
+    noContextShift: /(^|[\s,])--no-context-shift(?![-\w])/m.test(help),
+  };
+}
+
+/** 一次 `--help` 解析出各开关的支持形态。 */
 export function parseServerHelpSupport(help: string): ServerHelpSupport {
   return {
     loadMode: parseLoadModeSupportText(help),
     flashAttn: parseFlashAttnSupportText(help),
+    kvUnified: parseKvUnifiedSupportText(help),
+    reasoning: parseReasoningSupportText(help),
+    ...parseMemoryFlagsText(help),
   };
 }
 
@@ -75,10 +169,53 @@ export function flashAttnArgs(setting: string | null | undefined, support: Flash
   return [];
 }
 
+/**
+ * 按模型的思考开关 → 启动参数（仅聊天实例）。
+ *
+ *  - auto / 没设：一个参数都不发（交给模板默认，与加这个开关前逐字节一致）；
+ *  - 认 `--reasoning`：原样发 `--reasoning on|off`；
+ *  - 不认（老版 / 没探过）：关 → `--chat-template-kwargs {"enable_thinking":false}`（Qwen3 /
+ *    GLM 等模板都认这个 kwarg，老版也有这个开关）；开 → 不发（模板默认本来就是开）。
+ */
+export function reasoningArgs(mode: string | null | undefined, supported: boolean): string[] {
+  if (mode !== "on" && mode !== "off") return [];
+  if (supported) return ["--reasoning", mode];
+  return mode === "off" ? ["--chat-template-kwargs", JSON.stringify({ enable_thinking: false })] : [];
+}
+
 // —— 进程级缓存（llama.ts 持有） ——
 
 const flashAttnSupportCache = new Map<string, FlashAttnSupport>();
 const loadModeSupportCache = new Map<string, ServerHelpSupport["loadMode"]>();
+const kvUnifiedSupportCache = new Map<string, boolean>();
+const reasoningSupportCache = new Map<string, boolean>();
+const memoryFlagsCache = new Map<string, MemoryFlagSupport>();
+
+/** 探测结果里的显存开关收成完整一组（缺的字段按不支持）。 */
+function memoryFlagsOf(support: ServerHelpSupport): MemoryFlagSupport | null {
+  if (
+    support.fit === undefined &&
+    support.nCpuMoe === undefined &&
+    support.overrideTensor === undefined &&
+    support.noContextShift === undefined
+  ) {
+    return null;
+  }
+  return {
+    fit: support.fit ?? false,
+    nCpuMoe: support.nCpuMoe ?? false,
+    overrideTensor: support.overrideTensor ?? false,
+    noContextShift: support.noContextShift ?? false,
+  };
+}
+
+/**
+ * 同步读已探测到的显存开关支持（没探过 = 全部不支持）。与其它开关同一规则：
+ * 没探过就一个都不发，界面复制的命令与「不加这些开关之前」逐字节一致。
+ */
+export function cachedMemoryFlagSupport(binaryPath: string): MemoryFlagSupport {
+  return memoryFlagsCache.get(binaryPath) ?? NO_MEMORY_FLAGS;
+}
 
 export function cachedFlashAttnSupport(binaryPath: string): FlashAttnSupport | null {
   return flashAttnSupportCache.get(binaryPath) ?? null;
@@ -88,31 +225,61 @@ export function cachedLoadModeSupport(binaryPath: string): ServerHelpSupport["lo
   return loadModeSupportCache.get(binaryPath) ?? null;
 }
 
+/** 同步读已探测到的 `--kv-unified` 支持（null = 还没探过）。 */
+export function cachedKvUnifiedSupport(binaryPath: string): boolean | null {
+  return kvUnifiedSupportCache.get(binaryPath) ?? null;
+}
+
+/** 同步读已探测到的 `--reasoning` 支持（null = 还没探过）。 */
+export function cachedReasoningSupport(binaryPath: string): boolean | null {
+  return reasoningSupportCache.get(binaryPath) ?? null;
+}
+
 /**
  * 同步读已缓存的合并探测结果（null = 还没探过）。
  * llama.ts 的 `cachedLoadModeSupport` 委托到这里，避免两份 Map 各自演化。
  */
 export function cachedServerHelpSupport(
   binaryPath: string,
-): { loadMode: ServerHelpSupport["loadMode"]; flashAttn: FlashAttnSupport } | null {
+): {
+  loadMode: ServerHelpSupport["loadMode"];
+  flashAttn: FlashAttnSupport;
+  kvUnified: boolean;
+  reasoning: boolean;
+} | null {
   const load = loadModeSupportCache.get(binaryPath);
   const flash = flashAttnSupportCache.get(binaryPath);
-  if (load === undefined && flash === undefined) return null;
-  return { loadMode: load ?? "unknown", flashAttn: flash ?? "none" };
+  const kvu = kvUnifiedSupportCache.get(binaryPath);
+  const rea = reasoningSupportCache.get(binaryPath);
+  if (load === undefined && flash === undefined && kvu === undefined && rea === undefined) return null;
+  return {
+    loadMode: load ?? "unknown",
+    flashAttn: flash ?? "none",
+    kvUnified: kvu ?? false,
+    reasoning: rea ?? false,
+  };
 }
 
 export function clearServerHelpSupportCache(): void {
   flashAttnSupportCache.clear();
   loadModeSupportCache.clear();
+  kvUnifiedSupportCache.clear();
+  reasoningSupportCache.clear();
+  memoryFlagsCache.clear();
 }
 
 /**
  * 同步把一份探测结果写进缓存（仅供测试注用；生产路径永远走 probeServerHelp）。
- * loadMode === "unknown" 不落缓存（与 probeServerHelp 同一规则），flashAttn 三种都落。
+ * loadMode === "unknown" 不落缓存（与 probeServerHelp 同一规则），flashAttn 三种都落；
+ * kvUnified 缺省不落（等价于「没探过」→ 不支持）。
  */
 export function setCachedServerHelpSupport(binaryPath: string, support: ServerHelpSupport): void {
   if (support.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, support.loadMode);
   flashAttnSupportCache.set(binaryPath, support.flashAttn);
+  if (support.kvUnified !== undefined) kvUnifiedSupportCache.set(binaryPath, support.kvUnified);
+  if (support.reasoning !== undefined) reasoningSupportCache.set(binaryPath, support.reasoning);
+  const mem = memoryFlagsOf(support);
+  if (mem !== null) memoryFlagsCache.set(binaryPath, mem);
 }
 
 /**
@@ -127,8 +294,11 @@ export function setCachedServerHelpSupport(binaryPath: string, support: ServerHe
 export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSupport> {
   const cachedFlash = flashAttnSupportCache.get(binaryPath);
   const cachedLoad = loadModeSupportCache.get(binaryPath);
-  if (cachedFlash && cachedLoad) {
-    return { loadMode: cachedLoad, flashAttn: cachedFlash };
+  const cachedKvu = kvUnifiedSupportCache.get(binaryPath);
+  const cachedRea = reasoningSupportCache.get(binaryPath);
+  const cachedMem = memoryFlagsCache.get(binaryPath);
+  if (cachedFlash && cachedLoad && cachedKvu !== undefined && cachedRea !== undefined && cachedMem) {
+    return { loadMode: cachedLoad, flashAttn: cachedFlash, kvUnified: cachedKvu, reasoning: cachedRea, ...cachedMem };
   }
 
   let help = "";
@@ -161,11 +331,17 @@ export async function probeServerHelp(binaryPath: string): Promise<ServerHelpSup
     return {
       loadMode: cachedLoad ?? "unknown",
       flashAttn: cachedFlash ?? "none",
+      kvUnified: cachedKvu ?? false,
+      reasoning: cachedRea ?? false,
+      ...(cachedMem ?? NO_MEMORY_FLAGS),
     };
   }
 
   const parsed = parseServerHelpSupport(help);
   if (parsed.loadMode !== "unknown") loadModeSupportCache.set(binaryPath, parsed.loadMode);
   flashAttnSupportCache.set(binaryPath, parsed.flashAttn);
+  kvUnifiedSupportCache.set(binaryPath, parsed.kvUnified ?? false);
+  reasoningSupportCache.set(binaryPath, parsed.reasoning ?? false);
+  memoryFlagsCache.set(binaryPath, memoryFlagsOf(parsed) ?? NO_MEMORY_FLAGS);
   return parsed;
 }

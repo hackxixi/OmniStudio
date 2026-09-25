@@ -16,7 +16,7 @@ import { mkdirSync, existsSync, writeFileSync } from "fs";
 import path from "path";
 
 import { getSetting } from "./db/settings";
-import { ensureServerReady, getChatBaseUrl, maxOutputTokens } from "./chat";
+import { ensureServerReady, getChatBaseUrl, resolveMaxOutputTokens } from "./chat";
 import { getChatModelLabel, getChatProviderLabel, getChatRequestModelId } from "./chat-model";
 import { getImageGenConfig } from "./image-gen";
 import { anyReadyModel } from "./bg-remove";
@@ -173,10 +173,13 @@ export async function completeText(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey && apiKey !== "EMPTY") headers.Authorization = `Bearer ${apiKey}`;
 
+  const fullMessages = system ? [{ role: "system", content: system }, ...messages] : messages;
   const payload: Record<string, unknown> = {
     model,
-    messages: system ? [{ role: "system", content: system }, ...messages] : messages,
-    max_tokens: params.maxTokens ?? maxOutputTokens(),
+    messages: fullMessages,
+    max_tokens:
+      params.maxTokens ??
+      (await resolveMaxOutputTokens({ base, model, headers, promptMessages: fullMessages })),
     stream: false,
   };
   if (typeof params.temperature === "number") payload.temperature = params.temperature;
