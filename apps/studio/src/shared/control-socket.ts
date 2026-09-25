@@ -36,7 +36,8 @@ export function controlSocketPathFor(
 ): string {
   if (opts?.override) return opts.override;
 
-  const limit = opts?.platform === "darwin" ? 103 : 107;
+  // 没传 platform 就按当前平台：真实调用方都不传，默认值错了 macOS 上 104～107 字节的路径仍会炸。
+  const limit = (opts?.platform ?? process.platform) === "darwin" ? 103 : 107;
   const defaultPath = join(dataDir, SOCKET_NAME);
   if (byteLength(defaultPath) <= limit) return defaultPath;
 

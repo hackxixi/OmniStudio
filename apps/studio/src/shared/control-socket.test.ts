@@ -80,3 +80,13 @@ describe("controlSocketPathFor", () => {
     }
   });
 });
+
+test("不传 platform 时按当前平台的上限算（真实调用方都不传）", () => {
+  // 长度恰好卡在 macOS 上限与 Linux 上限之间的路径
+  const name = "/omni-control.sock";
+  const dir = `/${"d".repeat(105 - name.length - 1)}`;
+  expect(Buffer.byteLength(`${dir}${name}`)).toBe(105);
+  const result = controlSocketPathFor(dir, { tmpDir: "/tmp" });
+  if (process.platform === "darwin") expect(result.startsWith("/tmp/omni-")).toBe(true);
+  else expect(result).toBe(`${dir}${name}`);
+});
