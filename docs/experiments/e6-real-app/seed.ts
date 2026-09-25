@@ -22,7 +22,35 @@ const workspace = process.env.WORKSPACE;
 if (!dataDir || !workspace) throw new Error("need OMNI_DATA_DIR and WORKSPACE");
 const strategy = process.env.STRATEGY === "routed" ? "routed" : "classic";
 
+/**
+ * 云端验收这一轮（VERIFY=report|escalate）：选组仍用本地 JEV（local-url），验收强制走云端 JEV
+ * （CLOUD_JEV_BASE / CLOUD_JEV_KEY），不通过时交给升级厂商（ESCALATE_BASE / ESCALATE_MODEL，建一个自定义云厂商）。
+ * 不设 VERIFY 时与之前完全一样：JEV 走 cloud 后端指向本地 llama_jev_server。
+ */
+const verify = process.env.VERIFY === "report" || process.env.VERIFY === "escalate" ? process.env.VERIFY : "off";
+const localJev = process.env.JEV_BASE ?? "http://127.0.0.1:18133";
+const jevSettings: Record<string, string> =
+  verify === "off"
+    ? { SYSTEMONE_BACKEND: "cloud", SYSTEMONE_CLOUD_BASE_URL: localJev, SYSTEMONE_CLOUD_API_KEY: "local-jev", SYSTEMONE_LOCAL_BASE_URL: "" }
+    : {
+        SYSTEMONE_BACKEND: "local",
+        SYSTEMONE_LOCAL_BASE_URL: localJev,
+        SYSTEMONE_CLOUD_BASE_URL: process.env.CLOUD_JEV_BASE ?? "",
+        SYSTEMONE_CLOUD_API_KEY: process.env.CLOUD_JEV_KEY ?? "",
+      };
+let escalate: Record<string, string> = { AGENT_ESCALATE_PROVIDER_ID: "", AGENT_ESCALATE_MODEL: "" };
+if (verify === "escalate" && process.env.ESCALATE_BASE && process.env.ESCALATE_MODEL) {
+  const CloudProviders = await import("../../../apps/studio/src/bun/cloud-providers");
+  const existing = CloudProviders.listCloudProviders().providers.find((p) => p.name === "E6 升级");
+  const id = existing?.id ?? CloudProviders.createCloudProvider({ name: "E6 升级", baseUrl: process.env.ESCALATE_BASE }).id ?? "";
+  CloudProviders.updateCloudProvider(id, { baseUrl: process.env.ESCALATE_BASE, apiKey: process.env.ESCALATE_KEY ?? "EMPTY", models: [{ id: process.env.ESCALATE_MODEL }] });
+  escalate = { AGENT_ESCALATE_PROVIDER_ID: id, AGENT_ESCALATE_MODEL: process.env.ESCALATE_MODEL };
+}
+
 updateSettings({
+  ...jevSettings,
+  ...escalate,
+  AGENT_VERIFY_MODE: verify,
   SERVER_MODE: "remote",
   VLLM_API_BASE: process.env.CHAT_BASE ?? "http://127.0.0.1:18131/v1",
   VLLM_API_KEY: "EMPTY",
@@ -30,9 +58,6 @@ updateSettings({
   CHAT_MODEL: "qwen3.5-4b",
   AGENT_TOOL_STRATEGY: strategy,
   AGENT_THINKING_LEVEL: "off",
-  SYSTEMONE_BACKEND: "cloud",
-  SYSTEMONE_CLOUD_BASE_URL: process.env.JEV_BASE ?? "http://127.0.0.1:18133",
-  SYSTEMONE_CLOUD_API_KEY: "local-jev",
   MEMORY_ENABLED: "1",
 });
 
@@ -58,4 +83,4 @@ for (const [rel, content] of Object.entries(files)) {
   mkdirSync(path.dirname(path.join(workspace, rel)), { recursive: true });
   writeFileSync(path.join(workspace, rel), content);
 }
-console.log(`seeded ${dataDir} (strategy=${strategy})`);
+console.log(`seeded ${dataDir} (strategy=${strategy}, verify=${verify})`);
