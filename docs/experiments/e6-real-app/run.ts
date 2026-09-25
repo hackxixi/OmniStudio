@@ -6,17 +6,28 @@
  * 联网 / 生成 / 知识库的结果取决于外部服务或未预置的数据，这些题只检查「调了哪个工具、参数对不对」，
  * 不检查回答内容。笔记、记忆、工作区文件、生图记录都由 seed.ts 预置，这些题连回答一起检查。
  *
- * 用法：OMNI_DATA_DIR=<目录> WORKSPACE=<目录> TAG=routed bun run.ts [任务 id 前缀]
+ * 真实 App 与 E5 桩工具对不上的三处，在 REAL_APP_OVERRIDES 里按任务 id 覆盖 steps / answer
+ * （E5 的 tasks.ts 保持原样，供桩版 E5 复用）：
+ * - `m-export-cat`：真实 App 的生图记录 ref 是 `gen/xxx.png`（媒体库相对路径）而非桩里的 `img_prev_N`；
+ * - `m-release-poster`：真实 web_search 搜到的是当时实际的 Bun 版本（不是桩写死的 1.4.7），
+ *   只要求 prompt 提到 Bun 且是横版；
+ * - `m-note-web`：真实 App 保存笔记时会写一条带 `note_read #<id>` 的记忆索引，模型可以直接 `note_read`
+ *   而不必先检索；联网搜到的 Qdrant 版本也不是桩里的 1.15.2，所以不核对版本号。
+ *
+ * 用法：OMNI_DATA_DIR=<目录> WORKSPACE=<目录> TAG=routed [REPEAT=3] bun run.ts [任务 id 前缀]
+ * REPEAT>1 时每题跑 N 次，结果行带 rep 字段（1..N），汇总交给 summarize.ts。
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
-import { TASKS, score, type Call, type Task } from "../e5-tool-disclosure/tasks";
+import { TASKS, score, type Call, type Step, type Task } from "../e5-tool-disclosure/tasks";
 import { READ_ONLY } from "../e5-tool-disclosure/tools";
 
 const WORKSPACE = process.env.WORKSPACE!;
 const TAG = process.env.TAG ?? "?";
 const OUT = process.env.OUT ?? "results-e6.jsonl";
+const REPEAT = Math.max(1, Number(process.env.REPEAT ?? 1) || 1);
 const OMI = path.resolve(import.meta.dir, "../../../apps/studio/bin/omi.ts");
 
 /** 真实 App 里不存在的能力。 */
@@ -28,13 +39,59 @@ const unsupported = (t: Task) => t.steps.some((s) => Object.keys(s).every((k) =>
 const ANSWER_IS_ENOUGH = new Set(["memory-recall", "note-lookup"]);
 /** 数据已预置、回答可以核对的题；其余只核对工具与参数。 */
 const CHECK_ANSWER = new Set(["note-lookup", "memory-recall", "file-read", "file-find", "l1-storm", "l1-poem", "l1-divide", "l1-translate"]);
+/** 横版：显式比例，或者 width > height（E5 tasks.ts 里同名检查没有导出，这里复制一份）。 */
+const landscape = (a: Record<string, unknown>) =>
+  /16:9|3:2|4:3|landscape|横/i.test(String(a.aspect_ratio ?? "")) || Number(a.width) > Number(a.height);
+
+/**
+ * 对齐真实 App 的覆盖：只改与桩有差异的题（生图 ref 格式、真实联网结果、经记忆索引直接读笔记），
+ * 其余任务用 E5 原样。
+ */
+const REAL_APP_OVERRIDES: Record<string, { steps: Step[]; answer?: RegExp[] }> = {
+  // 真实生图记录的 ref 是 `gen/cat-astronaut.png` 这类媒体库相对路径（seed.ts 预置），
+  // 桩里是计数器生成的 `img_prev_N`；两者都放行。
+  "m-export-cat": {
+    steps: [
+      { media_search: { query: /猫|cat/i } },
+      { media_export: { refs: /cat-astronaut|img_/, save_to: /docs\/images/ } },
+    ],
+  },
+  // 真实网络搜到的 Bun 版本是当时实际的（1.4.2 / 1.5.0 …），不是桩里的 1.4.7：
+  // 不再核对 prompt 里的版本号，只要求提到 Bun 且横版。
+  "m-release-poster": {
+    steps: [
+      { web_search: { query: /bun/i } },
+      { generate_image: { prompt: /bun/i, _: landscape } },
+    ],
+  },
+  // 真实 App 的笔记会落一条记忆索引（「笔记《向量数据库选型」… note_read #1」，被自动拼进用户消息），
+  // 模型可以跳过检索直接 note_read；联网结果里的 Qdrant 版本也不固定，不核对版本号。
+  "m-note-web": {
+    steps: [
+      { note_read: {}, note_search: { query: /向量|vector|数据库/i }, recall: { query: /向量|vector|数据库/i } },
+      { web_search: { query: /qdrant/i } },
+    ],
+    answer: [],
+  },
+};
 
 const FILES: Record<string, string> = {
   "notes/todo.md": "- [x] 提交周报\n- [ ] 报销差旅发票\n- [ ] 预约牙医\n- [x] 续费域名\n",
   "docs/plan.md": "# 上线计划\n\n- 功能冻结：9 月 30 日\n- 上线日期：10 月 8 日\n- 负责人：张伟\n",
   "finance/budget-2026.xlsx": "placeholder spreadsheet",
 };
+/**
+ * 每题开始前把工作区**清空**再写回预置文件。只覆盖预置文件是不够的：前面题目（或前几轮）写出的文件会留下来，
+ * E6 v3 里 `notes/travel.md` 就是这样残留的（一份模型编的住宿标准），于是「查知识库再写文件」
+ * 那题读到它、把它当成了查到的结果。工作区是专供本实验的临时目录，拒绝清空根目录 / 家目录这类路径。
+ */
 function resetWorkspace() {
+  const root = path.resolve(WORKSPACE);
+  if (root === "/" || root === path.resolve(homedir()) || root.split(path.sep).filter(Boolean).length < 3) {
+    throw new Error(`WORKSPACE 看起来不是实验专用目录，拒绝清空：${root}`);
+  }
+  mkdirSync(root, { recursive: true });
+  for (const entry of readdirSync(root)) rmSync(path.join(root, entry), { recursive: true, force: true });
   for (const [rel, content] of Object.entries(FILES)) {
     mkdirSync(path.dirname(path.join(WORKSPACE, rel)), { recursive: true });
     writeFileSync(path.join(WORKSPACE, rel), content);
@@ -44,58 +101,60 @@ function resetWorkspace() {
 type Line = { type: string; event?: { kind: string; toolName?: string; args?: string | null; output?: string | null }; text?: string; ok?: boolean; error?: string };
 
 const only = process.argv[2];
-const tasks = TASKS.filter((t) => !unsupported(t) && (!only || t.id.startsWith(only)));
+const tasks = TASKS.filter((t) => !unsupported(t) && (!only || t.id.startsWith(only))).map((t) => ({ ...t, ...REAL_APP_OVERRIDES[t.id] }));
 let pass = 0;
 let ms = 0;
 for (const task of tasks) {
-  resetWorkspace();
-  const t0 = performance.now();
-  const r = spawnSync("bun", [OMI, "agent", "run", task.request, "--json", "--workspace", WORKSPACE, "--timeout", "600000"], {
-    encoding: "utf8",
-    env: process.env,
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  const elapsed = Math.round(performance.now() - t0);
-  const lines = r.stdout
-    .split("\n")
-    .filter(Boolean)
-    .flatMap((l) => {
-      try {
-        return [JSON.parse(l) as Line];
-      } catch {
-        return [];
-      }
+  for (let rep = 1; rep <= REPEAT; rep++) {
+    resetWorkspace();
+    const t0 = performance.now();
+    const r = spawnSync("bun", [OMI, "agent", "run", task.request, "--json", "--workspace", WORKSPACE, "--timeout", "600000"], {
+      encoding: "utf8",
+      env: process.env,
+      maxBuffer: 64 * 1024 * 1024,
     });
-  const calls: Call[] = [];
-  let routing = "";
-  for (const l of lines) {
-    const e = l.event;
-    if (l.type !== "event" || !e) continue;
-    if (e.kind === "tool_start" && e.toolName) {
-      let args: Record<string, unknown> = {};
-      try {
-        args = e.args ? (JSON.parse(e.args) as Record<string, unknown>) : {};
-      } catch {
-        args = { _raw: e.args };
+    const elapsed = Math.round(performance.now() - t0);
+    const lines = r.stdout
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((l) => {
+        try {
+          return [JSON.parse(l) as Line];
+        } catch {
+          return [];
+        }
+      });
+    const calls: Call[] = [];
+    let routing = "";
+    for (const l of lines) {
+      const e = l.event;
+      if (l.type !== "event" || !e) continue;
+      if (e.kind === "tool_start" && e.toolName) {
+        let args: Record<string, unknown> = {};
+        try {
+          args = e.args ? (JSON.parse(e.args) as Record<string, unknown>) : {};
+        } catch {
+          args = { _raw: e.args };
+        }
+        calls.push({ tool: e.toolName, args, result: "" });
       }
-      calls.push({ tool: e.toolName, args, result: "" });
+      if (e.kind === "status" && e.toolName === "tool_routing") routing = e.output ?? "";
     }
-    if (e.kind === "status" && e.toolName === "tool_routing") routing = e.output ?? "";
+    const result = lines.find((l) => l.type === "result");
+    const answer = result?.text ?? "";
+    const answerOk = task.answer.every((re) => re.test(answer));
+    const scored =
+      ANSWER_IS_ENOUGH.has(task.id) && answerOk && !calls.some((c) => !READ_ONLY.has(c.tool))
+        ? { pass: true, why: "" }
+        : score(CHECK_ANSWER.has(task.id) ? task : { ...task, answer: [] }, calls, answer, READ_ONLY);
+    const ok = scored.pass && result?.ok !== false;
+    pass += ok ? 1 : 0;
+    ms += elapsed;
+    appendFileSync(
+      OUT,
+      `${JSON.stringify({ tag: TAG, rep, task: task.id, kind: task.kind, pass: ok, why: result?.ok === false ? `run failed: ${result.error}` : scored.why, calls, routing, answer: answer.slice(0, 400), ms: elapsed })}\n`,
+    );
+    console.log(`${TAG} ${task.id.padEnd(20)} ${REPEAT > 1 ? `[${rep}] ` : ""}${ok ? "PASS" : "fail"} ${String(elapsed).padStart(6)}ms [${calls.map((c) => c.tool).join(" → ")}] ${routing ? `(${routing}) ` : ""}${ok ? "" : scored.why || result?.error || ""}`);
   }
-  const result = lines.find((l) => l.type === "result");
-  const answer = result?.text ?? "";
-  const answerOk = task.answer.every((re) => re.test(answer));
-  const scored =
-    ANSWER_IS_ENOUGH.has(task.id) && answerOk && !calls.some((c) => !READ_ONLY.has(c.tool))
-      ? { pass: true, why: "" }
-      : score(CHECK_ANSWER.has(task.id) ? task : { ...task, answer: [] }, calls, answer, READ_ONLY);
-  const ok = scored.pass && result?.ok !== false;
-  pass += ok ? 1 : 0;
-  ms += elapsed;
-  appendFileSync(
-    OUT,
-    `${JSON.stringify({ tag: TAG, task: task.id, kind: task.kind, pass: ok, why: result?.ok === false ? `run failed: ${result.error}` : scored.why, calls, routing, answer: answer.slice(0, 400), ms: elapsed })}\n`,
-  );
-  console.log(`${TAG} ${task.id.padEnd(20)} ${ok ? "PASS" : "fail"} ${String(elapsed).padStart(6)}ms [${calls.map((c) => c.tool).join(" → ")}] ${routing ? `(${routing}) ` : ""}${ok ? "" : scored.why || result?.error || ""}`);
 }
-console.log(`== ${TAG}: ${pass}/${tasks.length} (${Math.round((pass / tasks.length) * 100)}%)  avg ${(ms / tasks.length / 1000).toFixed(1)}s`);
+console.log(`== ${TAG}: ${pass}/${tasks.length * REPEAT} (${Math.round((pass / (tasks.length * REPEAT)) * 100)}%)  avg ${(ms / (tasks.length * REPEAT) / 1000).toFixed(1)}s`);

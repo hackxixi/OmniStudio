@@ -37,7 +37,9 @@ const originalSettings = Object.fromEntries(
   TOUCHED_SETTINGS.map((key) => [key, getSetting(key)]),
 );
 
-const ctx = { workspace, allowShell: false };
+// 交互式会话（有人看界面）：askUser 在场。缺配置时 generate_image 才会弹窗；
+// 无人值守（没有 askUser）直接失败的路径由 media-setup.test.ts 覆盖。
+const ctx = { workspace, allowShell: false, askUser: async () => [] as string[][] };
 const tool = (name: string) => buildMediaGenTools(ctx).find((t) => t.name === name)!;
 /** 工具结果里只关心文本块（图片块暂未使用）。 */
 const textOf = (res: { content: readonly { type: string; text?: string }[] }) =>

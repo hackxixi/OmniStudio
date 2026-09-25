@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { groupQuestionCriteria, groupsFromProbabilities, routedArgProblem, routedTurnNote } from "./agent-routing";
+import {
+  fillAspectRatio,
+  groupQuestionCriteria,
+  groupsFromProbabilities,
+  inferAspectRatio,
+  REMEMBER_INTENT,
+  routedArgProblem,
+  routedTurnNote,
+} from "./agent-routing";
 
 describe("groupsFromProbabilities：JEV 概率 → 要加载的工具组", () => {
   test("第一名是 none 就只用核心工具", () => {
@@ -41,5 +49,38 @@ describe("routedArgProblem：占位参数兜底", () => {
     expect(routedArgProblem("web_search", { query: "NA 联赛赛程" })).toBeNull();
     expect(routedArgProblem("write_file", { path: "a.md", content: "TODO" })).toBeNull();
     expect(routedArgProblem("bash", { command: "" })).toBeNull();
+  });
+});
+
+describe("REMEMBER_INTENT：「记住…」类请求", () => {
+  test("中英文说法都认", () => {
+    expect(REMEMBER_INTENT.test("记住：我对花生过敏")).toBe(true);
+    expect(REMEMBER_INTENT.test("Please remember that my manager's name is Priya.")).toBe(true);
+    expect(REMEMBER_INTENT.test("以后推荐菜谱的时候注意")).toBe(true);
+  });
+  test("普通请求不误判", () => {
+    expect(REMEMBER_INTENT.test("我之前跟你说过我喜欢什么音乐来着？")).toBe(false);
+    expect(REMEMBER_INTENT.test("画一只猫")).toBe(false);
+  });
+});
+
+describe("画幅补全", () => {
+  test("从说法推断画幅", () => {
+    expect(inferAspectRatio("画一张雪山日出的竖版手机壁纸")).toBe("9:16");
+    expect(inferAspectRatio("生成一张庆祝版本发布的横版海报")).toBe("16:9");
+    expect(inferAspectRatio("做个方形头像")).toBe("1:1");
+    expect(inferAspectRatio("按 4:3 画一张图")).toBe("4:3");
+    expect(inferAspectRatio("画一只猫")).toBeNull();
+  });
+  test("没传画幅时原地补上；传了或给了宽高就不动；非生图工具不动", () => {
+    const args: Record<string, unknown> = { prompt: "海报" };
+    expect(fillAspectRatio("generate_image", args, "横版海报")).toBe("16:9");
+    expect(args.aspect_ratio).toBe("16:9");
+    const given: Record<string, unknown> = { prompt: "x", aspect_ratio: "1:1" };
+    expect(fillAspectRatio("generate_image", given, "横版")).toBeNull();
+    expect(given.aspect_ratio).toBe("1:1");
+    expect(fillAspectRatio("generate_image", { prompt: "x", width: 1024 }, "竖版")).toBeNull();
+    expect(fillAspectRatio("generate_video", { prompt: "海浪" }, "竖屏短视频")).toBe("9:16");
+    expect(fillAspectRatio("generate_speech", { text: "x" }, "竖版")).toBeNull();
   });
 });

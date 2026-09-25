@@ -77,13 +77,32 @@ const seen = {
    * 用请求体里的 arguments 原文数，而不是 tool_call id（stub 里 id 恒等于工具名）。
    */
   gCalls: [] as string[],
+  /** 云端验收（noul 问题）的调用次数与请求 state。 */
+  verifyCalls: 0,
+  verifyStates: [] as string[],
+  /** 升级用的「云端模型」桩收到的请求：工具名列表与 messages 原文。 */
+  escalateToolLists: [] as string[][],
+  escalateDumps: [] as string[],
 };
 
 let jevMode: JevMode = "none";
+/** 云端验收（questions.done，noul）返回的 p：场景 H 判不通过、I 判通过。 */
+let verifyP = 0.95;
 let script: ModelScript = "A";
 
 /** JEV 的 choice 答案：选组问题只有一道（`group`），候选是 none / creation / dev / mcp。 */
 function jevChoice(body: Record<string, unknown>): string | null {
+  const questions = (body.questions ?? {}) as Record<string, unknown>;
+  if ("done" in questions) {
+    // 云端验收：不计入选组调用次数（场景 E 断言「经典策略 JEV 零调用」只看选组）
+    seen.verifyCalls += 1;
+    seen.verifyStates.push(JSON.stringify(body.state ?? ""));
+    return JSON.stringify({
+      model: "stub-jev",
+      answers: { done: { type: "noul", noul: verifyP } },
+      usage: { input_tokens: 60, output_tokens: 0 },
+    });
+  }
   seen.jevCalls += 1;
   seen.jevRequests.push(body);
   seen.jevStates.push(typeof body.state === "string" ? body.state : JSON.stringify(body.state ?? ""));
@@ -227,6 +246,15 @@ const jev = Bun.serve({
   },
 });
 
+// 升级用的「云端模型」：另一个桩，收到请求就给一段收尾正文（断言看它有没有被调、收到了什么）。
+const cloudLlm = startStubLlm({
+  respond: async (request) => {
+    seen.escalateToolLists.push((request.tools ?? []).map((t) => t.function?.name ?? "").filter(Boolean));
+    seen.escalateDumps.push(JSON.stringify(request.messages));
+    return textChunks(request.model, "云端补做：已检查并补上遗漏的步骤。");
+  },
+});
+
 const base = `http://127.0.0.1:${llm.port}/v1`;
 const jevBase = `http://127.0.0.1:${jev.port}`;
 
@@ -278,6 +306,10 @@ function resetSeen() {
   seen.jevCalls = 0;
   seen.fQueries.length = 0;
   seen.gCalls.length = 0;
+  seen.verifyCalls = 0;
+  seen.verifyStates.length = 0;
+  seen.escalateToolLists.length = 0;
+  seen.escalateDumps.length = 0;
 }
 
 /** 轨迹里的选组状态说明（toolName=tool_routing）。 */
@@ -715,10 +747,113 @@ console.log(`推理服务：${base}（内置桩）；JEV 桩：${jevBase}/v1\n`)
 }
 
 // ---------------------------------------------------------------------------
+// 场景 H / I / J：云端验收（AGENT_VERIFY_MODE）
+// H：escalate + 判不通过 → 交给「云端模型」桩接着做，之后的回合换回本地；
+// I：report + 判通过 → 只记一条说明，不升级；
+// J：escalate + 判不通过 + 没配升级模型 → 说明里写明没配，保留本地结果。
+// ---------------------------------------------------------------------------
+{
+  const CloudProviders = await import("../src/bun/cloud-providers");
+  const created = CloudProviders.createCloudProvider({ name: "升级桩", baseUrl: `http://127.0.0.1:${cloudLlm.port}/v1` });
+  const providerId = created.id ?? "";
+  CloudProviders.updateCloudProvider(providerId, { apiKey: "stub-cloud-key", models: [{ id: "stub-cloud-model" }] });
+  const verifyEvents = (conversationId: number) =>
+    Agent.listAgentEvents(conversationId).filter((event) => event.kind === "status" && event.toolName === "verify");
+
+  // H
+  resetSeen();
+  updateSettings({
+    ...baseSettings(),
+    AGENT_TOOL_STRATEGY: "routed",
+    AGENT_VERIFY_MODE: "escalate",
+    AGENT_VERIFY_THRESHOLD: "0.9",
+    AGENT_ESCALATE_PROVIDER_ID: providerId,
+    AGENT_ESCALATE_MODEL: "stub-cloud-model",
+  });
+  jevMode = "none";
+  verifyP = 0.2;
+  script = "B";
+  const conversation = Chat.createConversation("routed H", "agent");
+  Agent.setConversationWorkspace(conversation.id, workspace);
+  const turn = await Agent.runAgentTurn({ conversationId: conversation.id, content: "routed-H：整理一下待办。", mode: "agent", workspace });
+  const events = verifyEvents(conversation.id);
+  check("H：回合整体跑完（returned ok）", turn.ok, turn.error);
+  check("H：本地回复之后调了一次云端验收", seen.verifyCalls === 1, String(seen.verifyCalls));
+  check(
+    "H：验收状态里带上了本轮请求与本地回复",
+    (seen.verifyStates[0] ?? "").includes("routed-H") && (seen.verifyStates[0] ?? "").includes("好的，收到"),
+    seen.verifyStates[0],
+  );
+  check(
+    "H：判不通过 → 交给「云端模型」桩接着做（恰好一次请求）",
+    seen.escalateToolLists.length === 1,
+    String(seen.escalateToolLists.length),
+  );
+  check(
+    "H：升级请求里带着「云端验收未通过」的要求，工具列表与本地一致（核心 + load_tools）",
+    (seen.escalateDumps[0] ?? "").includes("云端验收未通过") &&
+      ["web_search", "recall", "load_tools"].every((name) => (seen.escalateToolLists[0] ?? []).includes(name)),
+    seen.escalateToolLists[0]?.join(","),
+  );
+  check(
+    "H：轨迹里写明未通过、交给了哪个云端模型",
+    events.some((event) => (event.output ?? "").includes("未通过") && (event.output ?? "").includes("stub-cloud-model")),
+    events.map((event) => event.output).join(" | "),
+  );
+  // 下一轮换回本地：关掉验收再跑一轮，升级桩不该再收到请求，本地桩要收到
+  updateSettings({ AGENT_VERIFY_MODE: "off" });
+  const localBefore = seen.toolLists.length;
+  await Agent.runAgentTurn({ conversationId: conversation.id, content: "routed-H2：谢谢。", mode: "agent", workspace });
+  check(
+    "H：升级只管那一轮，下一轮回到本地模型",
+    seen.escalateToolLists.length === 1 && seen.toolLists.length > localBefore,
+    `cloud=${seen.escalateToolLists.length} local=${seen.toolLists.length - localBefore}`,
+  );
+  Agent.deleteConversationEvents(conversation.id);
+  Chat.deleteConversation(conversation.id);
+
+  // I
+  resetSeen();
+  updateSettings({ ...baseSettings(), AGENT_TOOL_STRATEGY: "routed", AGENT_VERIFY_MODE: "report" });
+  verifyP = 0.95;
+  const convI = Chat.createConversation("routed I", "agent");
+  Agent.setConversationWorkspace(convI.id, workspace);
+  const turnI = await Agent.runAgentTurn({ conversationId: convI.id, content: "routed-I：你好。", mode: "agent", workspace });
+  const eventsI = verifyEvents(convI.id);
+  check("I：回合整体跑完（returned ok）", turnI.ok, turnI.error);
+  check(
+    "I：report 模式判通过 → 记一条「通过」，不升级",
+    seen.verifyCalls === 1 && seen.escalateToolLists.length === 0 && eventsI.some((event) => (event.output ?? "").includes("通过")),
+    eventsI.map((event) => event.output).join(" | "),
+  );
+  Agent.deleteConversationEvents(convI.id);
+  Chat.deleteConversation(convI.id);
+
+  // J
+  resetSeen();
+  updateSettings({ ...baseSettings(), AGENT_TOOL_STRATEGY: "routed", AGENT_VERIFY_MODE: "escalate", AGENT_ESCALATE_PROVIDER_ID: "", AGENT_ESCALATE_MODEL: "" });
+  verifyP = 0.1;
+  const convJ = Chat.createConversation("routed J", "agent");
+  Agent.setConversationWorkspace(convJ.id, workspace);
+  const turnJ = await Agent.runAgentTurn({ conversationId: convJ.id, content: "routed-J：你好。", mode: "agent", workspace });
+  const eventsJ = verifyEvents(convJ.id);
+  check("J：回合整体跑完（returned ok）", turnJ.ok, turnJ.error);
+  check(
+    "J：没配升级模型 → 说明里写明，保留本地结果、不升级",
+    seen.escalateToolLists.length === 0 && eventsJ.some((event) => (event.output ?? "").includes("没配升级用的云端模型")),
+    eventsJ.map((event) => event.output).join(" | "),
+  );
+  Agent.deleteConversationEvents(convJ.id);
+  Chat.deleteConversation(convJ.id);
+  CloudProviders.deleteCloudProvider(providerId);
+}
+
+// ---------------------------------------------------------------------------
 // 清理
 // ---------------------------------------------------------------------------
 Agent.stopAllAgentRuns();
 llm.stop();
+cloudLlm.stop();
 jev.stop();
 rmSync(dataDir, { recursive: true, force: true });
 rmSync(workspace, { recursive: true, force: true });

@@ -412,16 +412,26 @@ const CANCEL_MESSAGE =
  * 调用方（generate_image）用返回的模型去生成；`ok: false` 时把 message 交回给模型。
  */
 export async function prepareImageGeneration(
-  opts: { signal?: AbortSignal; explicitModel?: string } = {},
+  opts: {
+    signal?: AbortSignal;
+    explicitModel?: string;
+    /**
+     * 有没有人能回答弹窗（默认有）。无人值守运行（`omi agent run`、自动化）没有人看界面：
+     * 弹窗会一直等到工具超时（实测 600 秒）。此时「多个候选选一个」自动取第一个，
+     * 「后端没配好」直接失败并说明去哪配，不弹窗。
+     */
+    interactive?: boolean;
+  } = {},
 ): Promise<{ ok: true; model: string } | { ok: false; message: string }> {
   const explicit = opts.explicitModel?.trim();
+  const interactive = opts.interactive !== false;
   let cfg = ImageGen.getImageGenConfig();
   let state = await checkImageReadiness(cfg, explicit || cfg.model);
 
   // 启用过云厂商的用户不该再被问一遍连接：地址与 Key 直接来自服务商。
   const cloud = cloudImageCandidates();
   if (!state.ok && state.reason === "missing-config" && cfg.backend === "api" && cloud.length > 0) {
-    if (cloud.length === 1) {
+    if (cloud.length === 1 || !interactive) {
       adoptCandidate(cloud[0]!);
     } else {
       const picked = await requestMediaSetup(
@@ -442,7 +452,17 @@ export async function prepareImageGeneration(
     state = await checkImageReadiness(cfg, explicit || cfg.model);
   }
 
-  if (!state.ok) {
+  // 无人值守：厂商 / 地址已配、只差选模型（choose-model）时跳过弹窗，交给下面的候选扫描自动选；
+  // 其余没就绪的情况（没配厂商、权重没下载）不弹窗、直接失败并说明去哪配。
+  if (!state.ok && !interactive && state.reason !== "choose-model") {
+    return {
+      ok: false,
+      message:
+        `${state.message.replace(/[。.]\s*$/, "")}。现在是无人值守运行，没法弹窗配置：` +
+        "请在「设置 → 云端模型」或「图像」页配好生图后端后再让我继续。本轮不要重试生图。",
+    };
+  }
+  if (!state.ok && interactive) {
     // 能自己扫候选的后端照旧（弹窗打开时会自动扫）；扫不了的（没选厂商）才把
     // 「云端模型」里的现成模型摆出来，让用户至少有的选。
     const canScan = cfg.backend === "comfyui" ? !!cfg.comfyBase : !!cfg.providerId;
@@ -479,7 +499,7 @@ export async function prepareImageGeneration(
         message: `生图后端仍未就绪：${detail}。先不要重试生图，等用户准备好再继续。`,
       };
     }
-    if (ready.length === 1) {
+    if (ready.length === 1 || !interactive) {
       adoptCandidate(ready[0]!);
     } else {
       const picked = await requestMediaSetup(

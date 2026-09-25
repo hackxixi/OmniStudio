@@ -1,6 +1,7 @@
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { existsSync, readFileSync, statSync } from "fs";
+import { controlSocketPathFor } from "../shared/control-socket";
 
 export const APP_NAME = "OmniStudio";
 export const APP_IDENTIFIER = "omni-studio.kunpengtalk.com";
@@ -81,7 +82,12 @@ function channelCandidates(): DataDirCandidate[] {
         // 该 channel 没用过
       }
     }
-    return { dir, hasSocket: existsSync(join(dir, "omni-control.sock")), dbMtime };
+    // 与主进程同一套算法：数据目录过长时 socket 落在临时目录而不是数据目录里。
+    return {
+      dir,
+      hasSocket: existsSync(controlSocketPathFor(dir, { override: process.env.OMNI_CONTROL_SOCKET })),
+      dbMtime,
+    };
   });
 }
 
@@ -143,7 +149,7 @@ export async function findLiveDataDir(): Promise<string | null> {
   let result: string | null = null;
   // 库最新的先试：正在跑的实例在写 WAL，通常就是它。
   for (const candidate of channelCandidates().sort((a, b) => b.dbMtime - a.dbMtime)) {
-    if (await pingSocket(join(candidate.dir, "omni-control.sock"))) {
+    if (await pingSocket(controlSocketPathFor(candidate.dir, { override: process.env.OMNI_CONTROL_SOCKET }))) {
       result = candidate.dir;
       break;
     }
@@ -156,12 +162,12 @@ export async function findLiveDataDir(): Promise<string | null> {
 export async function resolveControlSocket(): Promise<string | null> {
   if (process.env.OMNI_CONTROL_SOCKET) return process.env.OMNI_CONTROL_SOCKET;
   const live = await findLiveDataDir();
-  return live ? join(live, "omni-control.sock") : null;
+  return live ? controlSocketPathFor(live, { override: process.env.OMNI_CONTROL_SOCKET }) : null;
 }
 
-/** 与主进程 `paths.controlSocketPath` 相同的 socket 路径。 */
+/** 与主进程 `paths.controlSocketPath` 相同的 socket 路径（同一套算法，见 shared/control-socket.ts）。 */
 export function controlSocketPath(): string {
-  return process.env.OMNI_CONTROL_SOCKET ?? join(resolveDataDir(), "omni-control.sock");
+  return controlSocketPathFor(resolveDataDir(), { override: process.env.OMNI_CONTROL_SOCKET });
 }
 
 /** 仓库根 package.json 的版本（CLI 以源码方式运行时读取）。 */

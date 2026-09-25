@@ -28,7 +28,7 @@ import { getSetting, updateSettings } from "./db/settings";
 import { getChatBaseUrl, getHistory, ensureServerReady, titleFromMessage } from "./chat";
 import { getChatModelLabel, getChatRequestModelId, getChatProviderLabel, chatModelSupportsImages } from "./chat-model";
 import { chatContextWindow } from "./chat-context";
-import { CLOUD_MAX_OUTPUT_TOKENS } from "../shared/model-context";
+import { CLOUD_MAX_OUTPUT_TOKENS, resolveCloudContextWindow } from "../shared/model-context";
 import { recordUsage } from "./stats";
 import { recordTokenUsage } from "./usage";
 import {
@@ -50,8 +50,17 @@ import {
   type RoutedGroupId,
   type RoutedToolset,
 } from "./agent-routed-tools";
-import { TurnLoopGuard } from "./agent-loop-guard";
-import { pickToolGroups, routedArgProblem, routedTurnNote } from "./agent-routing";
+import { DEV_INTENT, TurnLoopGuard } from "./agent-loop-guard";
+import {
+  escalationLeakedMarkup,
+  escalationPrompt,
+  lookupsAllEmpty,
+  parseVerifyMode,
+  parseVerifyThreshold,
+  verifyTurn,
+} from "./agent-verify";
+import { resolveCloudProvider } from "./cloud-providers";
+import { fillAspectRatio, pickToolGroups, REMEMBER_INTENT, routedArgProblem, routedTurnNote } from "./agent-routing";
 import { buildMediaGenTools, buildMediaReadTools } from "./media-tools";
 import { buildNotesAgentTools } from "./notes-tools";
 import { buildSystemOneAgentTools } from "./systemone-tools";
@@ -631,6 +640,148 @@ function createStreamFn() {
 }
 
 /**
+ * 升级用的云端模型通道（设置 `AGENT_ESCALATE_PROVIDER_ID` + `AGENT_ESCALATE_MODEL`）：
+ * 地址与 Key 来自「云端模型」里的厂商行（与所有云端能力同一个来源）。没配齐返回 null。
+ * 与本地通道分开建一套 provider：升级只换这一轮剩下的请求，结束后换回本地。
+ */
+function createEscalationStreamFn(): { model: Model<"openai-completions">; streamFn: Agent["streamFunction"]; label: string } | null {
+  const provider = resolveCloudProvider(getSetting("AGENT_ESCALATE_PROVIDER_ID"));
+  const modelId = getSetting("AGENT_ESCALATE_MODEL").trim();
+  if (!provider || !modelId || !provider.apiKey) return null;
+  const base = provider.baseUrl.replace(/\/+$/, "");
+  const baseUrl = /\/v1$/i.test(base) ? base : `${base}/v1`;
+  const model: Model<"openai-completions"> = {
+    id: modelId,
+    name: `${provider.name} · ${modelId}`,
+    api: "openai-completions",
+    provider: "omni-escalate",
+    baseUrl,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: resolveCloudContextWindow(modelId),
+    maxTokens: CLOUD_MAX_OUTPUT_TOKENS,
+  };
+  const models = createModels();
+  models.setProvider(
+    createProvider({
+      id: "omni-escalate",
+      name: "OmniStudio escalation",
+      baseUrl,
+      auth: {
+        apiKey: {
+          name: `${provider.name} API key`,
+          resolve: async () => ({ auth: { apiKey: provider.apiKey }, source: "env" as const }),
+        },
+      },
+      models: [model],
+      api: openAICompletionsApi() as never,
+    }),
+  );
+  return {
+    model,
+    label: model.name,
+    streamFn: (m: Model<string>, context: Context, options?: SimpleStreamOptions) =>
+      models.streamSimple(m as Model<"openai-completions">, context, {
+        ...options,
+        maxRetries: options?.maxRetries ?? retryAttempts(),
+        maxRetryDelayMs: options?.maxRetryDelayMs ?? 30_000,
+      }),
+  };
+}
+
+/**
+ * 精简路由策略的云端验收 + 升级（`AGENT_VERIFY_MODE`，见 agent-verify.ts）。
+ * 本轮以失败 / 中断收尾时不验收（那由回合结果分类处理）；验收服务不可用只记一条，不影响本地结果。
+ */
+/** 升级前后对流式正文的处理：升级回复作废时，把正文 / 思考 / 待落事件的尾巴回退到升级之前。 */
+type EscalationTextHooks = { mark: () => void; rollback: () => void };
+
+async function verifyAndMaybeEscalate(
+  session: Session,
+  conversationId: number,
+  request: string,
+  turnStart: number,
+  text: EscalationTextHooks,
+) {
+  const mode = parseVerifyMode(getSetting("AGENT_VERIFY_MODE"));
+  if (mode === "off" || !session.routed) return;
+  const agent = session.agent;
+  const stop = lastAssistantStopReason(agent);
+  if (stop === "error" || stop === "aborted") return;
+  const threshold = parseVerifyThreshold(getSetting("AGENT_VERIFY_THRESHOLD"));
+  // turnStart 处是本轮的用户消息，验收只看它之后的动作与回复。
+  const turnMessages = agent.state.messages.slice(turnStart + 1);
+  const outcome = await verifyTurn(request, turnMessages);
+  const messageId = currentMessageId(conversationId);
+  if (!outcome.ok) {
+    recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收没做成（${outcome.error}），保留本地结果。` });
+    logEvent({ level: "warn", source: "agent", event: "agent.verify.failed", message: outcome.error, detail: { conversationId } });
+    return;
+  }
+  const score = `判定 ${outcome.p.toFixed(2)}，阈值 ${threshold}`;
+  if (outcome.p >= threshold) {
+    recordEvent({ conversationId, messageId, kind: "status", toolName: "verify", output: `云端验收通过（${score}）。` });
+    return;
+  }
+  // 只做了查找且全都没找到：云端模型用同一批工具也查不到，升级只是多花一次解码。
+  const nothingToFind = mode === "escalate" && lookupsAllEmpty(turnMessages);
+  const escalation = mode === "escalate" && !nothingToFind ? createEscalationStreamFn() : null;
+  recordEvent({
+    conversationId,
+    messageId,
+    kind: "status",
+    toolName: "verify",
+    output: escalation
+      ? `云端验收未通过（${score}），交给云端模型 ${escalation.label} 接着处理。`
+      : nothingToFind
+        ? `云端验收未通过（${score}），但本轮的查找全都没有结果，换云端模型也查不到，不升级。`
+        : mode === "escalate"
+          ? `云端验收未通过（${score}）；没配升级用的云端模型（设置 → Agent 能力），保留本地结果。`
+          : `云端验收未通过（${score}）。`,
+  });
+  logEvent({
+    level: "info",
+    source: "agent",
+    event: "agent.verify.rejected",
+    message: `云端验收未通过（${score}）`,
+    detail: { conversationId, escalated: Boolean(escalation), nothingToFind },
+  });
+  if (!escalation) return;
+  const localModel = agent.state.model;
+  const localStreamFn = agent.streamFunction;
+  const before = agent.state.messages.length;
+  text.mark();
+  agent.streamFunction = escalation.streamFn;
+  agent.state.model = escalation.model;
+  try {
+    await agent.prompt(escalationPrompt(outcome.p));
+  } finally {
+    agent.streamFunction = localStreamFn;
+    agent.state.model = localModel;
+  }
+  if (escalationLeakedMarkup(agent.state.messages.slice(before))) {
+    // 升级要求与作废的回复一起摘掉：下一轮的上下文里不该留着半截 XML 和思考过程。
+    agent.state.messages = agent.state.messages.slice(0, before);
+    text.rollback();
+    recordEvent({
+      conversationId,
+      messageId,
+      kind: "status",
+      toolName: "verify",
+      output: `云端模型 ${escalation.label} 的回复里混进了思考过程 / 未解析的工具调用原文，已作废，保留本地结果。请检查该服务是否开启了推理与工具调用解析。`,
+    });
+    logEvent({
+      level: "warn",
+      source: "agent",
+      event: "agent.escalate.malformed",
+      message: "升级回复含未解析的 <think> / <tool_call> 标记，已作废",
+      detail: { conversationId, model: escalation.label },
+    });
+  }
+}
+
+/**
  * 自愈的重试预算（设置 `AGENT_RETRY_MAX`，默认 2，0 = 全关）。
  *
  * 一处开关管三件事：传输层 `maxRetries`、回合层的失败重发、空回合提醒。
@@ -1158,6 +1309,8 @@ type RoutedState = {
   pendingReload: boolean;
   /** 本轮循环守卫（搜索打转、生成失败后反复重试）：每轮用户消息开始时换新的。 */
   guard: TurnLoopGuard;
+  /** 本轮用户请求原文（参数补全按它推断，比如「横版」→ aspect_ratio 16:9）。 */
+  request: string;
 };
 
 /** 当前应发给模型的工具列表：核心 + 已加载的组 + （还有没加载的组时）load_tools。 */
@@ -2260,7 +2413,7 @@ function withLoopGuard(
  */
 function withToolStrategy<T extends Parameters<typeof partitionRoutedTools>[0]>(session: Session, tools: T): T {
   if (session.toolStrategy !== "routed") return tools;
-  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard() };
+  session.routed = { set: partitionRoutedTools(tools), loaded: [], pendingReload: false, guard: new TurnLoopGuard(), request: "" };
   return routedToolList(session.routed) as T;
 }
 
@@ -2278,10 +2431,14 @@ async function routeToolGroups(
 ): Promise<string> {
   const routed = session.routed;
   if (!routed) return "";
-  routed.guard = new TurnLoopGuard();
   const available = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
   const pick = await pickToolGroups(content, available, {
     attachments: [...files.map((f) => f.name), ...imagePaths.map((p) => path.basename(p))],
+  });
+  // dev 组（bash / apply_patch）只给开发类请求：请求里有开发类说法、JEV 给 dev 的概率不低，或 JEV 不可用时放行。
+  routed.request = content;
+  routed.guard = new TurnLoopGuard({
+    devAllowed: DEV_INTENT.test(content) || pick.via === "fallback" || (pick.probabilities?.dev ?? 0) >= 0.25,
   });
   const added = pick.groups.filter((g) => !routed.loaded.includes(g));
   routed.loaded.push(...added);
@@ -2307,7 +2464,12 @@ async function routeToolGroups(
     });
   }
   const notLoaded = ROUTED_GROUP_ORDER.filter((g) => !routed.loaded.includes(g) && routed.set.groups[g]?.length);
-  const note = routedTurnNote(notLoaded);
+  const notes = [routedTurnNote(notLoaded)];
+  // 「记住…」：E6 里模型只口头答应、不调 remember，这一轮明确要求先保存。
+  if (REMEMBER_INTENT.test(content) && routed.set.core.some((t) => t.name === "remember")) {
+    notes.push("--- 本轮要求 ---\n用户要你记住一件事：先调用 remember 把它保存成一句话，再回复用户。\n--- 要求结束 ---");
+  }
+  const note = notes.filter(Boolean).join("\n\n");
   return note ? `\n\n${note}` : "";
 }
 
@@ -2458,8 +2620,18 @@ async function getOrCreateSession(
       const args = (context.args ?? {}) as Record<string, unknown>;
       // 精简路由策略的参数兜底：小模型缺信息时爱填占位符（"<收件人>"、"unknown"），拦下来让它先问用户。
       if (session.routed) {
-        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName);
+        const problem = routedArgProblem(toolName, args) ?? session.routed.guard.check(toolName, args);
         if (problem) return { block: true, reason: problem };
+        const ratio = fillAspectRatio(toolName, args, session.routed.request);
+        if (ratio) {
+          recordEvent({
+            conversationId,
+            messageId: currentMessageId(conversationId),
+            kind: "status",
+            toolName: "tool_routing",
+            output: `按请求补上画幅：${toolName} aspect_ratio=${ratio}`,
+          });
+        }
       }
       const fingerprint = `${toolName}:${JSON.stringify(args)}`;
       session.recentCalls.push(fingerprint);
@@ -3091,7 +3263,25 @@ export async function runAgentTurn(opts: {
           if (stopped()) return;
         }
       };
+      const turnStart = agent.state.messages.length;
       await runTurnWithRecovery();
+      if (session.routed && !stopRequested && !stopRequests.has(conversationId)) {
+        let mark = { text: "", reasoning: "" };
+        await verifyAndMaybeEscalate(session, conversationId, content, turnStart, {
+          mark: () => {
+            // 本地那一段收尾正文先落成事件：它属于本地结果，升级作废时不能跟着一起丢。
+            flushStepText();
+            mark = { text: fullText, reasoning };
+          },
+          rollback: () => {
+            // 与失败重试的回退同理：已经流到界面的字撤不回来，收尾的 emitDone 会用最终正文整条覆盖。
+            flusher.discard();
+            pendingStepText = "";
+            fullText = mark.text;
+            reasoning = mark.reasoning;
+          },
+        });
+      }
     }
     // 模型循环结束：最后一段正文（收尾回答）也落成事件，时间轴到此完整。
     flushStepText();

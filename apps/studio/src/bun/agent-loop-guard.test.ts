@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isEmptyResult, TurnLoopGuard } from "./agent-loop-guard";
+import { DEV_INTENT, isEmptyResult, TurnLoopGuard } from "./agent-loop-guard";
 
 describe("isEmptyResult：识别「没找到」", () => {
   test("各检索工具的空结果文案", () => {
@@ -55,5 +55,51 @@ describe("生成失败后不重试、不绕路", () => {
     const g = new TurnLoopGuard();
     expect(g.record("generate_image", "Image saved as img_1", false)).toBeNull();
     expect(g.check("generate_image")).toBeNull();
+  });
+});
+
+describe("dev 组只给开发类请求", () => {
+  test("非开发请求加载 dev 组被拦，其他组照常", () => {
+    const g = new TurnLoopGuard({ devAllowed: false });
+    expect(g.check("load_tools", { group: "dev" })).toContain("开发任务");
+    expect(g.check("load_tools", { group: "creation" })).toBeNull();
+  });
+  test("开发请求放行；默认放行（经典调用方不传参数时行为不变）", () => {
+    expect(new TurnLoopGuard({ devAllowed: true }).check("load_tools", { group: "dev" })).toBeNull();
+    expect(new TurnLoopGuard().check("load_tools", { group: "dev" })).toBeNull();
+  });
+  test("开发类说法识别", () => {
+    expect(DEV_INTENT.test("帮我跑一下单测看看报错")).toBe(true);
+    expect(DEV_INTENT.test("git 提交一下")).toBe(true);
+    expect(DEV_INTENT.test("把这句话翻译成英文")).toBe(false);
+    expect(DEV_INTENT.test("给王总发封邮件")).toBe(false);
+  });
+});
+
+describe("ask_user 没人应答", () => {
+  test("之后本轮不再追问，也不许转向 bash / load_tools", () => {
+    const g = new TurnLoopGuard();
+    expect(g.record("ask_user", "Asking the user is not available in this mode.", false)).toContain("没有人能回答");
+    expect(g.check("ask_user")).toContain("不要再追问");
+    expect(g.check("bash")).not.toBeNull();
+    expect(g.check("load_tools", { group: "dev" })).not.toBeNull();
+    expect(g.check("write_file")).toBeNull();
+  });
+  test("之后也不许自己编内容去生成（问的就是画什么）", () => {
+    const g = new TurnLoopGuard();
+    g.record("ask_user", "Asking the user is not available in this mode.", true);
+    expect(g.check("generate_image")).toContain("没有人能回答");
+    expect(g.check("generate_speech")).not.toBeNull();
+  });
+  test("用户关掉提问或超时也算没人应答", () => {
+    const g = new TurnLoopGuard();
+    const dismissed = "The user did not answer (dismissed or timed out). Continue sensibly and say what you assumed.";
+    expect(g.record("ask_user", dismissed, false)).toContain("没有人能回答");
+    expect(g.check("ask_user")).toContain("不要再追问");
+  });
+  test("用户正常回答时不受影响", () => {
+    const g = new TurnLoopGuard();
+    expect(g.record("ask_user", "用户回答：发给 wang@example.com", false)).toBeNull();
+    expect(g.check("ask_user")).toBeNull();
   });
 });
