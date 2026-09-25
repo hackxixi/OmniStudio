@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@ui/switch";
 import { formatSize } from "@/mainview/lib/format";
 import { Textarea } from "@ui/textarea";
+import { CloudModelSelect } from "@components/cloud-model-select";
 import { useT } from "@stores/ui-lang";
 import { PageHeader, SettingsSection, SettingRow } from "@components/setting-ui";
 
@@ -74,6 +75,15 @@ export function AgentCapsTab() {
       rpcClient.setAgentCapabilities({ toolStrategy: strategy }),
     onSuccess: invalidate,
   });
+  const setVerify = useMutation({
+    mutationFn: (patch: {
+      verifyMode?: "off" | "report" | "escalate";
+      verifyThreshold?: number;
+      escalateProviderId?: string;
+      escalateModel?: string;
+    }) => rpcClient.setAgentCapabilities(patch),
+    onSuccess: invalidate,
+  });
   const setSnapshots = useMutation({
     mutationFn: (enabled: boolean) => rpcClient.setAgentSnapshots({ enabled }),
     onSuccess: invalidate,
@@ -114,6 +124,25 @@ export function AgentCapsTab() {
   useEffect(() => {
     setNotifyDraft(notifyQuery.data?.command ?? "");
   }, [notifyQuery.data?.command]);
+
+  // 阈值同样用本地态 + 失焦提交（每次按键都写设置会把一串中间值落库）。
+  const [thresholdDraft, setThresholdDraft] = useState(
+    String(caps?.verifyThreshold ?? 0.9),
+  );
+  useEffect(() => {
+    setThresholdDraft(String(caps?.verifyThreshold ?? 0.9));
+  }, [caps?.verifyThreshold]);
+
+  const commitThreshold = () => {
+    const value = Number(thresholdDraft);
+    if (!Number.isFinite(value) || value < 0.5 || value > 0.99) {
+      setThresholdDraft(String(caps?.verifyThreshold ?? 0.9));
+      return;
+    }
+    if (value !== (caps?.verifyThreshold ?? 0.9)) {
+      setVerify.mutate({ verifyThreshold: value });
+    }
+  };
 
   useEffect(() => {
     setHooksDraft(hooksQuery.data?.raw ?? "[]");
@@ -293,6 +322,79 @@ export function AgentCapsTab() {
         <p className="border-b px-4 py-3 text-xs text-muted-foreground last:border-b-0">
           {t("settings.agentCaps.toolStrategy.hint")}
         </p>
+      </SettingsSection>
+
+      <SettingsSection
+        title={t("settings.agentCaps.verify.title")}
+        description={t("settings.agentCaps.verify.desc")}
+        className={(caps?.toolStrategy ?? "classic") !== "routed" ? "opacity-50" : undefined}
+      >
+        {(caps?.toolStrategy ?? "classic") !== "routed" && (
+          <p className="border-b px-4 py-2 text-[11px] text-muted-foreground">
+            {t("settings.agentCaps.verify.classicHint")}
+          </p>
+        )}
+        <SettingRow title={t("settings.agentCaps.verify.mode")}>
+          <Select
+            value={caps?.verifyMode ?? "off"}
+            onValueChange={(value) => setVerify.mutate({ verifyMode: value as "off" | "report" | "escalate" })}
+            disabled={(caps?.toolStrategy ?? "classic") !== "routed"}
+          >
+            <SelectTrigger className="h-8 w-52 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="off">{t("settings.agentCaps.verify.mode.off")}</SelectItem>
+              <SelectItem value="report">{t("settings.agentCaps.verify.mode.report")}</SelectItem>
+              <SelectItem value="escalate">{t("settings.agentCaps.verify.mode.escalate")}</SelectItem>
+            </SelectContent>
+          </Select>
+        </SettingRow>
+        <SettingRow
+          title={t("settings.agentCaps.verify.threshold")}
+          description={t("settings.agentCaps.verify.thresholdHint")}
+        >
+          <Input
+            className="h-8 w-24 text-xs"
+            type="number"
+            min={0.5}
+            max={0.99}
+            step={0.01}
+            value={thresholdDraft}
+            disabled={(caps?.toolStrategy ?? "classic") !== "routed"}
+            onChange={(event) => setThresholdDraft(event.target.value)}
+            onBlur={commitThreshold}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") commitThreshold();
+            }}
+          />
+        </SettingRow>
+        {(caps?.verifyMode ?? "off") === "escalate" && (
+          <SettingRow
+            title={t("settings.agentCaps.verify.escalate")}
+            description={t("settings.agentCaps.verify.hint")}
+            stacked
+          >
+            <CloudModelSelect
+              kind="chat"
+              providerId={caps?.escalateProviderId ?? ""}
+              model={caps?.escalateModel ?? ""}
+              size="sm"
+              disabled={(caps?.toolStrategy ?? "classic") !== "routed"}
+              onChange={(choice) =>
+                setVerify.mutate({
+                  escalateProviderId: choice.providerId,
+                  escalateModel: choice.model,
+                })
+              }
+            />
+          </SettingRow>
+        )}
+        {(caps?.verifyMode ?? "off") !== "escalate" && (
+          <p className="border-b px-4 py-3 text-xs text-muted-foreground last:border-b-0">
+            {t("settings.agentCaps.verify.hint")}
+          </p>
+        )}
       </SettingsSection>
 
       <SettingsSection

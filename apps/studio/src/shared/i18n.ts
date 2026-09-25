@@ -366,6 +366,19 @@ const zh: Record<string, string> = {
   "settings.agentCaps.toolStrategy.classic": "经典（全部工具一次交给模型，适合云端 / 大模型）",
   "settings.agentCaps.toolStrategy.routed": "精简路由（常驻核心工具，按需加载创作 / 开发 / 已连接应用等工具组，适合本地小模型）",
   "settings.agentCaps.toolStrategy.hint": "切换只影响之后新开始的回合，Plan 模式不受影响。",
+  "settings.agentCaps.verify.title": "云端验收",
+  "settings.agentCaps.verify.desc":
+    "精简路由下，本地小模型做完一轮后交给云端 JEV 判一次「处理对了没有」，防止小模型漏步骤、编造结果。",
+  "settings.agentCaps.verify.mode": "模式",
+  "settings.agentCaps.verify.mode.off": "关闭",
+  "settings.agentCaps.verify.mode.report": "只记录结论（写入轨迹，不干预）",
+  "settings.agentCaps.verify.mode.escalate": "不通过就交给云端模型接着做",
+  "settings.agentCaps.verify.threshold": "判定阈值",
+  "settings.agentCaps.verify.thresholdHint": "判定「处理对了」的概率低于它算不通过（0.5～0.99）。",
+  "settings.agentCaps.verify.escalate": "升级用的云端模型",
+  "settings.agentCaps.verify.hint":
+    "只在「工具调用方式 = 精简路由」时生效；验收用 JEV 页「云端接入」配置的 Key，每轮多一次云端判定。",
+  "settings.agentCaps.verify.classicHint": "工具调用方式为「经典」时本节不生效。",
   "settings.permissions.title": "Agent 权限",
   "agent.approval.desc":
     "决定 Agent 执行哪些操作前需要你点一下确认。smart 只拦危险动作（rm -rf、sudo、git push、工作区外访问），manual 每个有副作用的工具都问，auto 全部放行，strict 全部拒绝。",
@@ -4055,6 +4068,19 @@ const en: Record<string, string> = {
   "settings.agentCaps.toolStrategy.classic": "Classic (all tools up front — cloud / large models)",
   "settings.agentCaps.toolStrategy.routed": "Routed (core tools resident, load creative / dev / connected-app groups on demand — local small models, shorter prefix, faster first turn)",
   "settings.agentCaps.toolStrategy.hint": "The change only applies to turns that start afterwards; Plan mode is not affected.",
+  "settings.agentCaps.verify.title": "Cloud verification",
+  "settings.agentCaps.verify.desc":
+    "With routed tooling, after a local small model finishes a turn, a cloud JEV judges whether it handled the request correctly — a guard against missed steps and fabricated results.",
+  "settings.agentCaps.verify.mode": "Mode",
+  "settings.agentCaps.verify.mode.off": "Off",
+  "settings.agentCaps.verify.mode.report": "Report only (record the verdict in the trace)",
+  "settings.agentCaps.verify.mode.escalate": "Escalate to a cloud model when it fails",
+  "settings.agentCaps.verify.threshold": "Verdict threshold",
+  "settings.agentCaps.verify.thresholdHint": "A verdict probability below this counts as a failure (0.5–0.99).",
+  "settings.agentCaps.verify.escalate": "Escalation cloud model",
+  "settings.agentCaps.verify.hint":
+    "Only active when the tool strategy is routed; verification uses the key configured on the JEV page (cloud access) and adds one cloud judgment per turn.",
+  "settings.agentCaps.verify.classicHint": "This section has no effect while the tool strategy is classic.",
   "settings.permissions.title": "Agent permissions",
   "agent.approval.desc":
     "Choose which actions the agent may take without asking. smart only gates dangerous ones (rm -rf, sudo, git push, outside the workspace); manual asks for every tool with side effects; auto allows everything; strict denies everything.",
