@@ -41,6 +41,7 @@ import {
 } from "../app-log";
 import { LOG_THROTTLE_MS, PROGRESS_THROTTLE_MS, throttleBatch, throttleLatest } from "../throttle";
 import { parseToolStrategy, type AgentToolStrategy } from "../../shared/agent-tool-strategy";
+import { parseVerifyMode, parseVerifyThreshold, type VerifyMode } from "../agent-verify";
 import * as ServerManager from "../server-manager";
 import type { ServerStatus } from "../server-manager";
 import * as Served from "../model-servers";
@@ -1371,10 +1372,24 @@ export type AppRPC = {
           modelName: string;
           /** 工具调用方式：classic（全部工具一次给模型）/ routed（精简路由）。 */
           toolStrategy: AgentToolStrategy;
+          /** 精简路由的云端验收：off / report / escalate。 */
+          verifyMode: VerifyMode;
+          /** 云端验收阈值（0～1 之间的小数）。 */
+          verifyThreshold: number;
+          /** 升级用的云厂商 id 与模型。 */
+          escalateProviderId: string;
+          escalateModel: string;
         };
       };
       setAgentCapabilities: {
-        params: { visionTool?: "auto" | "on" | "off"; toolStrategy?: AgentToolStrategy };
+        params: {
+          visionTool?: "auto" | "on" | "off";
+          toolStrategy?: AgentToolStrategy;
+          verifyMode?: VerifyMode;
+          verifyThreshold?: number;
+          escalateProviderId?: string;
+          escalateModel?: string;
+        };
         response: { ok: boolean };
       };
       getAgentInstructions: {
@@ -4545,12 +4560,23 @@ const rpcRequests: NonNullable<
     visionAvailable: chatModelSupportsImages(),
     modelName: getChatModelLabel(),
     toolStrategy: parseToolStrategy(getSetting("AGENT_TOOL_STRATEGY")),
+    verifyMode: parseVerifyMode(getSetting("AGENT_VERIFY_MODE")),
+    verifyThreshold: parseVerifyThreshold(getSetting("AGENT_VERIFY_THRESHOLD")),
+    escalateProviderId: getSetting("AGENT_ESCALATE_PROVIDER_ID"),
+    escalateModel: getSetting("AGENT_ESCALATE_MODEL"),
   }),
-  setAgentCapabilities: async ({ visionTool, toolStrategy }) => {
+  setAgentCapabilities: async ({ visionTool, toolStrategy, verifyMode, verifyThreshold, escalateProviderId, escalateModel }) => {
     if (visionTool) updateSettings({ AGENT_VISION_TOOL: visionTool });
     if (toolStrategy !== undefined) {
       updateSettings({ AGENT_TOOL_STRATEGY: parseToolStrategy(toolStrategy) });
     }
+    // 云端验收：读用 agent-verify 的解析函数归一，写前先归一再落库（阈值存字符串，与设置表一致）。
+    if (verifyMode !== undefined) updateSettings({ AGENT_VERIFY_MODE: parseVerifyMode(verifyMode) });
+    if (verifyThreshold !== undefined)
+      updateSettings({ AGENT_VERIFY_THRESHOLD: String(parseVerifyThreshold(verifyThreshold)) });
+    if (escalateProviderId !== undefined)
+      updateSettings({ AGENT_ESCALATE_PROVIDER_ID: escalateProviderId.trim() });
+    if (escalateModel !== undefined) updateSettings({ AGENT_ESCALATE_MODEL: escalateModel.trim() });
     return { ok: true };
   },
   getAgentInstructions: async (params) => {
