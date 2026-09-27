@@ -945,7 +945,7 @@ export type AppRPC = {
         response: { conversation: Conversation | null; messages: ChatMessage[] };
       };
       createConversation: {
-        params: { title?: string; app?: string };
+        params: { title?: string; app?: string; agentType?: string | null };
         response: { conversation: Conversation };
       };
       deleteConversation: {
@@ -4172,7 +4172,7 @@ const rpcRequests: NonNullable<
   },
 
   createConversation: async (params) => {
-    return { conversation: Chat.createConversation(params?.title, params?.app) };
+    return { conversation: Chat.createConversation(params?.title, params?.app, params?.agentType) };
   },
 
   deleteConversation: async ({ id }) => {

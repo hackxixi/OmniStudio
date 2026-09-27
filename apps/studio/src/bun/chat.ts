@@ -64,6 +64,8 @@ export type Conversation = {
   title: string;
   app: string;
   modelId: string | null;
+  /** 会话所属 agent 种类（claude / codex / pi）；null = 未标记，侧栏徽章据此显示品牌胶囊。 */
+  agentType?: string | null;
   pinned: number;
   /** 会话级工作区（绝对路径）；null = 跟随全局 AGENT_WORKSPACE 设置。 */
   workspace?: string | null;
@@ -322,10 +324,19 @@ export function getConversation(id: number): {
   return { conversation: conv as Conversation, messages: msgs as ChatMessage[] };
 }
 
-export function createConversation(title?: string, app: string = "chat"): Conversation {
+export function createConversation(
+  title?: string,
+  app: string = "chat",
+  agentType?: string | null,
+): Conversation {
   const result = db
     .insert(conversations)
-    .values({ title: title?.trim() || "New conversation", app, modelId: getChatModelLabel() || getSetting("CHAT_MODEL") || null })
+    .values({
+      title: title?.trim() || "New conversation",
+      app,
+      modelId: getChatModelLabel() || getSetting("CHAT_MODEL") || null,
+      agentType: agentType || null,
+    })
     .returning()
     .get();
   return result as Conversation;

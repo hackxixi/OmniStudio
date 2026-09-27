@@ -77,6 +77,8 @@ export const conversations = sqliteTable("conversations", {
   title: text("title").notNull(),
   app: text("app").notNull().default("chat"),
   modelId: text("model_id"),
+  /** 会话所属 agent 种类（claude / codex / pi）；NULL = 未标记。侧栏徽章用它着色。 */
+  agentType: text("agent_type"),
   pinned: int("pinned").notNull().default(0),
   /** 会话级工作区（绝对路径）。NULL = 使用全局 AGENT_WORKSPACE。 */
   workspace: text("workspace"),

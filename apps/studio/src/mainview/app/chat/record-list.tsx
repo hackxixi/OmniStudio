@@ -12,6 +12,7 @@ import {
 
 import { rpcClient } from "@lib/rpc";
 import { SingleToolEntry } from "@components/sidebar-parts";
+import { AgentTypeBadge } from "@components/agent-type-badge";
 import { Badge } from "@ui/badge";
 import { Button } from "@ui/button";
 import { ScrollArea } from "@ui/scroll-area";
@@ -65,7 +66,13 @@ export function ConversationRecordList({ app }: { app: AppId }) {
   }, [listQuery.data]);
 
   const createMutation = useMutation({
-    mutationFn: () => rpcClient.createConversation({ app }),
+    mutationFn: () =>
+      rpcClient.createConversation({
+        app,
+        // agent 应用的会话默认属于内置 Pi Agent；claude/codex 等外部 agent 的会话由
+        // 各自的接线方显式传入 agentType。
+        agentType: app === "agent" ? "pi" : undefined,
+      }),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
       useChatStore.getState().upsertConversation(data.conversation);
@@ -164,6 +171,7 @@ export function ConversationRecordList({ app }: { app: AppId }) {
                     <span className="min-w-0 flex-1 truncate text-xs font-medium">
                       {c.title}
                     </span>
+                    <AgentTypeBadge type={c.agentType} size={11} />
                     {!!c.pinned && (
                       <PinIcon className="size-3.5 shrink-0 fill-primary text-primary/70" />
                     )}
