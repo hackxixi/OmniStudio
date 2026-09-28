@@ -9,8 +9,8 @@
  * （静态 import 会被提升到 env 设置之前执行，必须用动态 import）。
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
-import { homedir } from "os";
 import { basename, join, resolve } from "path";
+import { getAppDataDir } from "../bun/paths";
 import type { InferenceEngine } from "../shared/engines";
 
 const APP_SUPPORT = "omni-studio.kunpengtalk.com";
@@ -60,7 +60,7 @@ function readVersion(): string {
 
 /** 自动探测最“新”的 channel 数据目录（含 omni-studio.db 且 mtime 最新）。 */
 function autoDetectDataDir(): string | undefined {
-  const base = join(homedir(), "Library", "Application Support", APP_SUPPORT);
+  const base = join(getAppDataDir(), APP_SUPPORT);
   try {
     const entries = readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory());
     let best: { dir: string; mtime: number } | undefined;
@@ -76,7 +76,7 @@ function autoDetectDataDir(): string | undefined {
   }
 }
 
-const DEFAULT_DATA_DIR = join(homedir(), "Library", "Application Support", APP_SUPPORT, "stable");
+const DEFAULT_DATA_DIR = join(getAppDataDir(), APP_SUPPORT, "stable");
 
 /** 解析数据目录并设置环境变量（必须在动态 import 后端之前调用）。 */
 function resolveDataDir(explicit?: string): string {

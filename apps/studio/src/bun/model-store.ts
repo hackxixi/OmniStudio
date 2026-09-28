@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { copyFile } from "fs/promises";
 import path from "path";
 import { getModelsBaseDir, safeRepoId, isModelWeightExt, modelDisplayName } from "./modelscope";
 import {
@@ -472,8 +473,8 @@ export function getActiveModelPath(): string {
 
 /**
  * Import a local model file by copying it into the primary models dir
- * (`<base>/imported/`) so it appears in the installed-models list. Uses an
- * external `cp` process so multi-GB copies don't block the event loop.
+ * (`<base>/imported/`) so it appears in the installed-models list. Uses the
+ * async `copyFile` so multi-GB copies don't block the event loop.
  */
 export async function importModelFile(sourcePath: string): Promise<{ ok: boolean; path?: string; error?: string }> {
   if (!existsSync(sourcePath)) return { ok: false, error: "File does not exist" };
@@ -483,9 +484,8 @@ export async function importModelFile(sourcePath: string): Promise<{ ok: boolean
     const destDir = path.join(getModelsBaseDir(), "imported");
     mkdirSync(destDir, { recursive: true });
     const dest = path.join(destDir, fileName);
-    const proc = Bun.spawn(["cp", "-f", sourcePath, dest], { stdout: "ignore", stderr: "ignore" });
-    const code = await proc.exited;
-    if (code !== 0) return { ok: false, error: `Copy failed (exit ${code})` };
+    // fs/promises 的 copyFile 在 libuv 线程池里跑，不卡事件循环；Windows 没有 `cp`。
+    await copyFile(sourcePath, dest);
     return { ok: true, path: dest };
   } catch (e) {
     return { ok: false, error: String(e) };

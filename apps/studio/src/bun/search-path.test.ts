@@ -51,7 +51,7 @@ describe("agentShellPath", () => {
     const p = agentShellPath({ platform: "linux", home: "/home/u", env: { PATH: "/x" } }).split(":");
     expect(p[0]).toBe("/usr/local/bin");
     expect(p).toContain("/home/u/.bun/bin");
-    expect(p.at(-1)).toBe("/x");
+    expect(p[p.length - 1]).toBe("/x");
   });
 
   test("Windows 不带任何 POSIX 目录", () => {

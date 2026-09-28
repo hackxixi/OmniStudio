@@ -11,6 +11,7 @@ import { downloadHttpFile, type DownloadProgress } from "./modelscope";
 import { resolveOcrImage, saveOcrRecord, type OcrLine, type OcrResult } from "./ocr";
 import type { PpOcrModelSize } from "../shared/ocr";
 import { toolSearchPath } from "./search-path";
+import { venvExecutable } from "./engine-paths";
 
 /**
  * PaddleOCR（PP-OCRv6）本地 OCR 引擎 —— 第三个 OCR 引擎（OCR 页顶部切换）。
@@ -205,12 +206,9 @@ export function engineDirPath(): string {
   return getEngineDir();
 }
 
-function getVenvBinDir(): string {
-  return path.join(getEngineDir(), "bin");
-}
-
+/** venv 里的可执行文件（Windows 是 `Scripts\python.exe`，不是 `bin/python3`）。 */
 function venvBinary(name: string): string {
-  return path.join(getVenvBinDir(), name);
+  return venvExecutable(getEngineDir(), name);
 }
 
 /**
@@ -218,7 +216,9 @@ function venvBinary(name: string): string {
  * 3.8–3.12，避开 3.13+（可能没有对应轮子导致安装失败）。
  */
 async function findPython(): Promise<string | null> {
-  const candidates = ["python3.11", "python3.12", "python3.10", "python3"];
+  // Windows 的官方安装包只放 `python.exe`（没有 python3.x）；应用商店的 python 占位
+  // 程序跑 `--version` 拿不到版本号，会被下面的版本检查筛掉。
+  const candidates = ["python3.11", "python3.12", "python3.10", "python3", ...(process.platform === "win32" ? ["python"] : [])];
   for (const name of candidates) {
     const p = Bun.which(name, { PATH: getSearchPath() });
     if (!p) continue;
@@ -396,7 +396,10 @@ async function doDownloadPpOcrEngine(): Promise<{
   if (!python) {
     return {
       ok: false,
-      error: "未找到 python3，请先安装 Python 3.10–3.12（macOS: brew install python）",
+      error:
+        process.platform === "win32"
+          ? "未找到 Python，请先从 python.org 安装 Python 3.10–3.12（勾选 Add python.exe to PATH）"
+          : "未找到 python3，请先安装 Python 3.10–3.12（macOS: brew install python）",
     };
   }
 

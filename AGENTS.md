@@ -348,6 +348,10 @@ Views must be configured in `electrobun.config.ts` to be built and copied into t
   `agentShellPath` / `prependPath`, plus `withPath` when putting it into a child env). Windows
   separates with `;` and names the variable `Path`; a `:` join glues the first PATH entry into
   garbage.
+- Managed venv executables go through `venvExecutable` (`bun/engine-paths.ts`): Windows venvs
+  are `Scripts\python.exe` / `Scripts\pip.exe`, never `bin/python3`. Don't shell out to
+  `cp` / `rm` / `unzip` / `open` either — Windows has none of them (use `fs`, the zip helpers
+  in `skills/installer.ts`, or `launchCommand` in `cli/client.ts`).
 - Anything that resolves a user-supplied path (downloads, media, Skills deletes) must validate
   it against the data directory — inputs arrive from the webview and the control socket.
 - Adding an inference engine means editing `src/shared/engines.ts` plus one `Runtime`

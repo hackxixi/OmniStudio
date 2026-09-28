@@ -2,6 +2,8 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { existsSync, readFileSync, statSync } from "fs";
 
+import { getAppDataDir } from "../bun/paths";
+
 export const APP_NAME = "OmniStudio";
 export const APP_IDENTIFIER = "omni-studio.kunpengtalk.com";
 
@@ -67,10 +69,9 @@ export function pickDataDir(candidates: DataDirCandidate[], fallback: string): s
 
 const CHANNELS = ["dev", "canary", "stable"];
 
-/** macOS 上按 channel 枚举候选（其余平台返回空，维持原有回退路径）。 */
+/** 按 channel 枚举候选。根目录与主进程同规则（macOS Application Support / Windows LOCALAPPDATA / Linux XDG）。 */
 function channelCandidates(): DataDirCandidate[] {
-  if (process.platform !== "darwin") return [];
-  const base = join(homedir(), "Library", "Application Support", APP_IDENTIFIER);
+  const base = join(getAppDataDir(), APP_IDENTIFIER);
   return CHANNELS.map((channel) => {
     const dir = join(base, channel);
     let dbMtime = 0;
@@ -96,15 +97,13 @@ function channelCandidates(): DataDirCandidate[] {
  */
 export function resolveDataDir(): string {
   if (process.env.OMNI_DATA_DIR) return process.env.OMNI_DATA_DIR;
-  if (process.platform === "darwin") {
-    const fromChannels = pickDataDir(channelCandidates(), "");
-    if (fromChannels) return fromChannels;
-    // 机器上有安装包时，它的 channel 才是"这份 CLI 该指的地方"。
-    const info = findAppVersionInfo();
-    if (info) return join(homedir(), "Library", "Application Support", info.identifier, info.channel);
-  }
+  const fromChannels = pickDataDir(channelCandidates(), "");
+  if (fromChannels) return fromChannels;
+  // 机器上有安装包时，它的 channel 才是"这份 CLI 该指的地方"（目前只认 macOS 的 .app）。
+  const info = findAppVersionInfo();
+  if (info) return join(getAppDataDir(), info.identifier, info.channel);
   // 源码/开发环境下的稳定回退 —— 与主进程 paths.getUserDataDir 的默认一致。
-  return join(homedir(), "Library", "Application Support", APP_IDENTIFIER, "dev");
+  return join(getAppDataDir(), APP_IDENTIFIER, "dev");
 }
 
 /** ping 一个控制 socket（真的连上去，不是看文件在不在）。 */

@@ -1,17 +1,24 @@
 import { homedir } from "os";
-import { basename, dirname, join, resolve, sep } from "path";
+import path, { basename, dirname, join, resolve, sep } from "path";
 import { readFileSync } from "fs";
 
 const APP_IDENTIFIER = "omni-studio.kunpengtalk.com";
 const FALLBACK_CHANNEL = "dev";
 
-function getAppDataDir(): string {
-  const home = homedir();
-  switch (process.platform) {
+/**
+ * 各平台的「应用数据」根目录（与 electrobun 同规则）。导出给 `omi` CLI 复用 ——
+ * 它以前自己写死 `~/Library/Application Support`，Windows / Linux 上永远找不到数据目录。
+ */
+export function getAppDataDir(
+  platform: NodeJS.Platform = process.platform,
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  switch (platform) {
     case "win32":
-      return process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+      return env.LOCALAPPDATA || path.win32.join(home, "AppData", "Local");
     case "linux":
-      return process.env.XDG_DATA_HOME || join(home, ".local", "share");
+      return env.XDG_DATA_HOME || join(home, ".local", "share");
     default:
       return join(home, "Library", "Application Support");
   }
