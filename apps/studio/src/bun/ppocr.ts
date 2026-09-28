@@ -10,6 +10,7 @@ import { convertFileToImages } from "./vllm";
 import { downloadHttpFile, type DownloadProgress } from "./modelscope";
 import { resolveOcrImage, saveOcrRecord, type OcrLine, type OcrResult } from "./ocr";
 import type { PpOcrModelSize } from "../shared/ocr";
+import { toolSearchPath } from "./search-path";
 
 /**
  * PaddleOCR（PP-OCRv6）本地 OCR 引擎 —— 第三个 OCR 引擎（OCR 页顶部切换）。
@@ -191,15 +192,7 @@ async function streamLines(
 // ---------------------------------------------------------------------------
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 /** venv 根目录（userData/engines/paddleocr，标准 python venv）。 */

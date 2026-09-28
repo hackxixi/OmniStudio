@@ -5,6 +5,7 @@ import { mcpServers, type McpServerRow } from "./db/schema";
 import { audit } from "./skills/audit";
 import type { BuiltTool } from "./agent-tools";
 import type { McpServerConfig, McpTransportType } from "../shared/mcp";
+import { agentShellPath, withPath } from "./search-path";
 
 export type { McpServerConfig, McpTransportType } from "../shared/mcp";
 
@@ -209,26 +210,6 @@ function formatCallResult(result: any): string {
 }
 
 /**
- * GUI 启动的进程 PATH 常缺少 Homebrew / nvm 等目录，stdio 服务器（npx/uvx/node）会找不到。
- * 与 agent-tools.ts 的 augmentPath 保持同样的补法。
- */
-function augmentPath(): string {
-  const extra = [
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    `${process.env.HOME ?? ""}/.nvm/versions/node/*/bin`,
-    `${process.env.HOME ?? ""}/.bun/bin`,
-    `${process.env.HOME ?? ""}/.cargo/bin`,
-  ];
-  return [...extra, process.env.PATH ?? ""].join(":");
-}
-
-/**
  * 会劫持子进程加载器 / 注入代码的 env 键。MCP 配置由 webview 提交，
  * 允许覆盖这些键等于让配置方在每次启动时往任意 stdio 服务器进程里注入代码。
  * 业务变量（API Key 等）仍然放行。
@@ -296,7 +277,7 @@ class StdioConnection implements McpConnection {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...env, PATH: augmentPath() },
+      env: withPath({ ...process.env, ...env }, agentShellPath()),
     });
     this.proc = proc;
     // stderr 仅排空防背压，内容丢给控制台便于排查服务器崩溃。

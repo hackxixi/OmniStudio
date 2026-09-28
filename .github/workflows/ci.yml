@@ -16,7 +16,8 @@ jobs:
   check:
     name: lint / typecheck / test
     # macOS runner：应用目标平台是 macOS（llama.cpp / MLX 等引擎与路径逻辑都有
-    # darwin 分支），测试也按 macOS 假设编写；Linux/Windows 的构建由 release.yml 覆盖。
+    # darwin 分支），测试也按 macOS 假设编写；Windows 另有下面的 windows 作业，
+    # Linux/Windows 的打包由 release.yml 覆盖。
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +79,38 @@ jobs:
       - name: Landlock 端到端（--require：跑不了就算失败，不许静默跳过）
         working-directory: apps/studio
         run: bun run scripts/landlock-e2e.ts --require
+
+  windows:
+    name: Windows（lint / typecheck / test）
+    # Windows 此前只在 release.yml 里打包、从不跑检查：PATH 用 ":" 拼、负 pid 杀进程组
+    # 这类问题只能等用户装上才发现。typecheck / lint 与平台无关，必须绿；
+    # 单测是按 macOS 假设写的，先跑出清单、不挡合并（continue-on-error），
+    # 逐条修到绿之后再去掉 continue-on-error。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build webview bundle（单测要读 vite 产物）
+        run: bun x vite build
+        working-directory: apps/studio
+
+      - name: Unit tests（暂不阻塞：先摸清 Windows 上的失败清单）
+        continue-on-error: true
+        run: bun run test
 
   build:
     name: vite build

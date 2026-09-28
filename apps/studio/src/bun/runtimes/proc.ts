@@ -3,6 +3,7 @@ import type { Subprocess } from "bun";
 import { logEvent } from "../app-log";
 import { forgetChild, recordChild } from "../child-registry";
 import { proxyChildEnv } from "../proxy";
+import { killWindowsTree } from "../win-process";
 
 /**
  * 推理服务器子进程的公共设施：四个 runtime（llama.cpp / vLLM / SGLang / MLX）
@@ -117,20 +118,50 @@ export function pumpServerOutput(proc: Subprocess, appendLog: (text: string) => 
 /** 只要能拿到 pid 与 kill 就够（Bun 各形态的 Subprocess 泛型都满足）。 */
 type KillableProc = {
   pid?: number;
+  /** 已退出时为退出码；Windows 上据此跳过按 pid 杀树（pid 可能已被复用）。 */
+  exitCode?: number | null;
   // 用方法简写声明：与 Bun 的 `Subprocess.kill` 保持双变（bivariant）兼容。
   kill?(signal?: number | string): void;
+};
+
+export type KillTreeOptions = {
+  /** 覆盖平台（测试用）。 */
+  platform?: NodeJS.Platform;
+  /** 覆盖 Windows 的杀树实现（测试用）。 */
+  killWindowsTree?: (pid: number) => boolean;
 };
 
 /**
  * 杀掉整个进程组（先 SIGTERM，调用方按需再 SIGKILL）。
  * 进程组不存在（已退出 / 未 detached）时退回单进程 kill。
+ *
+ * Windows 没有进程组信号（负 pid 直接抛错），改走 `taskkill /T /F` 杀整棵树；
+ * 没有 SIGTERM 的等价物，两种信号都是强杀。
  */
 export function killProcessTree(
   proc: KillableProc | null | undefined,
   signal: "SIGTERM" | "SIGKILL" = "SIGTERM",
+  opts: KillTreeOptions = {},
 ): void {
   if (!proc) return;
   const pid = proc.pid;
+  if ((opts.platform ?? process.platform) === "win32") {
+    if (typeof pid !== "number" || pid <= 0) return;
+    // 根进程已退出：子进程已脱离这棵树，taskkill /T 找不到它们；pid 还可能被
+    // 别的程序复用 —— 按 pid 杀树只会误伤，直接收工。
+    if (proc.exitCode === undefined || proc.exitCode === null) {
+      const killed = (opts.killWindowsTree ?? killWindowsTree)(pid);
+      if (!killed) {
+        try {
+          proc.kill?.(signal);
+        } catch {
+          // already dead
+        }
+      }
+    }
+    forgetChildSafe(pid);
+    return;
+  }
   if (typeof pid === "number" && pid > 0) {
     try {
       process.kill(-pid, signal);

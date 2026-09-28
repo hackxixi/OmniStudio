@@ -18,6 +18,7 @@ import { basename, join } from "path";
 
 import { getDataDir } from "./paths";
 import { logEvent } from "./app-log";
+import { killWindowsTree, windowsImageName } from "./win-process";
 
 export type ChildRecord = {
   pid: number;
@@ -162,9 +163,11 @@ export function forgetChild(pid: number): void {
  * 取某 pid 的命令行/可执行文件名：
  *  - Linux：读 `/proc/<pid>/cmdline`（null 分隔），返回第一段（argv[0]）
  *  - macOS：`ps -p <pid> -o comm=`，返回输出
+ *  - Windows：`tasklist` 的映像名（如 `llama-server.exe`）
  *  - 进程不存在 / 读不到 → 返回 null
  */
 export function readCmdline(pid: number): string | null {
+  if (process.platform === "win32") return windowsImageName(pid);
   if (process.platform === "darwin") {
     try {
       const out = Bun.spawnSync(["ps", "-p", String(pid), "-o", "comm="], {
@@ -189,8 +192,15 @@ export function readCmdline(pid: number): string | null {
   }
 }
 
-/** 给进程组发信号（pgid 传负值 -pgid）。ESRCH（进程已没了）不算错误。 */
+/**
+ * 给进程组发信号（pgid 传负值 -pgid）。ESRCH（进程已没了）不算错误。
+ * Windows 没有进程组信号：detached 启动时 pgid === pid，按 pid 杀整棵树（taskkill /T /F）。
+ */
 export function signalGroup(pgid: number, signal: "SIGTERM" | "SIGKILL"): void {
+  if (process.platform === "win32") {
+    killWindowsTree(pgid);
+    return;
+  }
   process.kill(-pgid, signal);
 }
 
