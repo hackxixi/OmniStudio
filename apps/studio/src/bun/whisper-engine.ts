@@ -4,6 +4,7 @@ import { WHISPER_CPP_RELEASE_TAG, WHISPER_CPP_REPO } from "../shared/whispercpp"
 import { getDataDir } from "./paths";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { fetchAssetFromSources, githubReleaseUrls, officialWithMirrors } from "./mirror-download";
+import { toolSearchPath } from "./search-path";
 
 /**
  * whisper.cpp 本地识别引擎（whisper-cli / whisper-server）的一键安装。
@@ -32,15 +33,7 @@ function getEngineRoot(): string {
 }
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 async function findOnPath(name: string): Promise<string | null> {

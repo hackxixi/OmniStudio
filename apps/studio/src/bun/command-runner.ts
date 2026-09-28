@@ -8,6 +8,8 @@
  *  - 一律带超时：`sysctl` 是毫秒级，`system_profiler` / `pip --version` 是秒级，
  *    但都不该把界面卡死。
  */
+import { toolSearchPath } from "./search-path";
+
 export type CommandResult = { code: number; stdout: string; stderr: string };
 
 export type CommandRunner = {
@@ -80,12 +82,5 @@ export const defaultCommandRunner: CommandRunner = {
  * 只查 `Bun.which` 会漏掉 Homebrew）。
  */
 export function searchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ].filter(Boolean);
-  return [...extra, process.env.PATH ?? ""].join(":");
+  return toolSearchPath();
 }

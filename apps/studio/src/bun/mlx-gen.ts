@@ -11,6 +11,7 @@ import { logEvent } from "./app-log";
 import { getDataDir } from "./paths";
 import { removeManifest, writeManifest } from "./install-manifest";
 import { getSetting } from "./db/settings";
+import { toolSearchPath } from "./search-path";
 
 /**
  * MLX 本地生图引擎（Apple Silicon）。
@@ -114,15 +115,7 @@ export type MlxGenStatus = {
 };
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 /** mflux venv 根目录（userData/engines/mflux，结构为标准 python venv）。 */

@@ -341,7 +341,17 @@ Views must be configured in `electrobun.config.ts` to be built and copied into t
   Same rule for `omni-landlock.c` (the Linux Landlock helper `landlock-helper.ts` compiles with
   `cc` on first use): if it is not copied into `bun/`, Linux silently degrades to "no compiler".
 - Child processes are spawned `detached` and killed by process group (`kill(-pid)`) — killing
-  only the direct child leaves VRAM-hogging orphans behind.
+  only the direct child leaves VRAM-hogging orphans behind. Always go through `killProcessTree`
+  (`runtimes/proc.ts`): Windows has no process-group signals (a negative pid throws), so it
+  kills the tree with `taskkill /T /F` (`bun/win-process.ts`) instead.
+- Never build a PATH with `join(":")`: use `bun/search-path.ts` (`toolSearchPath` /
+  `agentShellPath` / `prependPath`, plus `withPath` when putting it into a child env). Windows
+  separates with `;` and names the variable `Path`; a `:` join glues the first PATH entry into
+  garbage.
+- Managed venv executables go through `venvExecutable` (`bun/engine-paths.ts`): Windows venvs
+  are `Scripts\python.exe` / `Scripts\pip.exe`, never `bin/python3`. Don't shell out to
+  `cp` / `rm` / `unzip` / `open` either — Windows has none of them (use `fs`, the zip helpers
+  in `skills/installer.ts`, or `launchCommand` in `cli/client.ts`).
 - Anything that resolves a user-supplied path (downloads, media, Skills deletes) must validate
   it against the data directory — inputs arrive from the webview and the control socket.
 - Adding an inference engine means editing `src/shared/engines.ts` plus one `Runtime`

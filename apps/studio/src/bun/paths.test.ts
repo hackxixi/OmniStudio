@@ -12,7 +12,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import path from "path";
 import { tmpdir } from "os";
 
-import { getDataDir, isOmniDataPath } from "./paths";
+import { getAppDataDir, getDataDir, isOmniDataPath } from "./paths";
 
 const saved = process.env.OMNI_DATA_DIR;
 
@@ -55,5 +55,20 @@ describe("isOmniDataPath", () => {
       expect(isOmniDataPath(identifierDir)).toBe(true);
       expect(isOmniDataPath(path.join(identifierDir, "canary"))).toBe(true);
     }
+  });
+});
+
+describe("getAppDataDir（主进程与 omi CLI 共用）", () => {
+  test("Windows：LOCALAPPDATA，缺失时回落 <home>\\AppData\\Local", () => {
+    expect(getAppDataDir("win32", { LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local" }, "C:\\Users\\u")).toBe(
+      "C:\\Users\\u\\AppData\\Local",
+    );
+    expect(getAppDataDir("win32", {}, "C:\\Users\\u")).toBe("C:\\Users\\u\\AppData\\Local");
+  });
+
+  test("Linux：XDG_DATA_HOME → ~/.local/share；macOS：Application Support", () => {
+    expect(getAppDataDir("linux", { XDG_DATA_HOME: "/x" }, "/home/u")).toBe("/x");
+    expect(getAppDataDir("linux", {}, "/home/u")).toBe("/home/u/.local/share");
+    expect(getAppDataDir("darwin", {}, "/Users/u")).toBe("/Users/u/Library/Application Support");
   });
 });

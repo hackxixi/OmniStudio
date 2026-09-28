@@ -22,6 +22,7 @@ import { readSkillFile, skillsPromptSection } from "./agent-skills";
 import { capToolResultText, isSpillPath } from "./agent-spill";
 import { audit } from "./skills/audit";
 import { logEvent } from "./app-log";
+import { agentShellPath, withPath } from "./search-path";
 
 /**
  * Agent 可使用的工具集。
@@ -863,7 +864,7 @@ function createBash(ctx: ToolContext): BuiltTool {
           stderr: "pipe",
           stdin: "ignore",
           detached: true,
-          env: { ...process.env, PATH: augmentPath() },
+          env: withPath(process.env, agentShellPath()),
         });
         let killed: "timeout" | "abort" | null = null;
         const killGroup = (reason: "timeout" | "abort") => {
@@ -979,25 +980,6 @@ async function readOutputBounded(
   return text;
 }
 
-/**
- * GUI 启动的进程 PATH 往往缺少 Homebrew / nvm 等目录，导致 node、git、brew 找不到。
- * 补上常见路径，保证工具调用不会莫名其妙地 "command not found"。
- */
-function augmentPath(): string {
-  const extra = [
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    `${process.env.HOME ?? ""}/.nvm/versions/node/*/bin`,
-    `${process.env.HOME ?? ""}/.bun/bin`,
-    `${process.env.HOME ?? ""}/.cargo/bin`,
-  ];
-  return [...extra, process.env.PATH ?? ""].join(":");
-}
 
 function createWebSearch(): BuiltTool {
   return {

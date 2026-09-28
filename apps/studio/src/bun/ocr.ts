@@ -16,6 +16,7 @@ import { convertFileToImages, generate, type ModelEndpoint } from "./vllm";
 import { getLocalModelName } from "./vllm/model";
 import { getCurrentModelProfile } from "./vllm/model-profile";
 import * as ServerManager from "./server-manager";
+import { toolSearchPath } from "./search-path";
 
 /**
  * OCR 本地引擎。
@@ -159,15 +160,7 @@ export async function listOcrProviderModels(
 // ---------------------------------------------------------------------------
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 async function findTesseract(): Promise<string | null> {

@@ -20,6 +20,7 @@ import {
   voiceRecordToRow,
   type VoiceRecordRow,
 } from "./voice";
+import { toolSearchPath } from "./search-path";
 
 /** 通话 TTS 调试日志：进统一日志（`logs/app.log`，source=tts、event=voicecall）。 */
 function callTtsLog(line: string): void {
@@ -330,15 +331,7 @@ export function audioCppSupported(): boolean {
 }
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 async function findOnPath(): Promise<string | null> {

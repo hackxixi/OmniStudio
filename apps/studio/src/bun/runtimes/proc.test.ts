@@ -40,6 +40,29 @@ describe("killProcessTree", () => {
     await proc.exited;
     expect(() => killProcessTree(proc, "SIGTERM")).not.toThrow();
   });
+
+  test("Windows：走 taskkill 杀整棵树，不发负 pid 信号", () => {
+    const trees: number[] = [];
+    const direct: string[] = [];
+    const proc = { pid: 4321, exitCode: null, kill: (s?: number | string) => direct.push(String(s)) };
+    killProcessTree(proc, "SIGTERM", { platform: "win32", killWindowsTree: (pid) => (trees.push(pid), true) });
+    expect(trees).toEqual([4321]);
+    expect(direct).toEqual([]);
+  });
+
+  test("Windows：taskkill 失败时退回杀直接子进程", () => {
+    const direct: string[] = [];
+    const proc = { pid: 4321, exitCode: null, kill: (s?: number | string) => direct.push(String(s)) };
+    killProcessTree(proc, "SIGKILL", { platform: "win32", killWindowsTree: () => false });
+    expect(direct).toEqual(["SIGKILL"]);
+  });
+
+  test("Windows：根进程已退出就不按 pid 杀树（pid 可能已被复用）", () => {
+    const trees: number[] = [];
+    const proc = { pid: 4321, exitCode: 0, kill: () => {} };
+    killProcessTree(proc, "SIGKILL", { platform: "win32", killWindowsTree: (pid) => (trees.push(pid), true) });
+    expect(trees).toEqual([]);
+  });
 });
 
 describe("spawnServerProcess", () => {

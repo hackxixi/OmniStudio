@@ -425,10 +425,10 @@ export function installLocal(
   }
   if (/\.(zip|skill)$/i.test(abs)) {
     // zip / .skill（zip 变体）：先列条目校验、再解到临时目录。
-    const listing = Bun.spawnSync(["unzip", "-Z1", abs], { stdout: "pipe", stderr: "pipe" });
+    const listing = Bun.spawnSync(zipListArgs(abs), { stdout: "pipe", stderr: "pipe" });
     const entries = new TextDecoder()
       .decode(listing.stdout)
-      .split("\n")
+      .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean);
     const unsafe = entries.filter((e) => !isSafeArchiveEntry(e));
@@ -447,13 +447,13 @@ export function installLocal(
         ok: false,
         error:
           listing.exitCode !== 0
-            ? "无法读取压缩包内容（unzip 不可用？）"
+            ? `无法读取压缩包内容（${process.platform === "win32" ? "系统 tar" : "unzip"} 不可用？）`
             : "压缩包里含不安全的路径（../ 或绝对路径），已拒绝导入",
       };
     }
     const tmp = join(getTmpDir(), `zip-${randomUUID().slice(0, 8)}`);
     mkdirSync(tmp, { recursive: true });
-    const unzip = Bun.spawnSync(["unzip", "-q", "-o", abs, "-d", tmp], { stdout: "pipe", stderr: "pipe" });
+    const unzip = Bun.spawnSync(zipExtractArgs(abs, tmp), { stdout: "pipe", stderr: "pipe" });
     if (unzip.exitCode !== 0) {
       try {
         rmSync(tmp, { recursive: true, force: true });
@@ -475,6 +475,23 @@ export function installLocal(
     return result;
   }
   return { ok: false, error: "unsupported file type" };
+}
+
+/**
+ * 列 / 解 zip 的命令。macOS / Linux 用 `unzip`；Windows 没有 unzip，但系统自带的
+ * bsdtar（`System32\tar.exe`）能直接读 zip。写全路径是因为 PATH 上常先命中
+ * Git for Windows 带的 GNU tar —— 它不认 zip。
+ */
+export function zipListArgs(file: string, platform: NodeJS.Platform = process.platform): string[] {
+  return platform === "win32" ? [windowsTar(), "-tf", file] : ["unzip", "-Z1", file];
+}
+
+export function zipExtractArgs(file: string, dest: string, platform: NodeJS.Platform = process.platform): string[] {
+  return platform === "win32" ? [windowsTar(), "-xf", file, "-C", dest] : ["unzip", "-q", "-o", file, "-d", dest];
+}
+
+function windowsTar(): string {
+  return `${process.env.SystemRoot || "C:\\Windows"}\\System32\\tar.exe`;
 }
 
 /**

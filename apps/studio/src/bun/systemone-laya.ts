@@ -19,6 +19,7 @@ import { getSetting } from "./db/settings";
 import { getDataDir } from "./paths";
 import { proxyChildEnv } from "./proxy";
 import { removeManifest, writeManifest } from "./install-manifest";
+import { toolSearchPath } from "./search-path";
 
 export type LayaPhase = "idle" | "installing" | "loading" | "ready" | "error";
 
@@ -128,15 +129,7 @@ function workerScript(): string {
 }
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ];
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 /** 返回 Python 的 minor 版本（3.x 中的 x），解析失败返回 null。 */

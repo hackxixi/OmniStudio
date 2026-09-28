@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, statSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "fs";
 import path from "path";
 import { getSetting, updateSettings } from "./db/settings";
 import { getModelsBaseDirForRuntime } from "./model-store";
@@ -259,7 +259,7 @@ export async function downloadTTSModel(
     const code = await git.exited;
     if (code === 0) break;
     // 失败时清掉残留目录再试下一个镜像。
-    if (existsSync(dest)) Bun.spawnSync(["rm", "-rf", dest]);
+    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
   }
 
   const downloaded = isTTSModelDownloaded(entry);

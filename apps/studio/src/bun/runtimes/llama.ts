@@ -42,6 +42,7 @@ import type {
   StartResult,
   StatusListener,
 } from "./types";
+import { toolSearchPath } from "../search-path";
 
 const DOWNLOAD_PATTERN = /download|fetch|pulling|(\d+(\.\d+)?)\s*%/i;
 
@@ -100,15 +101,7 @@ export function effectiveFlashAttnForPlan(
 }
 
 function getSearchPath(): string {
-  const home = process.env.HOME ?? "";
-  const extra = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    home ? `${home}/.local/bin` : "",
-    home ? `${home}/bin` : "",
-  ].filter(Boolean);
-  const current = process.env.PATH ?? "";
-  return [...extra, current].join(":");
+  return toolSearchPath();
 }
 
 export const DEFAULT_CUSTOM_SERVER_ARGS: ServerArgs = {
