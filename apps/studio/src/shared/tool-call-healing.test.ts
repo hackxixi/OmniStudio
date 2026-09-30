@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   healToolCalls,
   parseInlineToolCalls,
+  stripInlineToolCalls,
+  hasInlineToolCallMarker,
   MAX_HEAL_INPUT_CHARS,
 } from "./tool-call-healing";
 
@@ -158,5 +160,101 @@ describe("tool-call-healing", () => {
     const text = prose + call + tail;
     const res = healToolCalls(text, ["read_file"]);
     expect(res.text).toBe(prose + tail);
+  });
+});
+
+/* ---------------- stripInlineToolCalls（展示侧清场） ---------------- */
+
+/**
+ * 测试里的标签用拼接构造：开/闭标签都是单行形态（逐段拼只是为了源码可读），
+ * function 开标签与参数标签同样逐段拼 —— 字面量与真实模型输出逐字节一致。
+ */
+const TOPEN = "<tool_call" + ">";
+const TCLOSE = "<" + "/tool_call>";
+const ft = (name: string, params: [string, string][], close = true) =>
+  "<" + "function=" + name + ">" +
+  params.map(([k, v]) => "<" + "parameter=" + k + ">" + v + "</" + "parameter>").join("") +
+  (close ? "</" + "function>" : "");
+
+describe("stripInlineToolCalls（展示侧清场：对话页 / 历史重放）", () => {
+  test("1. 真实形态：hermes 外壳包两个参数式调用（mimo 蒸馏模型）→ 全部移除，空外壳不残留", () => {
+    const text =
+      TOPEN +
+      "\n" + ft("Bash", [["command", "curl -L --max-time 20 -sS 'https://api.github.com/search/repositories?q=toolcall-15' | head -c 4000"]]) +
+      "\n" + ft("Bash", [["command", "git ls-remote https://github.com/toolcall-15/toolcall-15.git HEAD 2>&1 | head -5"]]) +
+      TCLOSE;
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe("");
+    expect(removedNames).toEqual(["Bash"]);
+  });
+
+  test("2. 完整的 hermes 纯 JSON 调用同样移除", () => {
+    const text = TOPEN + '{"name":"Bash","arguments":{"command":"ls"}}' + TCLOSE;
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe("");
+    expect(removedNames).toEqual(["Bash"]);
+  });
+
+  test("3. 正文 + 调用 + 收尾：只移除调用，正文原样保留", () => {
+    const text =
+      "先搜一下。" + TOPEN +
+      "\n" + ft("Read", [["path", "a.txt"]]) + TCLOSE +
+      "\n然后看结果。";
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe("先搜一下。\n然后看结果。");
+    expect(removedNames).toEqual(["Read"]);
+  });
+
+  test("4. 末尾未闭合（流式在调用写到一半时中断）：从开标签处截断，名字找回", () => {
+    const text =
+      "我来搜一下。" + TOPEN +
+      "\n" + ft("Bash", [["command", "curl https://example.com/api?q=很长很长被中断的查询串"]], false);
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe("我来搜一下。");
+    expect(removedNames).toEqual(["Bash"]);
+  });
+
+  test("5. 正文里顺嘴提到未闭合标签不当中断截（开标签后是空格 + 普通词）", () => {
+    const text = "这就是 " + TOPEN + " 的样子，对吧？";
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe(text);
+    expect(removedNames).toEqual([]);
+  });
+
+  test("6. 坏 JSON 的跨度不认成调用，原样保留（没见过就是没见过）", () => {
+    const text = TOPEN + '{"name":"Bash","arguments":{BROKEN}}' + TCLOSE + ' done';
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe(text);
+    expect(removedNames).toEqual([]);
+  });
+
+  test("7. 未闭合的参数式正文（参数没写完）从开标签处截断", () => {
+    const text = "跑一下这个。" + "<" + "function=Bash><" + "parameter=command>curl https://example.com/x";
+    const { text: out, removedNames } = stripInlineToolCalls(text);
+    expect(out).toBe("跑一下这个。");
+    expect(removedNames).toEqual(["Bash"]);
+  });
+
+  test("8. 超长：原样返回", () => {
+    const text = "a".repeat(MAX_HEAL_INPUT_CHARS + 1) + TOPEN;
+    const { text: out } = stripInlineToolCalls(text);
+    expect(out).toBe(text);
+  });
+
+  test("9. hasInlineToolCallMarker：廉价探测只看开标签", () => {
+    expect(hasInlineToolCallMarker(TOPEN)).toBe(true);
+    expect(hasInlineToolCallMarker("<" + "function=Bash>")).toBe(true);
+    expect(hasInlineToolCallMarker("[TOOL_CALLS]")).toBe(true);
+    expect(hasInlineToolCallMarker(TCLOSE)).toBe(false);
+    expect(hasInlineToolCallMarker("普通回答")).toBe(false);
+  });
+
+  test("10. healToolCalls 也能提升参数式调用（agent 执行侧受益）", () => {
+    const text = TOPEN + "\n" + ft("Bash", [["command", "ls"]]) + TCLOSE;
+    const { calls, text: healed } = healToolCalls(text, ["Bash"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.name).toBe("Bash");
+    expect(calls[0]!.arguments).toBe('{"command":"ls"}');
+    expect(healed).not.toContain("<" + "parameter=");
   });
 });

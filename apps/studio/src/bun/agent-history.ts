@@ -17,6 +17,7 @@
  *    对主 Agent 只有 `task` 那一次调用的结论有意义。
  */
 import type { AgentEventRow } from "./agent";
+import { stripInlineToolCalls } from "../shared/tool-call-healing";
 
 /** 回填时单条工具结果的字符上限（对齐 oh-my-pi 的摘要输入口径）。 */
 export const MAX_HISTORY_TOOL_RESULT_CHARS = 2_000;
@@ -147,7 +148,9 @@ export function buildHistoryMessages(
   const out: RehydratedMessage[] = [];
 
   for (const row of history) {
-    const text = row.content.trim();
+    // 助手正文里若混着模型以文本形态吐出的工具调用（小模型的已知毛病），回填前清掉：
+    // 原样喂回只会让它照着继续吐，历史就成了泄漏的放大器。
+    const text = (row.role === "assistant" ? stripInlineToolCalls(row.content).text : row.content).trim();
     if (row.role === "user") {
       if (text)
         out.push({ role: "user", content: [{ type: "text", text }], timestamp: row.createdAt });

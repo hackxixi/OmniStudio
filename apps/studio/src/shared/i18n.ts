@@ -571,6 +571,8 @@ const zh: Record<string, string> = {
   "chat.forkTitleSuffix": "分支",
   /** 用户按「停止」后追加在已生成内容末尾的标记（主进程写库，见 bun/chat.ts）。 */
   "chat.stopped": "_（已停止）_",
+  /** 模型把工具调用当正文吐出、被对话页清除后的说明（主进程写库，见 bun/chat.ts）。 */
+  "chat.toolCalls.stripped": "（模型想通过调用 {tools} 把事做完，但对话页不提供工具执行，这些调用没有运行。想让它自动执行任务，请改到 Agent 页发起。）",
   "chat.assistantName": "默认助手",
   "chat.worked": "已处理 · {duration}",
   "chat.working.duration": "处理中 · {duration}",
@@ -4247,6 +4249,8 @@ const en: Record<string, string> = {
   "chat.fork": "Fork a session from here",
   "chat.forkTitleSuffix": "branch",
   "chat.stopped": "_（stopped）_",
+  "chat.toolCalls.stripped": "(The model tried to get things done by invoking {tools}, but the chat page has no tool executor, so these calls were not run. Start the task from the Agent page if you want it executed.)",
+
   "chat.assistantName": "Assistant",
   "chat.worked": "Worked for {duration}",
   "chat.working.duration": "Working for {duration}",

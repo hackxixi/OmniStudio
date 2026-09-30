@@ -451,3 +451,155 @@ test("没有在生成时按停止：如实回 ok:false，不报错", () => {
   const conv = createConversation(undefined, "chat");
   expect(stopChatGeneration(conv.id)).toEqual({ ok: false });
 });
+
+
+// ---------------------------------------------------------------------------
+// 小模型（mimo 蒸馏）的已知毛病：把 hermes 工具调用当正文吐出来。对话页没有执行器，
+// 这些标签不能落库 / 上屏 / 被历史重放 —— 收尾净化 + 说明文案 + 流式闸门（见 bun/chat.ts）。
+// 标签用 char code 拼接构造（同 shared/tool-call-healing.test.ts 的惯例）。
+// ---------------------------------------------------------------------------
+
+const LTOPEN = String.fromCharCode(60) + 'tool_call' + String.fromCharCode(62);
+const LTCLOSE = String.fromCharCode(60) + '/tool_call' + String.fromCharCode(62);
+const lft = (name: string, params: [string, string][], close = true) =>
+  String.fromCharCode(60) + 'function=' + name + String.fromCharCode(62) +
+    params
+      .map(([k, v]) =>
+        String.fromCharCode(60) + 'parameter=' + k + String.fromCharCode(62) + v +
+          String.fromCharCode(60) + '/parameter' + String.fromCharCode(62),
+      )
+      .join('') +
+    (close ? String.fromCharCode(60) + '/function' + String.fromCharCode(62) : '');
+
+test("整条回答都是工具调用（对话页无执行器）：收尾净化落库、附说明、done 带净化内容", async () => {
+  clearAppLog();
+  const conv = createConversation(undefined, "chat");
+  const realFetch = globalThis.fetch;
+  const callText =
+    '我来搜一下。' + LTOPEN + ' ' +
+    lft('WebSearch', [['query', '谁写的 OmniStudio']]) + LTCLOSE;
+  globalThis.fetch = mock(async () => {
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const piece of [callText.slice(0, 20), callText.slice(20)]) {
+          controller.enqueue(
+            enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`),
+          );
+        }
+        controller.enqueue(
+          enc.encode(`data: ${JSON.stringify({ choices: [{ delta: {} }], usage: { prompt_tokens: 5, completion_tokens: 9 } })}\n\n`),
+        );
+        controller.enqueue(enc.encode(`data: ${'[DONE]'}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as never;
+  try {
+    const done: { content: string }[] = [];
+    const off = onChatDone((e) => done.push({ content: e.content }));
+    const res = await sendMessage(conv.id, "查一下作者");
+    off();
+    expect(res.ok).toBe(true);
+    const messages = getConversation(conv.id).messages;
+    const last = messages[messages.length - 1]!;
+    // 标签不残留：hermes 外壳与 function 调用都没了
+    expect(last.content).not.toContain('function=');
+    expect(last.content).not.toContain('tool_call');
+    // 正文保留 + 说明在尾（说明是落库数据，之后刷新仍显示）
+    expect(last.content).toContain('我来搜一下。');
+    expect(last.content).toContain('WebSearch');
+    expect(last.content).toContain('Agent 页');
+    // done 事件内容 = 落库内容（前端用它整体替换流式时已显示的文本）
+    expect(done).toHaveLength(1);
+    expect(done[0]!.content).toBe(last.content);
+    const events = readAppLogsInMemory({ source: 'chat' }).filter(
+      (e) => e.event === 'chat.toolcall.stripped',
+    );
+    expect(events).toHaveLength(1);
+    const detail = events[0]!.detail as Record<string, unknown>;
+    expect(detail.tools).toEqual(['WebSearch']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("停止按在工具调用写一半：半截标签从开标签处截掉再落库，标上「已停止」", async () => {
+  const conv = createConversation(undefined, "chat");
+  const realFetch = globalThis.fetch;
+  const leak = '开始干活：' + LTOPEN + lft('Bash', [['command', 'cu']], false);
+  globalThis.fetch = mock(async (_url: unknown, init: unknown) => {
+    const signal = (init as { signal?: AbortSignal }).signal;
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: leak } }] })}\n\n`),
+        );
+        signal?.addEventListener('abort', () => {
+          controller.error(new Error('The operation was aborted.'));
+        });
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as never;
+  try {
+    const pending = sendMessage(conv.id, "执行一个长任务");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(stopChatGeneration(conv.id).ok).toBe(true);
+    const res = await pending;
+    expect(res.ok).toBe(true);
+    const messages = getConversation(conv.id).messages;
+    const last = messages[messages.length - 1]!;
+    // 从 hermes 开标签处截断：半截 function / parameter 标签不落库
+    expect(last.content).toContain('开始干活：');
+    expect(last.content).not.toContain('function=');
+    expect(last.content).not.toContain('parameter=');
+    expect(last.content).toContain('已停止');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("历史重放前净化助手消息：已落库的旧泄漏不再原样喂回模型", async () => {
+  const conv = createConversation(undefined, "chat");
+  // 直接落库一条「旧版本写下的泄漏助手回复」（user 行让历史非空）
+  const leak = '我来搜一下。' + LTOPEN + ' ' + lft('Bash', [['command', 'ls']]) + LTCLOSE;
+  db.insert(schema.messages).values({
+    conversationId: conv.id, role: 'user', content: '查磁盘占用',
+  }).run();
+  db.insert(schema.messages).values({
+    conversationId: conv.id, role: 'assistant', content: leak,
+  }).run();
+  let capturedBody = '';
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = mock(async (_url: unknown, init: unknown) => {
+    capturedBody =
+      typeof init === 'object' && init && 'body' in init ? String((init as { body?: unknown }).body ?? '') : '';
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: '收到' } }] })}\n\n`),
+        );
+        controller.enqueue(enc.encode(`data: ${'[DONE]'}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as never;
+  try {
+    const res = await sendMessage(conv.id, "还剩多少空间");
+    expect(res.ok).toBe(true);
+    const body = JSON.parse(capturedBody) as { messages: { role: string; content: string }[] };
+    const assistantMsgs = body.messages.filter((m) => m.role === 'assistant');
+    // 旧泄漏回复净化后只剩正文（新插入的空助手行被跳过）
+    expect(assistantMsgs).toHaveLength(1);
+    expect(assistantMsgs[0]!.content).toContain('我来搜一下。');
+    expect(assistantMsgs[0]!.content).not.toContain('function=');
+    expect(assistantMsgs[0]!.content).not.toContain('tool_call');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

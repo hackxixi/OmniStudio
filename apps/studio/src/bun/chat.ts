@@ -6,6 +6,7 @@ import { conversations, messages } from "./db/schema";
 import { getSetting, getActiveServerPort } from "./db/settings";
 import { getChatModelLabel, getChatProviderLabel, getChatRequestModelId } from "./chat-model";
 import { mergeSystemMessages, parseChatDelta } from "./chat-messages";
+import { hasInlineToolCallMarker, stripInlineToolCalls } from "../shared/tool-call-healing";
 import { computeTokenStats, parseMessageStats, type MessageStats } from "./chat-stats";
 import { estimateMessagesTokens, estimateTokens } from "../shared/token-estimate";
 import { CLOUD_MAX_OUTPUT_TOKENS, LOCAL_CTX_DEFAULT } from "../shared/model-context";
@@ -180,6 +181,15 @@ export function insertAssistantMessage(conversationId: number): number {
   return inserted.id;
 }
 
+/**
+ * 模型把工具调用当正文吐出时，净化后落库 / 上屏的说明：
+ * 说清楚发生了什么（调用了哪些工具）与去哪儿执行（Agent 页）。
+ * 文案是落库数据（之后一直显示），所以生成时按当前界面语言定稿（mainT）。
+ */
+function toolCallNote(removedNames: string[]): string {
+  return mainT("chat.toolCalls.stripped", { tools: removedNames.join(" / ") });
+}
+
 const IMAGE_MEDIA_TYPES: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -255,7 +265,11 @@ function buildOpenAiMessages(history: ChatMessage[]): { role: string; content: u
 
   for (const m of history) {
     if (m.role === "assistant") {
-      out.push({ role: "assistant", content: m.content });
+      // 历史重放前清场：模型以文本形式吐出的工具调用（小模型的已知毛病）不能原样
+      // 喂回去 —— 下一轮会照着继续吐，泄漏就自我复制；已落库的旧泄漏也在这顺手治好。
+      // 清完为空的行直接丢弃（空助手行没有信息量）。
+      const { text } = stripInlineToolCalls(m.content);
+      if (text.trim()) out.push({ role: "assistant", content: text });
       continue;
     }
 
@@ -698,10 +712,30 @@ async function streamAssistantReply(opts: {
   });
   const flushChunks = () => flusher.flushNow();
 
+  /**
+   * 流式防泄漏闸门：累积正文里一旦出现**成形**的内联工具调用，就停止向显示 /
+   * TTS 通道吐后续增量（`full` 照旧累积，收尾时统一净化落库）。
+   *
+   * 判据是「成形」而不是「出现开标签」：正常回答里提到一个标签不构成调用；
+   * 只有参数 / JSON 成形且闭合，才说明这真是一次调用，后面的增量几乎全是
+   * 标签与参数 —— 继续吐给界面 / TTS 就是泄漏。检查有步长（每 256 字符一次）
+   * 且先过廉价的 marker 探测，普通回答不受影响。
+   */
+  let toolCallInStream = false;
+  let lastToolCallCheckLen = 0;
+  const maybeEnterToolCallSuppression = () => {
+    if (toolCallInStream || full.length - lastToolCallCheckLen < 256) return;
+    lastToolCallCheckLen = full.length;
+    if (!hasInlineToolCallMarker(full)) return;
+    if (stripInlineToolCalls(full).removedNames.length > 0) toolCallInStream = true;
+  };
+
   const appendContent = (delta: string) => {
     if (!delta) return;
     markFirstToken();
     full += delta;
+    maybeEnterToolCallSuppression();
+    if (toolCallInStream) return; // 已确认是工具调用：后续增量不进显示 / TTS
     flusher.pushContent(delta);
     // 即时消费方（语音通话边生成边合成）仍按 token 回调，不走批量缓冲。
     opts.onDelta?.(delta);
@@ -881,11 +915,24 @@ async function streamAssistantReply(opts: {
     // 区别只在文案：点停止的人需要看到"确实停了"，而被抢话的人不需要多一行字。
     if (opts.signal?.aborted || internal.signal.aborted) {
       const stoppedByUser = internal.signal.aborted && !opts.signal?.aborted;
+      // 先净化再收尾：中断在调用写到一半时，半截标签从开标签处截掉；
+      // 整条回复都是调用时，落一条说明而不是空气泡。
+      const { text: stopClean, removedNames } = stripInlineToolCalls(full);
+      if (removedNames.length > 0) {
+        logEvent({
+          level: "info",
+          source: "chat",
+          event: "chat.toolcall.stripped",
+          message: "正文里的内联工具调用已清除（对话页无执行器）：" + removedNames.join(", "),
+          detail: { conversationId, assistantId, tools: removedNames, chars: full.length },
+        });
+      }
+      const base = stopClean.trim() || (removedNames.length > 0 ? toolCallNote(removedNames) : "");
       const content = stoppedByUser
-        ? full
-          ? `${full}\n\n${mainT("chat.stopped")}`
+        ? base
+          ? `${base}\n\n${mainT("chat.stopped")}`
           : mainT("chat.stopped")
-        : full;
+        : base;
       const partial = collectStats();
       db.update(messages)
         .set({
@@ -958,9 +1005,29 @@ async function streamAssistantReply(opts: {
 
   const stats = collectStats();
 
+  // 收尾净化：模型以文本形式吐出的工具调用不能落库 / 上屏（对话页没有执行器）。
+  // done 事件带净化后的内容 —— 前端收尾时在界面上整体替换流式时已显示的文本，
+  // 标签不会残留；整条回复都是调用时，落一条说明而不是空气泡。
+  const { text: cleanFull, removedNames } = stripInlineToolCalls(full);
+  const finalContent =
+    removedNames.length === 0
+      ? full
+      : cleanFull.trim()
+        ? `${cleanFull.trimEnd()}\n\n${toolCallNote(removedNames)}`
+        : toolCallNote(removedNames);
+  if (removedNames.length > 0) {
+    logEvent({
+      level: "info",
+      source: "chat",
+      event: "chat.toolcall.stripped",
+      message: "正文里的内联工具调用已清除（对话页无执行器）：" + removedNames.join(", "),
+      detail: { conversationId, assistantId, tools: removedNames, chars: full.length },
+    });
+  }
+
   db.update(messages)
     .set({
-      content: full,
+      content: finalContent,
       reasoning: reasoning || null,
       tokens: stats.tokens,
       stats: JSON.stringify(stats),
@@ -977,11 +1044,11 @@ async function streamAssistantReply(opts: {
   emitDone({
     conversationId,
     messageId: assistantId,
-    content: full,
+    content: finalContent,
     reasoning: reasoning || undefined,
     citations: opts.citations,
   });
-  return { ok: true, content: full };
+  return { ok: true, content: finalContent };
 }
 
 export async function sendMessage(
