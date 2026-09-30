@@ -85,11 +85,13 @@ function fakeRunner(options: {
   const calls: string[][] = [];
   return {
     calls,
-    run: (cmd): CommandResult => {
+    run: (cmd, _timeoutMs, cwd): CommandResult => {
       calls.push(cmd);
-      if (cmd[0] === "tar") {
-        // 最后一个参数是 -C 的输出目录
-        const outDir = cmd[cmd.length - 1]!;
+      const first = cmd[0] ?? "";
+      if (first === "tar" || first.endsWith("\\tar.exe") || first.endsWith("/tar")) {
+        // 最后一个参数是 -C 的输出目录（Windows 方案下是相对 cwd 的 "out"）
+        const outDirArg = cmd[cmd.length - 1]!;
+        const outDir = cwd ? join(cwd, outDirArg) : outDirArg;
         const serverDir = join(outDir, "llama-b10976");
         mkdirSync(serverDir, { recursive: true });
         writeFileSync(join(serverDir, "llama-server"), "#!/bin/sh\n");

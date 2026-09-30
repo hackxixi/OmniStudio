@@ -11,7 +11,8 @@
 export type CommandResult = { code: number; stdout: string; stderr: string };
 
 export type CommandRunner = {
-  run: (cmd: string[], timeoutMs?: number) => CommandResult;
+  /** `cwd` 可选：个别命令（Windows 的 tar）必须用「相对路径 + cwd」而不是绝对路径，见 engine-install。 */
+  run: (cmd: string[], timeoutMs?: number, cwd?: string) => CommandResult;
   /**
    * 流式执行：逐行回调 stdout / stderr（pip / uv / brew 一次能打出几百行，用户要看到
    * 实时输出而不是等它跑完），返回退出码。必须实现，否则安装类流程在测试里会去执行
@@ -47,9 +48,9 @@ async function streamInto(
 }
 
 export const defaultCommandRunner: CommandRunner = {
-  run: (cmd, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) => {
+  run: (cmd, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, cwd) => {
     try {
-      const proc = Bun.spawnSync({ cmd, stdout: "pipe", stderr: "pipe", timeout: timeoutMs });
+      const proc = Bun.spawnSync({ cmd, cwd, stdout: "pipe", stderr: "pipe", timeout: timeoutMs });
       return {
         code: proc.exitCode ?? -1,
         stdout: proc.stdout?.toString() ?? "",

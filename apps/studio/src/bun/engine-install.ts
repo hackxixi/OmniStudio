@@ -23,7 +23,7 @@ import {
   statSync,
   writeFileSync,
 } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 
 import { ENGINE_SHORT_NAMES, engineInstallSupport, type InferenceEngine } from "../shared/engines";
 import type { GpuKind } from "../shared/hardware";
@@ -283,9 +283,21 @@ export async function fetchLatestLlamaRelease(fetchImpl: typeof fetch = fetch): 
 // llama.cpp：下载 / 解包 / 验证 / 落位
 // ---------------------------------------------------------------------------
 
-function archiveArgs(archive: "tar.gz" | "zip", file: string, outDir: string): string[] {
+/**
+ * Windows 上 PATH 里的 `tar` 不可信：可能是 bsdtar（老版本 libarchive 把 `C:\...`
+ * 盘符路径当成 URI 的 host:path，报 `Cannot connect to C: resolve failed`），也可能是
+ * GNU tar（根本解不了 zip：`This does not look like a tar archive`）。统一用
+ * System32 自带的 bsdtar（Win10+ 必有，且能解 zip），并配合「相对路径 + cwd」调用
+ * （archiveArgs 的 win32 分支），盘符不出现在任何参数里。
+ */
+function windowsSystemTar(): string {
+  return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+}
+
+function archiveArgs(archive: "tar.gz" | "zip", file: string, outDir: string, platform: string): string[] {
   // Windows 的 tar.exe 是 bsdtar，能解 zip；GNU tar 不能 —— zip 只出现在 Windows 方案里。
-  return archive === "zip" ? ["tar", "-xf", file, "-C", outDir] : ["tar", "-xzf", file, "-C", outDir];
+  const tarBin = platform === "win32" ? windowsSystemTar() : "tar";
+  return archive === "zip" ? [tarBin, "-xf", file, "-C", outDir] : [tarBin, "-xzf", file, "-C", outDir];
 }
 
 /** 解包后找 llama-server 所在目录（发布包里是一层 `llama-b10976/`）。 */
@@ -596,7 +608,11 @@ async function installLlamaPlan(input: {
       if (!fetched.ok) return { ok: false, error: fetched.error ?? `下载 ${asset} 失败` };
 
       reporter.phase("extracting", `解包 ${asset}`, null);
-      const code = runner.run(archiveArgs(plan.archive, archivePath, outDir), 300_000);
+      // Windows：System32 bsdtar + 相对路径 + 显式 cwd（理由见 windowsSystemTar 注释）。
+      const code =
+        platform === "win32"
+          ? runner.run(archiveArgs(plan.archive, basename(archivePath), "out", platform), 300_000, staging)
+          : runner.run(archiveArgs(plan.archive, archivePath, outDir, platform), 300_000);
       if (code.code !== 0) {
         return { ok: false, error: `解包失败：${code.stderr.trim() || `退出码 ${code.code}`}` };
       }
