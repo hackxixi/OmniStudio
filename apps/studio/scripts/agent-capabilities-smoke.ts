@@ -84,14 +84,29 @@ Permissions.grantPermission({
   scope: "session",
   scopeRef: "9999",
   permission: "bash",
+  pattern: "rm -rf /tmp/x",
+  action: "allow",
+});
+// 精确规则不降级：那是用户对着原文批过的，「总是允许」必须继续生效。
+check(
+  "会话规则（精确）覆盖内置的「危险命令询问」",
+  Permissions.evaluate({ permission: "bash", pattern: "rm -rf /tmp/x" }, Permissions.effectiveRules(9999, workspace))
+    .action === "allow",
+);
+// 通配 allow 不得放行危险命令：`rm -rf *` 不是「凡 rm -rf 开头的字符串我都信」，要降级成 ask。
+Permissions.grantPermission({
+  scope: "session",
+  scopeRef: "7777",
+  permission: "bash",
   pattern: "rm -rf *",
   action: "allow",
 });
 check(
-  "会话规则覆盖内置的「危险命令询问」",
-  Permissions.evaluate({ permission: "bash", pattern: "rm -rf /tmp/x" }, Permissions.effectiveRules(9999, workspace))
-    .action === "allow",
+  "通配 allow 命中危险命令时降级为 ask",
+  Permissions.evaluate({ permission: "bash", pattern: "rm -rf /tmp/y" }, Permissions.effectiveRules(7777, workspace))
+    .action === "ask",
 );
+Permissions.clearPermissions("session", "7777");
 check(
   "换一个会话不继承（作用域隔离）",
   Permissions.evaluate({ permission: "bash", pattern: "rm -rf /tmp/x" }, Permissions.effectiveRules(8888, workspace))
@@ -99,7 +114,7 @@ check(
 );
 
 const summary = Permissions.summarizeEffectivePermissions(9999, workspace);
-check("生效权限摘要含 7 个探针（含沙箱升级）", summary.length === 7);
+check("生效权限摘要含 8 个探针（含沙箱升级与区外写入）", summary.length === 8);
 check(
   "摘要把窄规则计成「例外」",
   (summary.find((row) => row.permission === "bash")?.exceptions ?? 0) > 0,
@@ -147,7 +162,7 @@ const denyPromise = Interactions.authorizeToolCall({
 });
 await new Promise((resolve) => setTimeout(resolve, 20));
 const external = Interactions.listPendingPermissions(conversationId)[0];
-check("工作区外写入触发 external_directory", external?.permission === "external_directory");
+check("工作区外写入触发 external_write（读仍是 external_directory）", external?.permission === "external_write");
 Interactions.respondPermission(external!.id, "deny");
 const denied = await denyPromise;
 check("拒绝时返回明确原因（工具会被拦住）", typeof denied === "string" && denied.includes("拒绝"));

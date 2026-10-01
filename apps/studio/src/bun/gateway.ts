@@ -1047,9 +1047,12 @@ async function handleMessages(req: Request): Promise<Response> {
   if (typeof body.top_k === "number") params.top_k = body.top_k;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) params.stop = body.stop_sequences;
   const toolsOAI = anthropicToolsToOAI(body.tools);
-  if (toolsOAI) params.tools = toolsOAI;
   const toolChoiceOAI = anthropicToolChoiceToOAI(body.tool_choice);
-  if (toolChoiceOAI) params.tool_choice = toolChoiceOAI;
+  // 同 /v1/responses：tool_choice 不允许脱离 tools 单独转发，否则上游 400。
+  if (toolsOAI) {
+    params.tools = toolsOAI;
+    if (toolChoiceOAI) params.tool_choice = toolChoiceOAI;
+  }
 
   let backend: ChatBackend;
   try {
@@ -1414,8 +1417,14 @@ async function handleResponses(req: Request): Promise<Response> {
   // Completions 要求 function 嵌套。必须转换，否则 llama.cpp / DeepSeek 会因 tools[0] 缺
   // function 字段而 400（codex 等 Responses 客户端会直接报错）。
   const toolsOAI = responsesToolsToOAI(body.tools);
-  if (toolsOAI) params.tools = toolsOAI;
-  if (body.tool_choice !== undefined) params.tool_choice = responsesToolChoiceToOAI(body.tool_choice);
+  // tool_choice 只能跟 tools 一起转发：tools 为空/被过滤（空数组、web_search 等内置工具、
+  // custom 工具）时单发 tool_choice，Chat Completions 上游会 400
+  // "When using tool_choice, tools must be set"（codex 显示为 stream disconnected）。
+  // codex 的压缩/总结等无工具请求仍会带 tool_choice:"auto"，必须在这里丢掉。
+  if (toolsOAI) {
+    params.tools = toolsOAI;
+    if (body.tool_choice !== undefined) params.tool_choice = responsesToolChoiceToOAI(body.tool_choice);
+  }
 
   let backend: ChatBackend;
   try {

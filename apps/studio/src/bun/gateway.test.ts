@@ -1003,6 +1003,23 @@ describe("Anthropic tool calling (/v1/messages)", () => {
     });
   });
 
+  test("无工具时不转发 tool_choice，避免上游 400（tool_choice 必须伴随 tools）", async () => {
+    lastLocalChat = null;
+    const res = await fetch(`${GATEWAY_BASE}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "upstream-chat",
+        max_tokens: 100,
+        tool_choice: { type: "auto" },
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(readLocal()?.tools).toBeUndefined();
+    expect(readLocal()?.tool_choice).toBeUndefined();
+  });
+
   test("assistant tool_use 历史 + user tool_result 转成 assistant tool_calls + role:tool", async () => {
     lastLocalChat = null;
     const res = await fetch(`${GATEWAY_BASE}/v1/messages`, {
@@ -1129,6 +1146,76 @@ describe("OpenAI Responses tool calling (/v1/responses)", () => {
       arguments: '{"city":"Paris"}',
     });
     expect(String(body.output[0].id)).toMatch(/^fc_/);
+  });
+
+  test("无函数工具时不转发 tool_choice（tools 空或全为内置工具），避免上游 400", async () => {
+    // codex 的压缩/总结等无工具请求仍会带 tool_choice:"auto"；
+    // Chat Completions 上游单收 tool_choice 会 400 "When using tool_choice, tools must be set"。
+    lastCloudChat = null;
+    let res = await fetch(`${GATEWAY_BASE}/v1/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "cloud-gpt", input: "summarize the session", tool_choice: "auto" }),
+    });
+    expect(res.status).toBe(200);
+    expect(readCloud()?.tools).toBeUndefined();
+    expect(readCloud()?.tool_choice).toBeUndefined();
+
+    // 全部是 Chat Completions 不支持的内置工具（web_search）→ tools 被过滤，tool_choice 一并丢弃。
+    lastCloudChat = null;
+    res = await fetch(`${GATEWAY_BASE}/v1/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cloud-gpt",
+        input: "search the web",
+        tools: [{ type: "web_search" }],
+        tool_choice: "auto",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(readCloud()?.tools).toBeUndefined();
+    expect(readCloud()?.tool_choice).toBeUndefined();
+  });
+
+  test("有函数工具时 tool_choice 照常转发", async () => {
+    lastCloudChat = null;
+    const res = await fetch(`${GATEWAY_BASE}/v1/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cloud-gpt",
+        input: "weather in Paris",
+        tools: [weatherFn],
+        tool_choice: "auto",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(readCloud()?.tools).toHaveLength(1);
+    expect(readCloud()?.tool_choice).toBe("auto");
+  });
+
+  test("stream: codex 无工具请求带 tool_choice 不再触发上游 400（response.failed）", async () => {
+    lastCloudChat = null;
+    const res = await fetch(`${GATEWAY_BASE}/v1/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cloud-gpt",
+        input: "summarize the session",
+        tool_choice: "auto",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const events = parseSSE(await res.text());
+    const names = events.map((e) => e.data.type);
+    expect(names[0]).toBe("response.created");
+    expect(names[names.length - 1]).toBe("response.completed");
+    expect(names).not.toContain("response.failed");
+    // 上游收到的是干净的请求：无 tools 也无 tool_choice。
+    expect(readCloud()?.tools).toBeUndefined();
+    expect(readCloud()?.tool_choice).toBeUndefined();
   });
 
   test("function_call + function_call_output 输入项转回 assistant tool_calls + role:tool", async () => {

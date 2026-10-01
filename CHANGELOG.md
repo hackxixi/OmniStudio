@@ -4,6 +4,13 @@ All notable changes are documented here. 所有重要变更记录于此。
 
 Format follows [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/), and the project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/).
 
+## [0.1.8] - 2026-09-30
+
+### Fixed / 修复
+
+- **网关把 `tool_choice` 脱离 `tools` 单独转发，OpenAI 兼容上游 400，Codex 偶发 "stream disconnected before completion"**。`/v1/responses` 与 `/v1/messages` 转 Chat Completions 时，`tools` 为空或全被过滤（空数组、`web_search` 等内置工具、custom 工具）就丢弃 `tools`，但 `tool_choice` 无条件照发——Codex 的会话压缩/总结等无工具请求仍带 `tool_choice: "auto"`，上游直接 400 `When using tool_choice, tools must be set`；流式下网关先发 `response.created` 再把 400 包成 `response.failed`，客户端就显示断流。直连官方 API 不触发（Responses 协议允许 `tool_choice` 不带 `tools`），只有经网关转换后才变成非法请求，这也解释了为什么「偶尔」才出现。现在 `tool_choice` 只在 `tools` 非空时才随请求转发；有函数工具时行为完全不变（含强制指定某个函数的 `tool_choice`）。
+- **回归**：tools 空数组 / 全内置工具 / 流式无工具请求（Codex 压缩回合形状）三种情况下上游不再收到 `tool_choice`，有函数工具时照常转发，Anthropic 路径同场景覆盖（`gateway.test.ts`）。
+
 ## [0.1.7] - 2026-09-29
 
 ### Added / 新增
