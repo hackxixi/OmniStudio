@@ -88,7 +88,11 @@ function fakeRunner(options: {
     run: (cmd, _timeoutMs, cwd): CommandResult => {
       calls.push(cmd);
       const first = cmd[0] ?? "";
-      if (first === "tar" || first.endsWith("\\tar.exe") || first.endsWith("/tar")) {
+      // tar 的可执行文件按 basename 认：`tar` / System32 的 `tar.exe`。Windows 上 path.join 是反斜杠，
+      // 非 Windows 平台跑用例时是 POSIX join（拼出 "C:\Windows/System32/tar.exe" 混合分隔符），
+      // 只认某一种后缀会在 CI 上漏掉 —— 归一成 / 再取末段。
+      const tarBin = first.replace(/\\/g, "/").split("/").pop() ?? "";
+      if (tarBin === "tar" || tarBin === "tar.exe") {
         // 最后一个参数是 -C 的输出目录（Windows 方案下是相对 cwd 的 "out"）
         const outDirArg = cmd[cmd.length - 1]!;
         const outDir = cwd ? join(cwd, outDirArg) : outDirArg;
